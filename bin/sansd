@@ -1,0 +1,38 @@
+#!/usr/bin/env python
+
+"""
+The libreflip sans daemon starter
+"""
+
+__doc__ = """Libreflip sansd
+
+Usage:
+  sansd (-h | --help)
+  sansd --version
+
+Options:
+  -h --help     Show this screen.
+  --version     Show version.
+  
+"""
+from docopt import docopt
+
+# FIXME: Find nicer way to do this
+import sys
+sys.path.append("..")
+import sans
+
+
+# Define some constants
+__APPNAME__ = 'sansd'
+__VERSION__ = '0.1a'
+
+
+def main():
+    args = docopt(__doc__, version=__APPNAME__ + ' v' + __VERSION__)
+    print(args)
+
+
+# Run the main function
+if __name__ == '__main__':
+    main()
