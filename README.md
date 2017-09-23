@@ -1,6 +1,3 @@
-[![Travis](https://img.shields.io/travis/libreflip/sans.svg?style=flat-square)]()
-[![Github All Releases](https://img.shields.io/github/downloads/libreflip/sans/total.svg?style=flat-square)]()
-[![AUR](https://img.shields.io/aur/version/libreflip-sans.svg?style=flat-square)]()
+# Sans
 
-# sans
-Libreflip backend daemon
+Libreflip backend daemon written in python. The project is currently in very early development and as such is probably broken (whoops). You will need all dependencies listed in `requirements.txt`. It is also recommended to use a virtualenv to install dependencies
