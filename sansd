@@ -16,11 +16,7 @@ Options:
   
 """
 from docopt import docopt
-
-# FIXME: Find nicer way to do this
-import sys
-sys.path.append("..")
-import sans
+from sans import core
 
 
 # Define some constants
