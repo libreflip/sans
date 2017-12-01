@@ -1,4 +1,4 @@
-# Sans
+# sans
 
 Libreflip backend daemon; written in Rust.
 
