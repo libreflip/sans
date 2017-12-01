@@ -1,5 +1,5 @@
 # Sans
 
-Libreflip backend daemon written in python.
+Libreflip backend daemon; written in Rust.
 
-The project is currently in very early development and as such is probably broken (whoops). You will need all dependencies listed in `requirements.txt`. It is also recommended to use a virtualenv to install dependencies
+To be continued...
