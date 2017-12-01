@@ -16,7 +16,7 @@ Options:
   
 """
 from docopt import docopt
-from sans import core
+from sans import core as sanscore
 
 
 # Define some constants
@@ -27,6 +27,7 @@ __VERSION__ = '0.1a'
 def main():
     args = docopt(__doc__, version=__APPNAME__ + ' v' + __VERSION__)
     print(args)
+    sanscore.initialise()
 
 
 # Run the main function
