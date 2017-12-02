@@ -1,7 +1,7 @@
 //! Sans – Libreflip backend daemon
 
 mod cameras;
-mod images;
+mod workers;
 mod ocr;
 mod rest;
 mod state;
