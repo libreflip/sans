@@ -5,7 +5,7 @@ This is the general development roadmap. Many of these will be exported to becom
 
 ### Planning tasks
 
- - [ ] Create basic project layout
+ - [x] Create basic project layout
  - [ ] Figure out concurrency model between front-end and backend states
  - [ ] Create a module state layout
 
@@ -19,3 +19,4 @@ This is the general development roadmap. Many of these will be exported to becom
  - [ ] Design hardware communication protocol (input required)
  - [ ] Design RESTful API for front-end
 
+## States to manage
