@@ -37,8 +37,8 @@ pub mod post;
 /// It can be locally initialised, then sent to a remote work server, returning
 /// a `Result` type for the processing that was done.
 pub trait Work {
-    fn add_workload(&self);
-    fn work(&self) -> Result<i32, ()>;
+    fn add_workload(&mut self);
+    fn work(&mut self) -> Result<i32, ()>;
 }
 
 

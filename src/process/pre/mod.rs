@@ -3,15 +3,15 @@
 use process::Work;
 
 pub struct ColorCorrect {
-    
+
 }
 
 impl Work for ColorCorrect {
-    fn add_workload(&self) {
+    fn add_workload(&mut self) {
 
     }
 
-    fn work(&self) -> Result<i32, ()> {
+    fn work(&mut self) -> Result<i32, ()> {
         Ok(0)
     }
 }
