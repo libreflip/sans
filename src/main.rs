@@ -1,7 +1,7 @@
 //! Sans – Libreflip backend daemon
 
 mod cameras;
-mod workers;
+// mod workers;
 mod ocr;
 mod rest;
 mod state;
@@ -9,14 +9,9 @@ mod utilities;
 
 
 fn main() {
-
 }
 
 
-// use std::sync::{Mutex, Arc};
-// use std::thread;
-// 
-// fn main() {
 //     let counter = Arc::new(Mutex::new(0));
 //     let mut handles = vec![];
 
