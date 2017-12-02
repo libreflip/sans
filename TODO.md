@@ -6,8 +6,8 @@ This is the general development roadmap. Many of these will be exported to becom
 ### Planning tasks
 
  - [x] Create basic project layout
- - [ ] Figure out concurrency model between front-end and backend states
- - [ ] Create a module state layout
+ - [x] Figure out concurrency model between front-end and backend states
+ - [x] Create a module state layout
 
 ### Implementational tasks 
 

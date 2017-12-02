@@ -5,10 +5,10 @@
 //! implementation for [Worker].
 //!
 
-use api::{rx, tx};
+use process::Work;
 
 pub struct Scheduler {
-    _type: Type
+    t: Type
 }
 
 pub enum Type {
@@ -17,7 +17,11 @@ pub enum Type {
 }
 
 impl Scheduler {
-    pub fn new(_type: Type) {
-        return Scheduler { _type: _type };
+    pub fn new(t: Type) -> Scheduler {
+        return Scheduler { t: t };
+    }
+
+    pub fn dispatch(&mut self, work: Box<Work>) {
+        
     }
 }

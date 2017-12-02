@@ -10,6 +10,10 @@
 //! s.dispatch(...);
 //! ```
 
-pub use scheduler;
-pub use net_worker;
-pub use loc_worker;
+mod scheduler;
+pub use self::scheduler::{Scheduler, Type};
+
+pub mod net_worker;
+
+
+pub mod loc_worker;

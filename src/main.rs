@@ -1,14 +1,16 @@
 //! Sans – Libreflip backend daemon
 
-mod cameras;
-// mod workers;
-mod ocr;
+
+mod binding;
+mod process;
+// use process::scheduling::scheduler::{Scheduler, Type};
+
 mod rest;
 mod state;
 mod utilities;
 
-
 fn main() {
+    // let s = Scheduler::new(Type::LOCAL);
 }
 
 

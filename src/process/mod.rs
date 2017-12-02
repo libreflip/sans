@@ -27,6 +27,11 @@
 //!
 
 
+pub mod scheduling;
+pub mod pre;
+pub mod post;
+
+
 /// A trait that describes a piece of work to be done
 ///
 /// It can be locally initialised, then sent to a remote work server, returning
