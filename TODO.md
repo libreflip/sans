@@ -20,3 +20,12 @@ This is the general development roadmap. Many of these will be exported to becom
  - [ ] Design RESTful API for front-end
 
 ## States to manage
+
+ - Persistent settings
+   - Default export settings
+   - External compute servers
+ - Camera state handle
+ - Web API state handle
+ - Worker API state handle
+ - Hardware API handle
+ - 

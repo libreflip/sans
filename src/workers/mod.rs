@@ -12,9 +12,23 @@
 /// a `Result` type for the processing that was done.
 pub trait Work {
     fn add_workload(&self);
-    fn work(&self) -> Result<()>;
+    fn work(&self) -> Result<i32, ()>;
 }
 
-pub struct Workers {
-    
-}
+/*
+
+What this module needs to expose
+
+ - "Work" interface which can be used to implement LocalWorker and RemoteWorker
+ - "Worker" interface which can be used to compute work locally or receive it via an API
+ - "Scheduler" which is configured to either talk to a local worker or send the work to an external 
+      worker to process.
+
+  Worker (local)   |   Worker
+     ^^^           |     ^^^
+  Scheduler        |   [Use worker API]
+     ^^^           |     ^^^
+     WORK          |   Scheduler  
+                   |     ^^^  
+                   |     WORK
+*/
