@@ -3,14 +3,12 @@
 
 mod binding;
 mod process;
-// use process::scheduling::scheduler::{Scheduler, Type};
-
 mod rest;
 mod state;
-mod utilities;
+mod util;
+
 
 fn main() {
-    // let s = Scheduler::new(Type::LOCAL);
 }
 
 

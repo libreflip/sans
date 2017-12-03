@@ -1,3 +1,1 @@
-//! Various utilities that make everybodies life easier
-//! 
-//! 
+//! A module of utilities to make your life easier
