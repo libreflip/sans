@@ -7,4 +7,3 @@
 //! away in this submodule
 
 mod camera;
-pub use self::camera::Camera;
