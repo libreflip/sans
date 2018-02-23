@@ -5,3 +5,6 @@
 //! 
 //! This a lot of logic to abstract away FFI types and uncertainties are hidden
 //! away in this submodule
+
+mod camera;
+pub use self::camera::Camera;
