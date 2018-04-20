@@ -1,1 +1,0 @@
-//! A module of utilities to make your life easier

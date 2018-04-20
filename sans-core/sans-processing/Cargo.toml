@@ -1,0 +1,9 @@
+[package]
+name = "sans-processing"
+description = "Filter processing module for sans"
+version = "0.1.0"
+authors = ["Katharina Fey <kookie@spacekookie.de>"]
+
+[dependencies]
+rayon = "1.0"
+sans-types = { path = "../sans-types" }

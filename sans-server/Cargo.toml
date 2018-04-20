@@ -5,8 +5,9 @@ authors = ["Katharina Sabel <katharina.sabel@asquera.de>"]
 
 [dependencies]
 sans = { path = "../sans" }
+sans-types = { path = "../sans/sans-types/" }
+clap = "2.0"
 
-# REST dependencies
 rocket = "0.3"
 rocket_codegen = "0.3"
 rocket_contrib = "0.3"
