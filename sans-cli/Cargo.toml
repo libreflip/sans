@@ -1,0 +1,8 @@
+[package]
+name = "sansctl"
+version = "0.1.0"
+authors = ["spacekookie"]
+
+[dependencies]
+sans-types = { path = "../sans-core/sans-types" }
+clap = "*"

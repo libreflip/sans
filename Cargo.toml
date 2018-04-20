@@ -10,7 +10,8 @@ members = [
     "sans-server",
 
     # Task worker for processing pipeline
-    "sans-worker"
+    "sans-worker",
 
     # Optional debugging and development CLI
+    "sans-cli"
 ]

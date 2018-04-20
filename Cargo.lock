@@ -486,6 +486,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sansctl"
+version = "0.1.0"
+dependencies = [
+ "clap 2.31.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sans-types 0.1.0",
+]
+
+[[package]]
 name = "scopeguard"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
