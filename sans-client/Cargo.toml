@@ -1,0 +1,12 @@
+[package]
+name = "sans-client"
+version = "0.1.0"
+authors = ["Katharina Sabel <katharina.sabel@asquera.de>"]
+
+[dependencies]
+sans = { path = "../sans" }
+
+# REST dependencies
+rocket = "0.3"
+rocket_codegen = "0.3"
+rocket_contrib = "0.3"

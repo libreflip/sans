@@ -16,27 +16,33 @@
 extern crate rscam;
 extern crate clap;
 
-
 mod binding;
 mod process;
-mod rest;
-mod state;
 mod util;
 
-fn main() {
 
-    let camera = rscam::Camera::new("/dev/video0").unwrap();
-    let mut vec = Vec::new();
+/// Core sans state object that provides a hardware abstraction API
+/// 
+/// 
+struct Sans {
+
+}
+
+
+// fn main() {
+
+//     let camera = rscam::Camera::new("/dev/video0").unwrap();
+//     let mut vec = Vec::new();
     
-    camera.formats().all(|f| {
-        match f {
-            Ok(f) => vec.push(f),
-            _ => return false,
-        }
-        return true;
-    });
+//     camera.formats().all(|f| {
+//         match f {
+//             Ok(f) => vec.push(f),
+//             _ => return false,
+//         }
+//         return true;
+//     });
 
-    println!("{:?}", vec);
+//     println!("{:?}", vec);
 
     // camera
     //     .start(&Config {
@@ -52,4 +58,4 @@ fn main() {
     //     let mut file = fs::File::create(&format!("frame-{}.jpg", i)).unwrap();
     //     file.write_all(&frame[..]).unwrap();
     // }
-}
+// }
