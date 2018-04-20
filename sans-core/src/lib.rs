@@ -4,18 +4,35 @@
 extern crate sans_types;
 extern crate sans_processing;
 
+// extern crate magicrust;
 extern crate rscam;
-extern crate clap;
+
+#[macro_use]
+extern crate serde_derive;
+extern crate serde;
+extern crate toml;
+
 
 mod binding;
-mod process;
-mod util;
+mod config;
+
+pub use config::SansConfig;
 
 
 /// Core sans state object that provides a hardware abstraction API
 /// 
 /// 
-struct Sans {
+pub struct Sans {
+
+}
+
+
+impl Sans {
+
+    /// A factory function to create a new Sans container
+    pub fn new() -> Self {
+        return Sans {};
+    }
 
 }
 

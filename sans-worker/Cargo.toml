@@ -4,3 +4,4 @@ version = "0.1.0"
 authors = ["Katharina Sabel <katharina.sabel@asquera.de>"]
 
 [dependencies]
+sans-types = { path = "../sans-core/sans-types" }
