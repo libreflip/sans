@@ -1,11 +1,7 @@
-# Some basic stuff about what we're doing here
 language: rust
 services: docker
 sudo: required
-language: rust
 cache: cargo
-rust:
-  - nightly
 
 # This is required for coveralls
 addons:
@@ -29,6 +25,19 @@ script:
   - cargo test --verbose --all
   - cargo bench --all
   - cargo doc
+
+matrix: # additional tests
+  include:
+  - rust: nightly
+    script: |
+      cargo test --all --features nightly
+      cargo +nightly-2018-04-15 clippy --all -- -D warnings
+  - rust: 1.25.0  # `stable`: Locking down for consistent behavior
+    env: RUSTFMT=yes_please
+    install:
+    - rustup component add rustfmt-preview
+    script:
+    - cargo fmt --all -- --write-mode=diff
 
 # Upload the whole mess
 after_success:
