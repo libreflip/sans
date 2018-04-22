@@ -1,6 +1,6 @@
 //! Configuration module for sans
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use toml as serde_toml;
 
@@ -12,6 +12,12 @@ struct ConfigBackend {
 pub struct SansConfig {
     path: String,
     backend: ConfigBackend,
+}
+
+pub enum ConfigError {
+    FileNotFount,
+    FailedToReadFile,
+    CorruptFile,
 }
 
 impl SansConfig {
@@ -29,5 +35,31 @@ impl SansConfig {
                 })
                 .as_bytes())
             .expect("Failed to write sans config. Is your disk full?");
+    }
+
+    /// Attempt to load the configuration for sans. Will return
+    /// None if that was not possible.SansConfig
+    ///
+    /// In this case sans needs to terminate!
+    pub fn load(path: &str) -> Result<Self, ConfigError> {
+        use self::ConfigError::{CorruptFile, FailedToReadFile, FileNotFount};
+
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(_) => return Err(FileNotFount),
+        };
+
+        let mut content = String::new();
+        if f.read_to_string(&mut content).is_err() {
+            return Err(FailedToReadFile);
+        }
+
+        return Ok(SansConfig {
+            path: path.into(),
+            backend: match serde_toml::from_str(&content) {
+                Ok(s) => s,
+                Err(_) => return Err(CorruptFile),
+            },
+        });
     }
 }
