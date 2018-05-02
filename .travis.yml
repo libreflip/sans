@@ -24,10 +24,22 @@ before_script:
 
 # Build, test, benchmark, document. Gogogogo!
 script:
-  - cargo build --verbose --all
-  - cargo test --verbose --all
-  - cargo bench --all
-  - cargo doc
+  - |
+  # Firstly build sans-core by itself
+  (cd sans-core && cargo build --verbose --all) &&
+  (cd sans-core && cargo test --verbose --all) &&
+  (cd sans-core && cargo bench --all) &&
+  (cd sans-core && cargo doc) &&
+  # Build sans-server
+  (cd sans-server && cargo build --verbose --all) &&
+  (cd sans-server && cargo test --verbose --all) &&
+  (cd sans-server && cargo bench --all) &&
+  (cd sans-server && cargo doc) &&
+  # Build sans-worker
+  (cd sans-worker && cargo build --verbose --all) &&
+  (cd sans-worker && cargo test --verbose --all) &&
+  (cd sans-worker && cargo bench --all) &&
+  (cd sans-worker && cargo doc)
 
 matrix: # additional tests
   include:

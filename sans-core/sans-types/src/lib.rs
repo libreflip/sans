@@ -1,1 +1,2 @@
-//! 
+//! Libreflip shared type system
+

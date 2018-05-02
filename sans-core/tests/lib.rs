@@ -1,4 +1,4 @@
-//! Integration testing module for sans
+//! Integration testing for `sans-core`
 
 extern crate sans_core;
 
