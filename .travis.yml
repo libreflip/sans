@@ -46,15 +46,16 @@ matrix: # additional tests
   - rust: stable
   - rust: beta
   - rust: nightly
-    script: |
-      cargo test --all --features nightly
-      cargo +nightly-2018-04-15 clippy --all -- -D warnings
+    script: 
+      - |
+      (cd sans-server && cargo test --all --features nightly) &&
+      (cd sans-server && cargo +nightly-2018-04-15 clippy --all -- -D warnings)
   - rust: 1.25.0  # `stable`: Locking down for consistent behavior
     env: RUSTFMT=yes_please
     install:
     - rustup component add rustfmt-preview
     script:
-    - cargo fmt --all -- --write-mode=diff
+    - (cd sans-server && cargo fmt --all -- --write-mode=diff)
 
 # Upload the whole mess
 after_success:
