@@ -12,6 +12,6 @@ members = [
     # Task worker for processing pipeline
     "sans-worker",
 
-    # Optional debugging and development CLI
-    "sans-cli"
+    # Optional debugging and development CLI (sansctl)
+    "sans-ctrl"
 ]

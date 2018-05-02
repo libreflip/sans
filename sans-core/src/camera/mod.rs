@@ -1,25 +1,29 @@
 //! A hardware agnostic wrapper for different camera backends
-//! 
+//!
 //! By defalt the camera capture functionality is being implemented by
 //! the rscam crate, using the V4L2 backend. Via this API it is however possible
 //! to load other camera backends without changing other code functionality.
-//! 
+//!
+//! In the future this should also be possible via a plugin system that doesn't
+//! require other developers to have to modify `sans` sources.
 
-pub mod vl_cam;
+mod vl_cam;
+pub use self::vl_cam::VLCamera;
 
-
-pub struct CameraConfig {
-
-}
-
+/// A camera-backend overarching configuration setting
+/// 
+/// It describes capabilites such as resolutions, framerates
+/// and if a camera can be put into "live view" mode.
+pub struct CameraConfig {}
 
 /// A hardware agnostic camera trait
 pub trait Camera {
-
     /// Tries to run the very lengthy and time-intensive process of
-    /// auto-configuring this camera device. It can optionally be provided 
-    /// with a `target` config which acts as a guideline to what 
-    /// configuration is **desired**. This is however not enforced!
+    /// auto-configuring this camera device. It can optionally be provided
+    /// with a `target` config which acts as a guideline to what
+    /// configuration is **desired**.
+    ///
+    /// As this is a trait it is however not enforced!
     fn auto_config(&mut self, Option<CameraConfig>) -> Result<(), CameraError>;
 
     /// Capture an image into memory
@@ -29,7 +33,7 @@ pub trait Camera {
     fn capture_video(&self, fps: u32, time: u32) -> Result<(), CameraError>;
 
     /// Initialise the liveview stream with a specific framerate
-    fn init_liveview(&self, fps: u32) -> Result<(), CameraError>;
+    fn start_liveview(&self, fps: u32) -> Result<(), CameraError>;
 
     /// Stop liveview stream
     fn stop_liveview(&self) -> Result<(), CameraError>;
@@ -37,7 +41,6 @@ pub trait Camera {
     /// Get a data fragment from liveview buffer
     fn get_liveview_chunk(&self);
 }
-
 
 /// Error codes that are shared across the camera module
 pub enum CameraError {

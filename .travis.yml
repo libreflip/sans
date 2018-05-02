@@ -12,6 +12,9 @@ addons:
       - libdw-dev
       - binutils-dev
       - cmake
+      
+      # Actual sans dependencies
+      - libv4l-dev
     sources:
       - kalakris-cmake
 

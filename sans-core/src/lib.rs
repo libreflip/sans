@@ -13,7 +13,7 @@ extern crate serde;
 extern crate toml;
 
 
-mod binding;
+mod camera;
 mod config;
 
 pub use config::SansConfig;

@@ -10,6 +10,7 @@ pub struct VLCamera {
 }
 
 impl VLCamera {
+    
     /// Bind a new camera with a path on the FS
     pub fn new(path: &str) -> Result<VLCamera, CameraError> {
         return match CameraBackend::new(path) {
@@ -36,7 +37,7 @@ impl Camera for VLCamera {
         unimplemented!()
     }
 
-    fn init_liveview(&self, fps: u32) -> Result<(), CameraError> {
+    fn start_liveview(&self, fps: u32) -> Result<(), CameraError> {
         unimplemented!()
     }
 
