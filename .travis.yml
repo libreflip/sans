@@ -43,8 +43,6 @@ script:
 
 matrix: # additional tests
   include:
-  - rust: stable
-  - rust: beta
   - rust: nightly
     script: 
       - |
