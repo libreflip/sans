@@ -1,5 +1,9 @@
 //! sans-core – Libreflip backend daemon core library
 
+#![feature(non_modrs_mods)]
+#![feature(extern_prelude)]
+
+
 extern crate sans_types;
 
 extern crate serde;
@@ -8,9 +12,7 @@ extern crate serde_derive;
 extern crate toml;
 
 extern crate rscam;
-
-extern crate mio;
-extern crate mio_serial;
+extern crate serialport;
 
 mod camera;
 mod config;

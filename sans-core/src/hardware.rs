@@ -1,28 +1,15 @@
 //! Hardware abstraction module
 
-use mio::unix::UnixReady;
-use mio::{Events, Poll, PollOpt, Ready, Token};
-use mio_serial;
+mod parser;
 
-use std::io::{Read, Write};
-use std::{env, str};
-
-/// A delimiter token for serial comms
-const SERIAL_TOKEN: Token = Token(0);
-const SERIAL_BUF_SIZE: usize = 1024;
+use serialport::prelude::*;
+use std::io::{self, Write};
+use std::time::Duration;
 
 struct Hardware {
+    rxtx: Box<SerialPort>,
     port: String,
-}
-
-/// Utility function to check if port is ready & willing
-fn readiness() -> Ready {
-    Ready::readable() | UnixReady::hup() | UnixReady::error()
-}
-
-/// Utility function to check if port is closed
-fn is_closed(state: Ready) -> bool {
-    state.contains(UnixReady::hup() | UnixReady::error())
+    settings: SerialPortSettings,
 }
 
 /// All supported commands for this hardware
@@ -41,63 +28,38 @@ enum Payload {
 struct Response {
     state: u8,
     length: u8,
-    payload: [u8]
 }
 
 impl Hardware {
-    pub fn new(port: &str) {
-        let poll = Poll::new().unwrap();
-        let mut events = Events::with_capacity(SERIAL_BUF_SIZE);
+    /// Attempt to open a serial connection
+    pub fn new(port: &str, baud: u32) -> Option<Hardware> {
+        let mut settings: SerialPortSettings = Default::default();
+        settings.timeout = Duration::from_millis(10);
+        settings.baud_rate = baud.into();
 
-        // Create the listener
-        let settings = mio_serial::SerialPortSettings::default();
+        return Some(Hardware {
+            rxtx: serialport::open_with_settings(&port, &settings).ok()?,
+            port: String::from(port),
+            settings,
+        });
+    }
 
-        println!("Opening {} at 9600,8N1", port);
-        let mut rx = mio_serial::Serial::from_path(&port, &settings).unwrap();
-
-        poll.register(&rx, SERIAL_TOKEN, self::readiness(), PollOpt::edge())
-            .unwrap();
-
-        let mut rx_buf = [0u8; 1024];
-        'outer: loop {
-            poll.poll(&mut events, None).unwrap();
-
-            if events.is_empty() {
-                println!("Read timed out!");
-                continue;
-            }
-
-            for event in events.iter() {
-                match event.token() {
-                    SERIAL_TOKEN => {
-                        let ready = event.readiness();
-                        if self::is_closed(ready) {
-                            println!("Quitting due to event: {:?}", ready);
-                            break 'outer;
-                        }
-                        if ready.is_readable() {
-                            match rx.read(&mut rx_buf) {
-                                Ok(b) => match b {
-                                    b if b > 0 => {
-                                        println!("{:?}", String::from_utf8_lossy(&rx_buf[..b]))
-                                    }
-                                    _ => println!("Read would have blocked."),
-                                },
-                                Err(e) => println!("Error:  {}", e),
-                            }
-                        }
-                    }
-                    t => unreachable!("Unexpected token: {:?}", t),
-                }
-            }
-
-            /* foo */
+    /// Start an async I/O runner for this port
+    pub fn run(&mut self) {
+        loop {
+            self.poll();
         }
     }
+
+    /// Do a polling-loop for the serialport
+    fn poll(&mut self) -> Option<()> {
+        let mut buffer = vec![0; 2];
+        self.rxtx.read_exact(&mut buffer).ok()?;
+
+        /* Parse received input */
+        parser::get_response(buffer);
+
+        /* Return the all-clear */
+        return Some(());
+    }
 }
-
-/// Utility function which parses a single command-code
-fn parse_message() {}
-
-/// Utility function which sends a single command-code
-fn send_message() {}
