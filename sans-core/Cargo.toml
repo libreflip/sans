@@ -16,3 +16,4 @@ toml = "0.4"
 # Hardware bindings
 rscam = "0.5"
 mio-serial = "0.8"
+mio = "0.6"

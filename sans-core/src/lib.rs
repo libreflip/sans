@@ -2,13 +2,15 @@
 
 extern crate sans_types;
 
-// extern crate magicrust;
-extern crate rscam;
-
 #[macro_use]
 extern crate serde_derive;
 extern crate serde;
 extern crate toml;
+
+extern crate rscam;
+
+extern crate mio;
+extern crate mio_serial;
 
 mod camera;
 mod config;
