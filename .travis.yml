@@ -3,15 +3,17 @@ services: docker
 sudo: required
 cache: cargo
 
-# This is required for coveralls
 addons:
   apt:
     packages:
+      # This is required for coveralls
       - libcurl4-openssl-dev
       - libelf-dev
       - libdw-dev
       - binutils-dev
       - cmake
+      # sans dependencies
+      - libudev-dev
       
       # Actual sans dependencies
       - libv4l-dev
