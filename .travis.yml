@@ -12,20 +12,6 @@ addons:
       - libdw-dev
       - binutils-dev
       - cmake
-      # sans dependencies
-      - libudev-dev
-      - imagemagick-dev
-      - wget http://www.imagemagick.org/download/ImageMagick-7.0.7-30.tar.gz -O ImageMagick.tar.gz
-      - tar xf ImageMagick.tar.gz
-      - cd ImageMagick*
-      - ./configure --prefix=/usr
-      - make
-      - sudo make install
-      - cd ..
-      - printf "\n" | pecl install imagick-beta
-      
-      # Actual sans dependencies
-      - libv4l-dev
     sources:
       - kalakris-cmake
 
@@ -36,38 +22,44 @@ before_script:
 # Build, test, benchmark, document. Gogogogo!
 script:
   - |
-    # Firstly build sans-core by itself
-    (cd sans-core && cargo build --verbose --all) &&
-    (cd sans-core && cargo test --verbose --all) &&
-    (cd sans-core && cargo bench --all) &&
-    (cd sans-core && cargo doc) &&
-    # Build sans-server
-    (cd sans-server && cargo build --verbose --all) &&
-    (cd sans-server && cargo test --verbose --all) &&
-    (cd sans-server && cargo bench --all) &&
-    (cd sans-server && cargo doc) &&
-    # Build sans-worker
-    (cd sans-worker && cargo build --verbose --all) &&
-    (cd sans-worker && cargo test --verbose --all) &&
-    (cd sans-worker && cargo bench --all) &&
-    (cd sans-worker && cargo doc) &&
-    # Clippy checking
-    (cd sans-server && cargo test --all --features nightly) &&
-    (cd sans-server && cargo clippy --all -- -D warnings) &&
-    # Do a formatter run
-    cargo fmt --all -- --write-mode=diff
+    export PKG_CONFIG_ALLOW_CROSS=1
+    cross build --target armv7-unknown-linux-gnueabihf
+    cross test --verbose --all --target armv7-unknown-linux-gnueabihf
 
-matrix: # additional tests
-  include:
+
+  # - |
+  #   # Firstly build sans-core by itself
+  #   (cd sans-core && cargo build --verbose --all) &&
+  #   (cd sans-core && cargo test --verbose --all) &&
+  #   (cd sans-core && cargo bench --all) &&
+  #   (cd sans-core && cargo doc) &&
+  #   # Build sans-server
+  #   (cd sans-server && cargo build --verbose --all) &&
+  #   (cd sans-server && cargo test --verbose --all) &&
+  #   (cd sans-server && cargo bench --all) &&
+  #   (cd sans-server && cargo doc) &&
+  #   # Build sans-worker
+  #   (cd sans-worker && cargo build --verbose --all) &&
+  #   (cd sans-worker && cargo test --verbose --all) &&
+  #   (cd sans-worker && cargo bench --all) &&
+  #   (cd sans-worker && cargo doc) &&
+  #   # Clippy checking
+  #   (cd sans-server && cargo test --all --features nightly) &&
+  #   (cd sans-server && cargo clippy --all -- -D warnings) &&
+  #   # Do a formatter run
+  #   cargo fmt --all -- --write-mode=diff
+
+# matrix: # additional tests
+  # include:
 
   # Rolling compilation for rocket
-  - rust: nightly-2018-04-30
-    env: RUSTFMT=yes_please
-    install: rustup component add rustfmt-preview
+  # - rust: nightly-2018-04-30
+  #   env: RUSTFMT=yes_please
+  #   install: rustup component add rustfmt-preview
 
 # Upload the whole mess
-after_success:
-  - cargo coveralls --verbose
+# after_success:
+  # - cargo coveralls --verbose
 
 # AND GOD DAMN IT LET ME SLEEP!
 notifications:

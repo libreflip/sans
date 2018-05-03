@@ -2,7 +2,7 @@
 
 mod parser;
 
-use serialport::prelude::*;
+use serialport::{self, prelude::*};
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -13,19 +13,19 @@ struct Hardware {
 }
 
 /// All supported commands for this hardware
-enum Command {
+pub enum Command {
     MoveBox = 0b00000010,
     Lighting = 0b00000100,
     FlipPage = 0b00001000,
 }
 
 /// Second-byte is a payload described here
-enum Payload {
+pub enum Payload {
     Flag(bool),
     Value(u8),
 }
 
-struct Response {
+pub struct Response {
     state: u8,
     length: u8,
 }
