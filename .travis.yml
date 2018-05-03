@@ -53,15 +53,11 @@ matrix: # additional tests
 
   # Pin up-to-date nightly version for clippy
   - rust: nightly-2018-05-01
+    install: rustup install nightly-2018-05-01
     script: 
       - |
         (cd sans-server && cargo test --all --features nightly) &&
-        (cd sans-server && cargo +nightly-2018-04-15 clippy --all -- -D warnings)
-  
-  # This is an old nightly we pin for formatting guides
-  - rust: nightly-2018-02-01
-    env: RUSTFMT=yes_please
-    install: rustup component add rustfmt-preview
+        (cd sans-server && cargo +nightly-2018-05-01 clippy --all -- -D warnings)
 
 # Upload the whole mess
 after_success:

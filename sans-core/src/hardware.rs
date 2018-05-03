@@ -25,8 +25,23 @@ fn is_closed(state: Ready) -> bool {
     state.contains(UnixReady::hup() | UnixReady::error())
 }
 
+/// All supported commands for this hardware
 enum Command {
-    TurnPage = 0x010001001,
+    MoveBox = 0b00000010,
+    Lighting = 0b00000100,
+    FlipPage = 0b00001000,
+}
+
+/// Second-byte is a payload described here
+enum Payload {
+    Flag(bool),
+    Value(u8),
+}
+
+struct Response {
+    state: u8,
+    length: u8,
+    payload: [u8]
 }
 
 impl Hardware {
