@@ -23,10 +23,8 @@ before_script:
 # Build, test, benchmark, document. Gogogogo!
 script:
   - |
-    export PKG_CONFIG_ALLOW_CROSS=1
     cross build --target armv7-unknown-linux-gnueabihf
     cross test --verbose --all --target armv7-unknown-linux-gnueabihf
-
 
   # - |
   #   # Firstly build sans-core by itself
@@ -50,13 +48,15 @@ script:
   #   # Do a formatter run
   #   cargo fmt --all -- --write-mode=diff
 
-# matrix: # additional tests
-  # include:
+matrix:
+  include:
 
-  # Rolling compilation for rocket
-  # - rust: nightly-2018-04-30
-  #   env: RUSTFMT=yes_please
-  #   install: rustup component add rustfmt-preview
+  # Pin nightly for rocket
+  - rust: nightly-2018-04-30
+    env: 
+      - RUSTFMT=yes_please
+      - PKG_CONFIG_ALLOW_CROSS=1
+    install: rustup component add rustfmt-preview
 
 # Upload the whole mess
 # after_success:
