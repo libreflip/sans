@@ -14,6 +14,7 @@ addons:
       - cmake
       # sans dependencies
       - libudev-dev
+      - imagemagick-dev
       - wget http://www.imagemagick.org/download/ImageMagick-7.0.7-30.tar.gz -O ImageMagick.tar.gz
       - tar xf ImageMagick.tar.gz
       - cd ImageMagick*
