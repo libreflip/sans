@@ -14,6 +14,14 @@ addons:
       - cmake
       # sans dependencies
       - libudev-dev
+      - wget http://www.imagemagick.org/download/ImageMagick.tar.gz
+      - tar xf ImageMagick.tar.gz
+      - cd ImageMagick*
+      - ./configure --prefix=/usr
+      - make
+      - sudo make install
+      - cd ..
+      - printf "\n" | pecl install imagick-beta
       
       # Actual sans dependencies
       - libv4l-dev
