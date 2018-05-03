@@ -39,7 +39,10 @@ script:
     (cd sans-worker && cargo build --verbose --all) &&
     (cd sans-worker && cargo test --verbose --all) &&
     (cd sans-worker && cargo bench --all) &&
-    (cd sans-worker && cargo doc)
+    (cd sans-worker && cargo doc) &&
+    # Clippy checking
+    (cd sans-server && cargo test --all --features nightly) &&
+    (cd sans-server && cargo clippy --all -- -D warnings) &&
     # Do a formatter run
     cargo fmt --all -- --write-mode=diff
 
@@ -47,17 +50,9 @@ matrix: # additional tests
   include:
 
   # Rolling compilation for rocket
-  - rust: nightly 
+  - rust: nightly-2018-04-30
     env: RUSTFMT=yes_please
     install: rustup component add rustfmt-preview
-
-  # Pin up-to-date nightly version for clippy
-  - rust: nightly-2018-05-01
-    install: rustup install nightly-2018-05-01
-    script: 
-      - |
-        (cd sans-server && cargo test --all --features nightly) &&
-        (cd sans-server && cargo +nightly-2018-05-01 clippy --all -- -D warnings)
 
 # Upload the whole mess
 after_success:
