@@ -2,7 +2,7 @@
 //!
 //!
 
-use super::{Camera, CameraError, CameraConfig};
+use super::{Camera, CameraConfig, CameraError};
 use rscam::Camera as CameraBackend;
 
 pub struct VLCamera {
@@ -10,7 +10,6 @@ pub struct VLCamera {
 }
 
 impl VLCamera {
-    
     /// Bind a new camera with a path on the FS
     pub fn new(path: &str) -> Result<VLCamera, CameraError> {
         return match CameraBackend::new(path) {
@@ -24,7 +23,6 @@ impl VLCamera {
 }
 
 impl Camera for VLCamera {
-
     fn auto_config(&mut self, cfg: Option<CameraConfig>) -> Result<(), CameraError> {
         unimplemented!()
     }

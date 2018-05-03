@@ -40,20 +40,28 @@ script:
     (cd sans-worker && cargo test --verbose --all) &&
     (cd sans-worker && cargo bench --all) &&
     (cd sans-worker && cargo doc)
+    # Do a formatter run
+    cargo fmt --all -- --write-mode=diff
 
 matrix: # additional tests
   include:
-  - rust: nightly
+
+  # Rolling compilation for rocket
+  - rust: nightly 
+    env: RUSTFMT=yes_please
+    install: rustup component add rustfmt-preview
+
+  # Pin up-to-date nightly version for clippy
+  - rust: nightly-2018-05-01
     script: 
       - |
         (cd sans-server && cargo test --all --features nightly) &&
         (cd sans-server && cargo +nightly-2018-04-15 clippy --all -- -D warnings)
-  - rust: 1.25.0  # `stable`: Locking down for consistent behavior
+  
+  # This is an old nightly we pin for formatting guides
+  - rust: nightly-2018-02-01
     env: RUSTFMT=yes_please
-    install:
-    - rustup component add rustfmt-preview
-    script:
-    - (cd sans-server && cargo fmt --all -- --write-mode=diff)
+    install: rustup component add rustfmt-preview
 
 # Upload the whole mess
 after_success:

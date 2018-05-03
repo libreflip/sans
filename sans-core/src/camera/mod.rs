@@ -11,7 +11,7 @@ mod vl_cam;
 pub use self::vl_cam::VLCamera;
 
 /// A camera-backend overarching configuration setting
-/// 
+///
 /// It describes capabilites such as resolutions, framerates
 /// and if a camera can be put into "live view" mode.
 pub struct CameraConfig {}

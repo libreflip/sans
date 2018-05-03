@@ -1,5 +1,5 @@
 //! sans-server – Libreflip sans server daemon
-//! 
+//!
 //! The design principle for this software is taken from Aouglas Adams:
 //!
 //! > Don't Panic!
@@ -13,9 +13,9 @@
 #![feature(plugin, decl_macro)]
 #![plugin(rocket_codegen)]
 
+extern crate rocket;
 extern crate sans_core;
 extern crate sans_types;
-extern crate rocket;
 
 #[get("/")]
 fn hello() -> &'static str {

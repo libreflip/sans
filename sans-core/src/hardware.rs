@@ -31,7 +31,6 @@ enum Command {
 
 impl Hardware {
     pub fn new(port: &str) {
-        
         let poll = Poll::new().unwrap();
         let mut events = Events::with_capacity(SERIAL_BUF_SIZE);
 
