@@ -18,7 +18,7 @@ addons:
 # This is a pretty big hack and only really needed on the first of a build chain
 before_script:
   - (cargo install cargo-travis | true) && export PATH=$HOME/.cargo/bin:$PATH
-  - cargo install cross
+  - (cargo install cross | true) && export PATH=$HOME/.cargo/bin:$PATH
 
 # Build, test, benchmark, document. Gogogogo!
 script:
