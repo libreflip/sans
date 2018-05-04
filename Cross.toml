@@ -1,5 +1,5 @@
 [target.armv7-unknown-linux-gnueabihf]
-image = "sans-ci:latest"
+image = "libreflip/sans-ci:latest"
 
 [build.env]
 passthrough = [
