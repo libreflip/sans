@@ -10,6 +10,11 @@
 mod vl_cam;
 pub use self::vl_cam::VLCamera;
 
+/// The camera type, usually location
+pub enum CameraType {
+    Left, Right
+}
+
 /// A camera-backend overarching configuration setting
 ///
 /// It describes capabilites such as resolutions, framerates

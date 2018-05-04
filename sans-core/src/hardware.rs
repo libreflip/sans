@@ -6,7 +6,7 @@ use serialport::{self, prelude::*};
 use std::io::{self, Write};
 use std::time::Duration;
 
-struct Hardware {
+pub struct Hardware {
     rxtx: Box<SerialPort>,
     port: String,
     settings: SerialPortSettings,

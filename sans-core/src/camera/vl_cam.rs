@@ -2,18 +2,19 @@
 //!
 //!
 
-use super::{Camera, CameraConfig, CameraError};
-use rscam::Camera as CameraBackend;
+use super::{Camera, CameraConfig, CameraError, CameraType};
+pub use rscam::Camera as CameraBackend;
 
 pub struct VLCamera {
     backend: CameraBackend,
+    meta: CameraType,
 }
 
 impl VLCamera {
     /// Bind a new camera with a path on the FS
-    pub fn new(path: &str) -> Result<VLCamera, CameraError> {
+    pub fn new(path: &str, meta: CameraType) -> Result<VLCamera, CameraError> {
         return match CameraBackend::new(path) {
-            Ok(c) => Ok(VLCamera { backend: c }),
+            Ok(c) => Ok(VLCamera { backend: c, meta }),
             Err(e) => Err(CameraError::ReceiverNotFound(format!(
                 "Failed to allocate '{}': {:?}",
                 path, e

@@ -3,7 +3,6 @@
 #![feature(non_modrs_mods)]
 #![feature(extern_prelude)]
 
-
 extern crate sans_types;
 
 extern crate serde;
@@ -20,43 +19,38 @@ mod hardware;
 
 pub use config::SansConfig;
 
+use camera::{CameraType, VLCamera as Camera};
+use hardware::Hardware;
+
 /// Core `sans` state, initiliasers & run loop
-pub struct Sans {}
+pub struct Sans {
+    cameras: Vec<Camera>,
+    hardware: Hardware,
+}
+
+pub enum SansErrors {
+    ShootingInProgress(String),
+}
 
 impl Sans {
     /// A factory function to create a new Sans container
-    pub fn new() -> Self {
-        return Sans {};
+    pub fn new(cfg: SansConfig) -> Option<Self> {
+        Some(Sans {
+            cameras: vec![
+                Camera::new(&*cfg.cameras.left, CameraType::Left).ok()?,
+                Camera::new(&*cfg.cameras.right, CameraType::Right).ok()?,
+            ],
+            hardware: Hardware::new(&*cfg.hw_port, 9200)?,
+        })
+    }
+
+    /// Start a new process, Err if one is already in progress
+    pub fn start_process(&mut self) -> Result<(), SansErrors> {
+        Ok(())
+    }
+
+    /// Cancel an already running process
+    pub fn cancel_running(&mut self) -> Result<(), SansErrors> {
+        Ok(())
     }
 }
-
-// fn main() {
-
-//     let camera = rscam::Camera::new("/dev/video0").unwrap();
-//     let mut vec = Vec::new();
-
-//     camera.formats().all(|f| {
-//         match f {
-//             Ok(f) => vec.push(f),
-//             _ => return false,
-//         }
-//         return true;
-//     });
-
-//     println!("{:?}", vec);
-
-// camera
-//     .start(&Config {
-//         interval: (1, 60), // 30 fps.
-//         resolution: (1920, 1080),
-//         format: b"MJPG",
-//         ..Default::default()
-//     })
-//     .unwrap();
-
-// for i in 0..120 {
-//     let frame = camera.capture().unwrap();
-//     let mut file = fs::File::create(&format!("frame-{}.jpg", i)).unwrap();
-//     file.write_all(&frame[..]).unwrap();
-// }
-// }

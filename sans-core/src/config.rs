@@ -2,16 +2,35 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::ops::Deref;
+
 use toml as serde_toml;
 
+
 #[derive(Serialize, Deserialize)]
-struct ConfigBackend {
-    cameras: Vec<String>,
+pub struct ConfigBackend {
+    pub cameras: Cameras,
+    pub http_port: u32,
+    pub img_worker: (String, u32),
+    pub hw_port: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Cameras {
+    pub left: String,
+    pub right: String,
 }
 
 pub struct SansConfig {
     path: String,
-    backend: ConfigBackend,
+    pub backend: ConfigBackend,
+}
+
+impl Deref for SansConfig {
+    type Target = ConfigBackend;
+    fn deref(&self) -> &ConfigBackend {
+        return &self.backend;
+    }
 }
 
 pub enum ConfigError {
@@ -30,7 +49,13 @@ impl SansConfig {
             .write_all(&serde_toml::to_string_pretty(&self.backend)
                 .unwrap_or_else(|_| {
                     serde_toml::to_string_pretty(&ConfigBackend {
-                        cameras: Vec::new(),
+                        cameras: Cameras {
+                            left: String::new(),
+                            right: String::new(),
+                        },
+                        http_port: 8080,
+                        img_worker: (String::new(), 5505),
+                        hw_port: String::from("/dev/ttyUSB-libreflip"),
                     }).unwrap()
                 })
                 .as_bytes())
