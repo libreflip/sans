@@ -18,9 +18,8 @@ mod config;
 mod hardware;
 
 pub use config::SansConfig;
-
-use camera::{CameraType, VLCamera as Camera};
-use hardware::Hardware;
+pub use camera::{CameraType, VLCamera as Camera};
+pub use hardware::Hardware;
 
 /// Core `sans` state, initiliasers & run loop
 pub struct Sans {
