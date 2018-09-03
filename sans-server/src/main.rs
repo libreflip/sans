@@ -23,8 +23,8 @@ use sans_core::{Camera, CameraTrait, CameraType};
 
 fn main() {
 
-    for n in &[0..=11] {
-        let left = Camera::new(format!("/dev/video{}", n), CameraType::Left).unwrap();
+    for n in 0..=11 {
+        let left = Camera::new(&format!("/dev/video{}", n), CameraType::Left).unwrap();
         print!("Camera: {}", n);
         match left.capture_image() {
             Ok(n) => println!("OK!"),
