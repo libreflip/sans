@@ -44,7 +44,7 @@ impl Camera for VLCamera {
 
     fn capture_image(&self) -> Result<(), CameraError> {
         let frame = self.backend.capture().unwrap();
-        let mut file = fs::File::create(&format!("frame-{}.jpg", self.meta)).unwrap();
+        let mut file = fs::File::create(&format!("static/img/frame-{}.jpg", self.meta)).unwrap();
         file.write_all(&frame[..]).unwrap();
         Ok(())
     }

@@ -23,7 +23,7 @@ use sans_core::{Camera, CameraTrait, CameraType};
 
 fn main() {
     let left = Camera::new("/dev/video0".into(), CameraType::Left).unwrap();
-    // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
+    let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
 
     println!("Press <enter> to take two pictures – reload your browser after");
     loop {
@@ -33,7 +33,7 @@ fn main() {
             .expect("Failed to read user input!");
 
         left.capture_image().unwrap();
-        // right.capture_image().unwrap();
+        right.capture_image().unwrap();
         println!("*click*");
     }
 }
