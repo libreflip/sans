@@ -18,57 +18,10 @@ extern crate rocket_contrib;
 extern crate sans_core;
 extern crate sans_types;
 
-use std::io::{stdin, Cursor};
-
-#[get("/")]
-fn hello() -> Result<Response<'static>, Status> {
-    let body = "<!DOCTYPE html>
-<html>
-<body>
-    <a href=\"/pictures\">Camera calibrator</a>
-</body>
-</html>";
-
-    Response::build()
-        .header(ContentType::HTML)
-        .sized_body(Cursor::new(body))
-        .ok()
-}
-
-use rocket::http::{ContentType, Status};
-use rocket::response::Response;
+use std::io::stdin;
 use sans_core::{Camera, CameraTrait, CameraType};
-use std::thread;
-
-#[get("/pictures")]
-fn pictures() -> Result<Response<'static>, Status> {
-    let body = "<!DOCTYPE html>
-<html>
-<head>
-    <title>Libreflip Camera Calibrator 3000</title>
-</head>
-<body>
-    <h1>Libreflip Camera Calibrator 3000</h1>
-
-    <img src=\"frame-left.jpg\"  width=450 />
-    <img src=\"frame-right.jpg\" width=450 />
-</body>
-</html>";
-
-    Response::build()
-        .header(ContentType::HTML)
-        .sized_body(Cursor::new(body))
-        .ok()
-}
 
 fn main() {
-    println!("=== sans server ===");
-    thread::spawn(|| {
-        rocket::ignite()
-            .mount("/", routes![hello, pictures])
-            .launch();
-    });
-
     let left = Camera::new("/dev/video0".into(), CameraType::Left).unwrap();
     // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
 
