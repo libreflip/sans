@@ -31,6 +31,7 @@ fn main() {
             Err(_) => println!("FAILED"),
         };
     }
+}
 
     // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
 
@@ -43,5 +44,5 @@ fn main() {
 
     //     right.capture_image().unwrap();
     //     println!("*click*");
-    }
-}
+//     }
+// }
