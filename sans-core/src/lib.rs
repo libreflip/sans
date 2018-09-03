@@ -17,8 +17,8 @@ mod camera;
 mod config;
 mod hardware;
 
+pub use camera::{Camera as CameraTrait, CameraConfig, CameraType, VLCamera as Camera};
 pub use config::SansConfig;
-pub use camera::{CameraType, VLCamera as Camera};
 pub use hardware::Hardware;
 
 /// Core `sans` state, initiliasers & run loop

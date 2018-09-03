@@ -12,14 +12,32 @@ pub use self::vl_cam::VLCamera;
 
 /// The camera type, usually location
 pub enum CameraType {
-    Left, Right
+    Left,
+    Right,
+}
+
+use std::fmt;
+impl fmt::Display for CameraType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use CameraType::*;
+        write!(
+            f,
+            "{}",
+            match self {
+                Left => "left",
+                Right => "right",
+            }
+        )
+    }
 }
 
 /// A camera-backend overarching configuration setting
 ///
 /// It describes capabilites such as resolutions, framerates
 /// and if a camera can be put into "live view" mode.
-pub struct CameraConfig {}
+pub struct CameraConfig {
+    pub id: String,
+}
 
 /// A hardware agnostic camera trait
 pub trait Camera {
@@ -48,6 +66,7 @@ pub trait Camera {
 }
 
 /// Error codes that are shared across the camera module
+#[derive(Debug)]
 pub enum CameraError {
     /// When the camera target isn't known
     ReceiverNotFound(String),

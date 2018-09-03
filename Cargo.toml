@@ -3,7 +3,7 @@ members = [
 
     # Core sans library components
     "sans-core",
-    "sans-core/sans-processing",
+    # "sans-core/sans-processing",
     "sans-core/sans-types",
 
     # Core server run on machine
