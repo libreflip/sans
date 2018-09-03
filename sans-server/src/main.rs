@@ -22,18 +22,26 @@ use std::io::stdin;
 use sans_core::{Camera, CameraTrait, CameraType};
 
 fn main() {
-    let left = Camera::new("/dev/video0".into(), CameraType::Left).unwrap();
-    let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
 
-    println!("Press <enter> to take two pictures – reload your browser after");
-    loop {
-        let mut _s = String::new();
-        stdin()
-            .read_line(&mut _s)
-            .expect("Failed to read user input!");
+    for n in &[0..=11] {
+        let left = Camera::new(format!("/dev/video{}", n), CameraType::Left).unwrap();
+        print!("Camera: {}", n);
+        match left.capture_image() {
+            Ok(n) => println!("OK!"),
+            Err(_) => println!("FAILED"),
+        };
+    }
 
-        left.capture_image().unwrap();
-        right.capture_image().unwrap();
-        println!("*click*");
+    // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
+
+    // println!("Press <enter> to take two pictures – reload your browser after");
+    // loop {
+    //     let mut _s = String::new();
+    //     stdin()
+    //         .read_line(&mut _s)
+    //         .expect("Failed to read user input!");
+
+    //     right.capture_image().unwrap();
+    //     println!("*click*");
     }
 }
