@@ -54,20 +54,23 @@ fn rocket() -> rocket::Rocket {
     rocket::ignite().mount("/", routes![index, shoot])
 }
 
-fn main() {
-    rocket().launch();
-}
-
 // fn main() {
-// for n in 0..=11 {
-//     let left = Camera::new(&format!("/dev/video{}", n), CameraType::Left).unwrap();
-//     print!("Camera: {}", n);
-//     match left.capture_image() {
-//         Ok(_) => println!("OK!"),
-//         Err(_) => println!("FAILED"),
-//     };
+//     rocket().launch();
 // }
-// }
+
+fn main() {
+    for n in 0..=11 {
+        print!("Camera: {}", n);
+        let left = match Camera::new(&format!("/dev/video{}", n), CameraType::Left) {
+            Ok(c) => c,
+            _ => continue
+        };
+        match left.capture_image() {
+            Ok(_) => println!("OK!"),
+            Err(_) => println!("FAILED"),
+        };
+    }
+}
 
 // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
 
