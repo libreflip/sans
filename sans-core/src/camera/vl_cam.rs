@@ -27,8 +27,8 @@ impl VLCamera {
 
         backend
             .start(&Config {
-                interval: (1, 30), // 30 fps.
-                resolution: (1280, 720),
+                interval: (1, 1), // 30 fps.
+                resolution: (3840, 2160),
                 // resolution: (4224, 3156),
                 format: b"MJPG",
                 ..Default::default()
@@ -45,6 +45,7 @@ impl Camera for VLCamera {
 
     fn capture_image(&self) -> Result<(), CameraError> {
         let frame = self.backend.capture().unwrap();
+        fs::remove_file(&format!("static/img/frame-{}.jpg", self.meta));
         let mut file = fs::File::create(&format!("static/img/frame-{}.jpg", self.meta)).unwrap();
         file.write_all(&frame[..]).unwrap();
         Ok(())
