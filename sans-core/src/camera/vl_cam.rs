@@ -28,7 +28,8 @@ impl VLCamera {
         backend
             .start(&Config {
                 interval: (1, 30), // 30 fps.
-                resolution: (4224, 3156),
+                resolution: (1280, 720),
+                // resolution: (4224, 3156),
                 format: b"MJPG",
                 ..Default::default()
             }).unwrap();

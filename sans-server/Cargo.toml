@@ -1,7 +1,7 @@
 [package]
 name = "sans-server"
 version = "0.1.0"
-authors = ["Katharina Sabel <katharina.sabel@asquera.de>"]
+authors = ["Katharina Fey <kookie@spacekookie.de>"]
 
 [dependencies]
 sans-core = { path = "../sans-core" }

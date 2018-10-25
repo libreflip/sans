@@ -10,39 +10,75 @@
 //! into a Result<_> and communicate them to the user interface. Any actual panic
 //! is a condition in the operation that prevents communication with the UI. These
 //! should however still be logged.
-#![feature(plugin, decl_macro)]
+#![feature(custom_derive, plugin, decl_macro)]
 #![plugin(rocket_codegen)]
 
+#[macro_use]
 extern crate rocket;
 extern crate rocket_contrib;
 extern crate sans_core;
 extern crate sans_types;
 
-use std::io::stdin;
+use rocket::http::RawStr;
+use rocket::request::{Form, FromFormValue};
+use rocket::response::Redirect;
+
+use rocket::response::NamedFile;
+
 use sans_core::{Camera, CameraTrait, CameraType};
+use std::io::{self, stdin};
+use std::path::{Path, PathBuf};
 
-fn main() {
+#[derive(FromForm)]
+struct CaptureRequest {}
 
-    for n in 0..=11 {
-        let left = Camera::new(&format!("/dev/video{}", n), CameraType::Left).unwrap();
-        print!("Camera: {}", n);
-        match left.capture_image() {
-            Ok(n) => println!("OK!"),
-            Err(_) => println!("FAILED"),
-        };
-    }
+#[post("/shoot", data = "<_form>")]
+fn shoot(_form: Form<CaptureRequest>) -> Result<Redirect, String> {
+    println!("Capturing new pictures!");
+
+    let left = Camera::new("/dev/video0".into(), CameraType::Left).unwrap();
+    left.capture_image().unwrap();
+
+    let right = Camera::new("/dev/video0".into(), CameraType::Right).unwrap();
+    right.capture_image().unwrap();
+
+    Ok(Redirect::to("/"))
 }
 
-    // let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
+#[get("/")]
+pub fn index() -> io::Result<NamedFile> {
+    NamedFile::open("static/index.html")
+}
 
-    // println!("Press <enter> to take two pictures – reload your browser after");
-    // loop {
-    //     let mut _s = String::new();
-    //     stdin()
-    //         .read_line(&mut _s)
-    //         .expect("Failed to read user input!");
+fn rocket() -> rocket::Rocket {
+    rocket::ignite().mount("/", routes![index, shoot])
+}
 
-    //     right.capture_image().unwrap();
-    //     println!("*click*");
+fn main() {
+    rocket().launch();
+}
+
+// fn main() {
+// for n in 0..=11 {
+//     let left = Camera::new(&format!("/dev/video{}", n), CameraType::Left).unwrap();
+//     print!("Camera: {}", n);
+//     match left.capture_image() {
+//         Ok(_) => println!("OK!"),
+//         Err(_) => println!("FAILED"),
+//     };
+// }
+// }
+
+// let right = Camera::new("/dev/video1".into(), CameraType::Right).unwrap();
+
+// println!("Press <enter> to take two pictures – reload your browser after");
+// loop {
+//     let mut _s = String::new();
+//     stdin()
+//         .read_line(&mut _s)
+//         .expect("Failed to read user input!");
+
+//     right.capture_image().unwrap();
+//     println!("*click*");
 //     }
 // }
