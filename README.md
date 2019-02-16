@@ -15,7 +15,7 @@ Additionally there is `sansctl` which can be used to get debug information from 
 
 ## `sans` crates
 
-As the entire software stack is written in Rust, the three core library components `sans-core`, `sans-types` and `sans-processing` are available on [crates.io](). You can link against them to build your own extentions and modules that hook into sans.
+As the entire software stack is written in Rust, the three core library components `sans-core`, `sans-types` and `sans-processing` are available on [crates.io](http://crates.io). You can link against them to build your own extentions and modules that hook into sans.
 
 ## Build dependencies
 
