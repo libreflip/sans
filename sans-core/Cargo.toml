@@ -1,8 +1,9 @@
 [package]
 name = "sans-core"
 description = "A comprehensive software for running camera enabled workflows, including Libreflip"
-version = "0.1.0"
 authors = ["Katharina Fey <kookie@spacekookie.de>"]
+edition = "2018"
+version = "0.1.0"
 
 [dependencies]
 sans-types = { path = "sans-types" }
