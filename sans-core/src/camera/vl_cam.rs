@@ -39,7 +39,7 @@ impl VLCamera {
 }
 
 impl Camera for VLCamera {
-    fn auto_config(&mut self, cfg: Option<CameraConfig>) -> Result<(), CameraError> {
+    fn auto_config(&mut self, _cfg: Option<CameraConfig>) -> Result<(), CameraError> {
         unimplemented!()
     }
 
@@ -51,11 +51,11 @@ impl Camera for VLCamera {
         Ok(())
     }
 
-    fn capture_video(&self, fps: u32, time: u32) -> Result<(), CameraError> {
+    fn capture_video(&self, _fps: u32, _time: u32) -> Result<(), CameraError> {
         unimplemented!()
     }
 
-    fn start_liveview(&self, fps: u32) -> Result<(), CameraError> {
+    fn start_liveview(&self, _fps: u32) -> Result<(), CameraError> {
         unimplemented!()
     }
 
