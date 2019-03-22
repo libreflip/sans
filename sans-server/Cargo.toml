@@ -6,8 +6,8 @@ authors = ["Katharina Fey <kookie@spacekookie.de>"]
 [dependencies]
 sans-core = { path = "../sans-core" }
 sans-types = { path = "../sans-core/sans-types/" }
-clap = "2.0"
+clap = "2.32"
 
-rocket = "0.3"
-rocket_codegen = "0.3"
-rocket_contrib = "0.3"
+rocket = "0.4"
+rocket_codegen = "0.4"
+rocket_contrib = "0.4"
