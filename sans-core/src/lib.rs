@@ -1,17 +1,7 @@
 //! sans-core – Libreflip backend daemon core library
 
-#![feature(non_modrs_mods)]
-#![feature(extern_prelude)]
-
-extern crate sans_types;
-
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate toml;
-
-extern crate rscam;
-extern crate serialport;
 
 mod camera;
 mod config;
@@ -19,7 +9,7 @@ mod hardware;
 
 pub use crate::camera::{Camera as CameraTrait, CameraConfig, CameraType, VLCamera as Camera};
 pub use crate::config::SansConfig;
-pub use crate::hardware::Hardware;
+pub use crate::hardware::{Hardware, Response, Direction, Command, Status};
 
 /// Core `sans` state, initiliasers & run loop
 pub struct Sans {

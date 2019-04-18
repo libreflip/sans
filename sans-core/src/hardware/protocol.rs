@@ -49,16 +49,17 @@ impl Command {
     }
 }
 
+#[derive(Debug)]
 pub enum Status {
     Cool,
-    Error,
+    Error(u8),
 }
 
 impl From<u8> for Status {
     fn from(code: u8) -> Self {
         match code {
             0 => Status::Cool,
-            _ => Status::Error,
+            err => Status::Error(err),
         }
     }
 }
@@ -66,6 +67,7 @@ impl From<u8> for Status {
 /// Ab abstraction over responses sent by the hardware
 ///
 /// If no payload was present `payload` is an empty vector
+#[derive(Debug)]
 pub struct Response {
     status: Status,
     payload: Vec<u8>,
