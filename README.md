@@ -1,11 +1,18 @@
-<h1 align="center">Sans</h1>
+<img align="center" src="sans.png" />
+
 <div align="center">
  <strong>
    Automated photo production platform
  </strong>
 </div>
 
-[![Build Status](https://travis-ci.org/Libreflip/sans.svg?branch=master)](https://travis-ci.org/Libreflip/sans)
+<div align="center">
+  <!-- Build Status -->
+  <a href="https://travis-ci.org/rustasync/tide">
+    <img src="https://img.shields.io/travis/Libreflip/sans.svg?style=flat-square"
+      alt="Build Status" />
+  </a>
+</div>
 
 The software that powers Libreflip. The two primary runtime components
 are `sans-server` which initialises the RESTful user interface and
