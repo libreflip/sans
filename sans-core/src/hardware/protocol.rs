@@ -12,7 +12,6 @@
 //! $ cargo test hw::mock_serial --no-default-features
 //! ```
 
-
 /// A one-dimentional direction
 pub enum Direction {
     Up = 1,
@@ -21,6 +20,10 @@ pub enum Direction {
 
 /// A command to send to the hardware
 pub enum Command {
+
+    /// An internal command
+    #[doc(hidden)]
+    __Internal,
 
     /// Move the box either up or down
     MoveBox(Direction),
@@ -41,6 +44,7 @@ impl Command {
             MoveBox(dir) => vec![0b00000010, dir as u8],
             Lighting(state) => vec![0b00000100, state as u8],
             FlipPage(spine) => vec![0b00001000, spine],
+            _ => unreachable!() // panic on "__Internal"
         }
     }
 }
@@ -87,21 +91,4 @@ impl Response {
 
         Some(Self { status, payload })
     }
-
-
-    // pub fn parse(data: Vec<u8>) -> Option<Self> {
-    //     let s = data.get(0)?;
-    //     let len = data.get(1)?;
-
-    //     let payload = if *len != 0 {
-    //         &data[2..2+(*len) as usize]
-    //     } else {
-    //         unimplemented!()
-    //     };
-
-    //     Some(Self {
-    //         status: Status::Ok,
-    //         payload: payload.into(),
-    //     })
-    // }
 }

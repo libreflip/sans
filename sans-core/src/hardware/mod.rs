@@ -5,28 +5,48 @@ mod protocol;
 
 use serialport::{self, prelude::*};
 use std::io::{self, Write};
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::time::Duration;
 
-use protocol::{Response, Command, Status};
+pub use protocol::{Response, Command, Status};
 
 pub struct Hardware {
     rxtx: Box<SerialPort>,
     port: String,
     settings: SerialPortSettings,
+
+    /// Send replies via this channel
+    sender: Sender<Response>,
+
+    /// Get commands via this channel
+    receiver: Receiver<Command>,
 }
 
 impl Hardware {
-    /// Attempt to open a serial connection
-    pub fn new(port: &str, baud: u32) -> Option<Hardware> {
+    /// Try to create a serial communication handler
+    ///
+    /// This function takes a `channel` to rescieve commands
+    /// and returns a resceiver to send replies to.
+    ///
+    /// All actions are done on a dedicated thread.
+    ///
+    pub fn new(
+        port: &str,
+        baud: u32,
+        receiver: Receiver<Command>,
+    ) -> Option<(Hardware, Receiver<Response>)> {
         let mut settings: SerialPortSettings = Default::default();
         settings.timeout = Duration::from_millis(10);
         settings.baud_rate = baud.into();
+        let (sender, replier) = channel();
 
-        return Some(Hardware {
+        return Some((Hardware {
             rxtx: serialport::open_with_settings(&port, &settings).ok()?,
             port: String::from(port),
             settings,
-        });
+            sender,
+            receiver,
+        }, replier));
     }
 
     /// Try to read a byte - nonblocking
@@ -41,14 +61,26 @@ impl Hardware {
         }
     }
 
-    /// This function get's thrown on a seperate thread to read and write
-    ///
-    /// 1. Check if a response can be read
-    ///   - Read response and send via out channel
-    /// 2. Check if any messages to send are queued
-    ///   - Write response via serial port
-    fn run(&mut self) {
+    fn send(&mut self, cmd: Vec<u8>) -> Option<()> {
 
-        let resp = Response::build(|| self.read_byte());
+
+        None
+    }
+
+    fn run(&mut self) {
+        // Check for sends and internal commands
+        loop {
+            let cmd = self.receiver.recv_timeout(Duration::from_micros(50));
+            match cmd {
+                Ok(Command::__Internal) => break,
+                Ok(c) => self.send(Command::encode(c)).expect("Failed to send Command!"),
+                _ => {},
+            };
+
+            let resp = Response::build(|| self.read_byte());
+
+        }
+
+        // ...
     }
 }

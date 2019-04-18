@@ -39,7 +39,7 @@ impl Sans {
                 Camera::new(&*cfg.cameras.left, CameraType::Left).ok()?,
                 Camera::new(&*cfg.cameras.right, CameraType::Right).ok()?,
             ],
-            hardware: Hardware::new(&*cfg.hw_port, 9200)?,
+            hardware: Hardware::new(&*cfg.hw_port, 9200, unsafe { std::mem::uninitialized() })?.0,
         })
     }
 
