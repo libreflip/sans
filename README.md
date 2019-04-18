@@ -1,4 +1,6 @@
-<img align="center" src="sans.png" />
+<h1 align="center">
+<img src="sans.png" />
+</h1>
 
 <div align="center">
  <strong>
