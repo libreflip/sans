@@ -22,7 +22,7 @@ information from a local or remote server instance.
 
 As the entire software stack is written in Rust, the three core
 library components `sans-core`, `sans-types` and `sans-processing` are
-available on [crates.io](). You can link against them to build your
+available on [crates.io](http://crates.io). You can link against them to build your
 own extentions and modules that hook into sans.
 
 ## Build dependencies
