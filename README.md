@@ -1,13 +1,11 @@
-![Libreflip sans](sans.png)
+<h1 align="center">Sans</h1>
+<div align="center">
+ <strong>
+   Automated photo production platform
+ </strong>
+</div>
 
-[![](https://travis-ci.org/libreflip/sans.svg?branch=master)](https://travis-ci.org/libreflip/sans)
-[![](https://coveralls.io/repos/github/libreflip/sans/badge.svg?branch=master&service=github)](https://coveralls.io/github/libreflip/sans?branch=master)
-
-<!--
-[![](https://docs.rs/barrel/badge.svg)](https://docs.rs/barrel/) 
-[![](https://img.shields.io/crates/v/barrel.svg)](https://crates.io/crates/barrel)
-[![](https://img.shields.io/crates/d/barrel.svg)](https://crates.io/crates/barrel)
--->
+[![Build Status](https://travis-ci.org/Libreflip/sans.svg?branch=master)](https://travis-ci.org/Libreflip/sans)
 
 The software that powers Libreflip. The two primary runtime components
 are `sans-server` which initialises the RESTful user interface and
