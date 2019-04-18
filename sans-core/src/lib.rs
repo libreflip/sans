@@ -17,9 +17,9 @@ mod camera;
 mod config;
 mod hardware;
 
-pub use camera::{Camera as CameraTrait, CameraConfig, CameraType, VLCamera as Camera};
-pub use config::SansConfig;
-pub use hardware::Hardware;
+pub use crate::camera::{Camera as CameraTrait, CameraConfig, CameraType, VLCamera as Camera};
+pub use crate::config::SansConfig;
+pub use crate::hardware::Hardware;
 
 /// Core `sans` state, initiliasers & run loop
 pub struct Sans {

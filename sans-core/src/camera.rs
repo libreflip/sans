@@ -19,7 +19,7 @@ pub enum CameraType {
 use std::fmt;
 impl fmt::Display for CameraType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use CameraType::*;
+        use crate::CameraType::*;
         write!(
             f,
             "{}",
@@ -47,7 +47,7 @@ pub trait Camera {
     /// configuration is **desired**.
     ///
     /// As this is a trait it is however not enforced!
-    fn auto_config(&mut self, Option<CameraConfig>) -> Result<(), CameraError>;
+    fn auto_config(&mut self, _: Option<CameraConfig>) -> Result<(), CameraError>;
 
     /// Capture an image into memory
     fn capture_image(&self) -> Result<(), CameraError>;

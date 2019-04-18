@@ -3,3 +3,4 @@ name = "sans-types"
 description = "A utility crate that exports commonly shared sans types"
 version = "0.1.0"
 authors = ["Katharina Fey <kookie@spacekookie.de>"]
+edition = "2018"
