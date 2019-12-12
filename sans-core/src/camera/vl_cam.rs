@@ -2,20 +2,28 @@
 //!
 //!
 
-use super::{Camera, CameraConfig, CameraError, CameraType};
-pub use rscam::Camera as CameraBackend;
+use super::{Camera, CameraConfig, CameraError, Orientation};
 use rscam::Config;
+pub use rscam::{Camera as CameraBackend, ResolutionInfo};
 use std::{fs, io::Write};
 
 pub struct VLCamera {
     backend: CameraBackend,
-    meta: CameraType,
+    meta: Orientation,
 }
 
 impl VLCamera {
+    
     /// Bind a new camera with a path on the FS
-    pub fn new(path: &str, meta: CameraType) -> Result<VLCamera, CameraError> {
-        let mut backend = match CameraBackend::new(path) {
+    pub fn new(meta: Orientation, cfg: CameraConfig) -> Result<VLCamera, CameraError> {
+        let CameraConfig {
+            path,
+            format,
+            interval,
+            resolution,
+        } = cfg;
+
+        let mut backend = match CameraBackend::new(path.as_str()) {
             Ok(c) => c,
             Err(e) => {
                 return Err(CameraError::ReceiverNotFound(format!(
@@ -24,15 +32,16 @@ impl VLCamera {
                 )))
             }
         };
-
-        backend
-            .start(&Config {
-                interval: (1, 1), // 30 fps.
-                resolution: (3840, 2160),
-                // resolution: (4224, 3156),
-                format: b"MJPG",
-                ..Default::default()
-            }).unwrap();
+        
+        match backend.start(&Config {
+            interval: (1, 14),
+            resolution: (4224, 3156),
+            format: b"MJPG",
+            ..Default::default()
+        }) {
+            Ok(res) => Ok(res),
+            Err(_) => Err(CameraError::FailedInitialisation("...".into())),
+        }?;
 
         Ok(VLCamera { backend, meta })
     }

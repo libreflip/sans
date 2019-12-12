@@ -24,6 +24,8 @@ fn main() {
 
     (|| -> Result<(), Box<std::error::Error>> {
         loop {
+            print!("> ");
+            io::stdout().flush().ok().expect("Could not flush stdout");
             let mut line = String::new();
             io::stdin().read_line(&mut line)?;
 
@@ -37,7 +39,10 @@ fn main() {
                 _ => continue,
             }
 
-            let resp = recv.recv_timeout(Duration::from_secs(5))?;
+            let resp = match recv.recv_timeout(Duration::from_secs(5)) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
             println!("{:?}", resp);
         }
 
