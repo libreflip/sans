@@ -9,6 +9,9 @@ sans-core = { path = "../sans-core" }
 sans-types = { path = "../sans-core/sans-types/" }
 clap = "2.33"
 
-# rocket = "0.4"
-# rocket_codegen = "0.4"
-# rocket_contrib = "0.4"
+actix-files = "0.2"
+actix-web = "2.0"
+actix-rt = "1.0"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+handlebars = "2.0"
