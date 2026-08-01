@@ -16,4 +16,9 @@ toml = "0.5"
 
 # Hardware bindings
 rscam = "0.5"
-serialport = "3.2"
+serialport = "4"
+
+# hw_diag diagnostic CLI
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+chrono = "0.4"
