@@ -112,3 +112,11 @@ startup, every streamed reading is also appended to that file as
 -failure pressure thresholds later. The on-screen printout and the CSV file
 get the same readings; the CSV is just for keeping more than terminal
 scrollback.
+
+### Test results
+
+[`test-results/vacuum-pressure-drop-test-results.md`](test-results/vacuum-pressure-drop-test-results.md)
+has real measurements gathered this way: a validated 3-state pressure model
+(pump off / pump on with nothing sealed / pump on with a page sealed)
+confirmed across three separate test runs, including a real multi-attempt
+manual session. Raw CSVs are alongside it in the same folder.
