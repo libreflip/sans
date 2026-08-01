@@ -1,83 +1,162 @@
-//! Hardware abstraction module
+//! Hardware abstraction module — typed client for the `monospace` text
+//! protocol (see `monospace.md` §4-§6 for the wire format this implements).
 
 mod protocol;
 
-use serialport::{self, prelude::*};
-use std::io::{self, Write};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use protocol::{classify_line, LineKind};
+use serialport::SerialPort;
+use std::io::{self, BufRead, BufReader, Write};
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use std::time::Duration;
 
-pub use protocol::{Response, Command, Status, Direction};
+pub use protocol::LineKind as HwLine;
 
-pub struct Hardware {
-    rxtx: Box<SerialPort>,
-    port: String,
-    settings: SerialPortSettings,
-
-    /// Send replies via this channel
-    sender: Sender<Response>,
-
-    /// Get commands via this channel
-    receiver: Receiver<Command>,
+#[derive(Debug)]
+pub enum HwError {
+    Io(io::Error),
+    Device(String),
+    NoReply,
+    UnexpectedReply(String),
 }
 
-impl Hardware {
-    /// Try to create a serial communication handler
-    ///
-    /// This function takes a `channel` to rescieve commands
-    /// and returns a resceiver to send replies to.
-    ///
-    /// All actions are done on a dedicated thread.
-    ///
-    pub fn new(
-        port: &str,
+impl From<io::Error> for HwError {
+    fn from(e: io::Error) -> Self {
+        HwError::Io(e)
+    }
+}
+
+const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Typed client for a `monospace`-protocol board.
+///
+/// Opening the port resets the Arduino (its DTR auto-reset circuit), so
+/// only one `HwClient` should exist per physical connection at a time.
+/// Non-telemetry reply lines are matched to whichever command triggered
+/// them; unsolicited `PRESS <mbar>` telemetry lines (emitted only while
+/// streaming is active, `monospace.md` §6) are routed to `on_telemetry`
+/// instead, so a live stream can run concurrently with ordinary commands.
+pub struct HwClient {
+    write_half: Box<dyn SerialPort>,
+    responses: Receiver<String>,
+}
+
+impl HwClient {
+    /// Open a connection, waiting out the post-reset boot delay before
+    /// returning. `boot_delay` should be measured empirically on real
+    /// hardware (see `monospace.md` §9.1) rather than assumed.
+    pub fn open(
+        path: &str,
         baud: u32,
-        receiver: Receiver<Command>,
-    ) -> Option<(Hardware, Receiver<Response>)> {
-        let mut settings: SerialPortSettings = Default::default();
-        settings.timeout = Duration::from_millis(10);
-        settings.baud_rate = baud.into();
-        let (sender, replier) = channel();
+        boot_delay: Duration,
+        mut on_telemetry: impl FnMut(f32) + Send + 'static,
+    ) -> Result<Self, HwError> {
+        let port = serialport::new(path, baud)
+            .timeout(Duration::from_millis(100))
+            .open()
+            .map_err(|e| HwError::Device(e.to_string()))?;
 
-        return Some((Hardware {
-            rxtx: serialport::open_with_settings(&port, &settings).ok()?,
-            port: String::from(port),
-            settings,
-            sender,
-            receiver,
-        }, replier));
-    }
+        thread::sleep(boot_delay);
 
-    /// Try to read a byte - nonblocking
-    ///
-    /// This function returns `None` if there's no byte to be had
-    fn read_byte(&mut self) -> Option<u8> {
-        let mut buf = [0; 1];
-        if self.rxtx.bytes_to_read().ok()? > 0 && self.rxtx.read_exact(&mut buf).is_ok() {
-            println!("Read a byte: `{:08b}`", buf[0]);
-            Some(buf[0])
-        } else {
-            None
-        }
-    }
+        let read_half = port.try_clone().map_err(|e| HwError::Device(e.to_string()))?;
+        let write_half = port;
 
-    fn send(&mut self, cmd: Vec<u8>) -> Option<()> {
-        self.rxtx.write(cmd.as_slice()).ok().map(|_| Some(()))?
-    }
-
-    pub fn run(&mut self) {
-        // Check for sends and internal commands
-        loop {
-            let cmd = self.receiver.recv_timeout(Duration::from_micros(50));
-            match cmd {
-                Ok(Command::__Internal) => break,
-                Ok(c) => self.send(Command::encode(c)).expect("Failed to send Command!"),
-                _ => {},
-            };
-
-            if let Some(resp) = Response::build(|| self.read_byte()) {
-                self.sender.send(resp).expect("Failed to send Response!");
+        let (sender, responses) = channel();
+        thread::spawn(move || {
+            let mut reader = BufReader::new(read_half);
+            let mut line = String::new();
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF: port closed
+                    Ok(_) => {
+                        let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
+                        line.clear();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match classify_line(&trimmed) {
+                            LineKind::Telemetry(mbar) => on_telemetry(mbar),
+                            _ => {
+                                if sender.send(trimmed).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // A per-read timeout can fire mid-line (e.g. the
+                    // firmware sends "OK " immediately but the trailing
+                    // value only after a slower averaged sensor read
+                    // completes) — do NOT clear `line` here, or the
+                    // already-buffered partial content is lost and the
+                    // rest of the line gets misread as its own line on
+                    // the next iteration.
+                    Err(ref e) if e.kind() == io::ErrorKind::TimedOut => continue,
+                    Err(_) => break,
+                }
             }
+        });
+
+        Ok(HwClient {
+            write_half,
+            responses,
+        })
+    }
+
+    /// Send a raw protocol line, return the board's raw reply line —
+    /// escape hatch for exercising unknown/malformed commands directly.
+    pub fn send_raw(&mut self, line: &str) -> Result<String, HwError> {
+        self.write_half.write_all(line.as_bytes())?;
+        self.write_half.write_all(b"\n")?;
+        self.write_half.flush()?;
+        self.responses
+            .recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| HwError::NoReply)
+    }
+
+    fn expect_ok(&mut self, cmd: &str) -> Result<(), HwError> {
+        match self.send_raw(cmd)?.as_str() {
+            "OK" => Ok(()),
+            other => Err(HwError::UnexpectedReply(other.to_string())),
         }
+    }
+
+    pub fn set_vacuum(&mut self, on: bool) -> Result<(), HwError> {
+        self.expect_ok(if on { "VACUUM ON" } else { "VACUUM OFF" })
+    }
+
+    pub fn set_fan(&mut self, on: bool) -> Result<(), HwError> {
+        self.expect_ok(if on { "FAN ON" } else { "FAN OFF" })
+    }
+
+    pub fn set_blower(&mut self, on: bool) -> Result<(), HwError> {
+        self.expect_ok(if on { "BLOWER ON" } else { "BLOWER OFF" })
+    }
+
+    pub fn set_light(&mut self, on: bool) -> Result<(), HwError> {
+        self.expect_ok(if on { "LIGHT ON" } else { "LIGHT OFF" })
+    }
+
+    /// Atomically de-energizes vacuum, fan, and blower (light untouched).
+    pub fn all_off(&mut self) -> Result<(), HwError> {
+        self.expect_ok("ALL OFF")
+    }
+
+    /// Single-shot averaged pressure read (mbar) — accuracy-favoring.
+    pub fn press_once(&mut self) -> Result<f32, HwError> {
+        let reply = self.send_raw("PRESS?")?;
+        match classify_line(&reply) {
+            LineKind::OkPress(mbar) => Ok(mbar),
+            _ => Err(HwError::UnexpectedReply(reply)),
+        }
+    }
+
+    /// Begin continuous pressure streaming; readings arrive via the
+    /// `on_telemetry` callback passed to `open()`.
+    pub fn start_press_stream(&mut self) -> Result<(), HwError> {
+        self.expect_ok("PRESS START")
+    }
+
+    pub fn stop_press_stream(&mut self) -> Result<(), HwError> {
+        self.expect_ok("PRESS STOP")
     }
 }

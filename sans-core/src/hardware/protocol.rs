@@ -1,96 +1,92 @@
-//! Simple protocole handling module for `sans` and `monospace`
+//! Line classifier for the `monospace` text protocol.
 //!
-//! The protocol is documented at length in the wiki [here]!
-//!
-//! [here]: https://github.com/libreflip/sans/wiki
-//!
-//! When making changes, make sure to test against the
-//! mock connection which can be run via the
-//! `hw::mock_serial` test-suite:
-//!
-//! ```console
-//! $ cargo test hw::mock_serial --no-default-features
-//! ```
+//! Protocol reference: `monospace.md` §4-§6. One command per line,
+//! `\n`-terminated (an optional preceding `\r` is tolerated on read).
+//! Every command gets exactly one response line (`OK`, `OK <mbar>`, or
+//! `ERR <reason>`) except while `PRESS START` streaming is active, during
+//! which unsolicited `PRESS <mbar>` lines are also emitted. This module is
+//! pure/I/O-free so it can be unit-tested without real hardware.
 
-/// A one-dimentional direction
-pub enum Direction {
-    Up = 1,
-    Down = 0,
+#[derive(Debug, Clone, PartialEq)]
+pub enum LineKind {
+    /// Bare `OK`
+    Ok,
+    /// `OK <mbar>` — the reply to `PRESS?`
+    OkPress(f32),
+    /// `ERR <reason>`
+    Err(String),
+    /// Unsolicited `PRESS <mbar>` line during streaming
+    Telemetry(f32),
+    /// Anything that doesn't match one of the above shapes
+    Malformed(String),
 }
 
-/// A command to send to the hardware
-pub enum Command {
+pub fn classify_line(line: &str) -> LineKind {
+    let line = line.trim_end_matches('\r');
 
-    /// An internal command
-    #[doc(hidden)]
-    __Internal,
-
-    /// Move the box either up or down
-    MoveBox(Direction),
-
-    /// Enable or disable lights
-    Lighting(bool),
-
-    /// Turn page, sending spine width
-    FlipPage(u8),
-}
-
-impl Command {
-
-    /// Encode a command into a byte array
-    pub fn encode(self) -> Vec<u8> {
-        use Command::*;
-        match self {
-            MoveBox(dir) => vec![0b00000010, dir as u8],
-            Lighting(state) => vec![0b00000100, state as u8],
-            FlipPage(spine) => vec![0b00001000, spine],
-            _ => unreachable!() // panic on "__Internal"
-        }
+    if let Some(rest) = line.strip_prefix("PRESS ") {
+        return match rest.parse::<f32>() {
+            Ok(mbar) => LineKind::Telemetry(mbar),
+            Err(_) => LineKind::Malformed(line.to_string()),
+        };
     }
-}
 
-#[derive(Debug)]
-pub enum Status {
-    Cool,
-    Error(u8),
-}
-
-impl From<u8> for Status {
-    fn from(code: u8) -> Self {
-        match code {
-            0 => Status::Cool,
-            err => Status::Error(err),
-        }
+    if let Some(rest) = line.strip_prefix("OK ") {
+        return match rest.parse::<f32>() {
+            Ok(mbar) => LineKind::OkPress(mbar),
+            Err(_) => LineKind::Malformed(line.to_string()),
+        };
     }
+
+    if line == "OK" {
+        return LineKind::Ok;
+    }
+
+    if let Some(reason) = line.strip_prefix("ERR ") {
+        return LineKind::Err(reason.to_string());
+    }
+
+    LineKind::Malformed(line.to_string())
 }
 
-/// Ab abstraction over responses sent by the hardware
-///
-/// If no payload was present `payload` is an empty vector
-#[derive(Debug)]
-pub struct Response {
-    status: Status,
-    payload: Vec<u8>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Response {
-    /// Pass a lambda that returns a byte via reads
-    pub fn build<F>(mut req_byte: F) -> Option<Self>
-    where
-        F: FnMut() -> Option<u8>,
-    {
-        let status = req_byte()?.into();
-        let len = req_byte()?;
+    #[test]
+    fn classifies_ok() {
+        assert_eq!(classify_line("OK"), LineKind::Ok);
+        assert_eq!(classify_line("OK\r"), LineKind::Ok);
+    }
 
-        let payload = (0..len).map(|_| req_byte()).fold(Some(Vec::new()), |mut vec, byte| {
-            match (&mut vec, byte) {
-                (Some(ref mut v), Some(b)) => v.push(b),
-                _ => return None,
-            };
+    #[test]
+    fn classifies_ok_press() {
+        assert_eq!(classify_line("OK 1013.25"), LineKind::OkPress(1013.25));
+    }
 
-            vec
-        })?;
+    #[test]
+    fn classifies_telemetry() {
+        assert_eq!(classify_line("PRESS 1013.25"), LineKind::Telemetry(1013.25));
+    }
 
-        Some(Self { status, payload })
+    #[test]
+    fn classifies_err() {
+        assert_eq!(
+            classify_line("ERR UNKNOWN_COMMAND"),
+            LineKind::Err("UNKNOWN_COMMAND".to_string())
+        );
+    }
+
+    #[test]
+    fn classifies_malformed() {
+        assert_eq!(
+            classify_line("PRESS not_a_number"),
+            LineKind::Malformed("PRESS not_a_number".to_string())
+        );
+        assert_eq!(classify_line(""), LineKind::Malformed("".to_string()));
+        assert_eq!(
+            classify_line("garbage"),
+            LineKind::Malformed("garbage".to_string())
+        );
     }
 }
