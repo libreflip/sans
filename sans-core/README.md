@@ -103,8 +103,10 @@ is tracking.
 
 ### 5. Streaming + CSV logging
 
-`PRESS START` streams as fast as the firmware can sample (measured ~80Hz on
-real hardware — comfortably above the ≥5Hz target). If `--log` was given at
+`PRESS START` streams as fast as the firmware can sample (measured ~49Hz on
+real hardware at oversampling=2 — comfortably above the ≥5Hz target and
+close to the ≤50Hz ideal, with noticeably less per-sample sensor noise than
+the faster-but-noisier oversampling=0). If `--log` was given at
 startup, every streamed reading is also appended to that file as
 `timestamp,mbar` — this is the data you'd use to derive real pickup-success/
 -failure pressure thresholds later. The on-screen printout and the CSV file
