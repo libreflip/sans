@@ -38,15 +38,27 @@ fn main() {
     });
 
     let csv_for_telemetry = csv_writer.clone();
-    let mut client = HwClient::open(&args.port, BAUD, BOOT_DELAY, move |mbar| {
-        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
-        println!("[{ts}] PRESS {mbar:.2}");
-        if let Some(w) = &csv_for_telemetry {
-            let mut w = w.lock().unwrap();
-            let _ = w.write_record([ts.to_string(), format!("{mbar:.2}")]);
-            let _ = w.flush();
-        }
-    })
+    let mut client = HwClient::open(
+        &args.port,
+        BAUD,
+        BOOT_DELAY,
+        move |mbar| {
+            let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
+            println!("[{ts}] PRESS {mbar:.2}");
+            if let Some(w) = &csv_for_telemetry {
+                let mut w = w.lock().unwrap();
+                let _ = w.write_record([ts.to_string(), format!("{mbar:.2}")]);
+                let _ = w.flush();
+            }
+        },
+        // Unsolicited board events (currently only `BUTTON PRESSED`, §10),
+        // timestamped like the PRESS stream. Not logged to --log: that file
+        // is the pressure-stream CSV (§9.1), events would corrupt its shape.
+        |event| {
+            let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
+            println!("[{ts}] EVENT {event}");
+        },
+    )
     .expect("failed to open serial connection");
 
     // Reconnect-recovery pattern (monospace.md §4): always start from a
@@ -71,6 +83,26 @@ fn main() {
         // protocol change (monospace.md §4 requires uppercase on the wire).
         let cmd = line.trim().to_uppercase();
         if cmd.is_empty() {
+            continue;
+        }
+
+        // Convenience `led <r> <g> <b>` command (monospace.md §10.4): a thin
+        // alias for the wire's `LED SET <r> <g> <b>`, going through the typed
+        // client. The raw `LED SET ...` form is deliberately left to fall
+        // through to send_raw below, so its ERR BAD_ARGS path stays testable.
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if parts.len() == 4 && parts[0] == "LED" && parts[1] != "SET" {
+            match (
+                parts[1].parse::<u8>(),
+                parts[2].parse::<u8>(),
+                parts[3].parse::<u8>(),
+            ) {
+                (Ok(r), Ok(g), Ok(b)) => match client.set_led(r, g, b) {
+                    Ok(()) => println!("OK"),
+                    Err(e) => println!("error: {e:?}"),
+                },
+                _ => println!("error: led expects three 0-255 values, e.g. `led 255 0 0`"),
+            }
             continue;
         }
 

@@ -3,9 +3,11 @@
 //! Protocol reference: `monospace.md` §4-§6. One command per line,
 //! `\n`-terminated (an optional preceding `\r` is tolerated on read).
 //! Every command gets exactly one response line (`OK`, `OK <mbar>`, or
-//! `ERR <reason>`) except while `PRESS START` streaming is active, during
-//! which unsolicited `PRESS <mbar>` lines are also emitted. This module is
-//! pure/I/O-free so it can be unit-tested without real hardware.
+//! `ERR <reason>`) except for two kinds of unsolicited line: `PRESS <mbar>`
+//! telemetry while `PRESS START` streaming is active, and `EVENT ...` lines
+//! (currently only `EVENT BUTTON PRESSED`, §10) emitted on a debounced
+//! button press regardless of streaming state. This module is pure/I/O-free
+//! so it can be unit-tested without real hardware.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LineKind {
@@ -17,6 +19,9 @@ pub enum LineKind {
     Err(String),
     /// Unsolicited `PRESS <mbar>` line during streaming
     Telemetry(f32),
+    /// Unsolicited `EVENT ...` line — carries the text after `EVENT `
+    /// (e.g. `BUTTON PRESSED`, §10). Like telemetry, never a command reply.
+    Event(String),
     /// Anything that doesn't match one of the above shapes
     Malformed(String),
 }
@@ -29,6 +34,10 @@ pub fn classify_line(line: &str) -> LineKind {
             Ok(mbar) => LineKind::Telemetry(mbar),
             Err(_) => LineKind::Malformed(line.to_string()),
         };
+    }
+
+    if let Some(rest) = line.strip_prefix("EVENT ") {
+        return LineKind::Event(rest.to_string());
     }
 
     if let Some(rest) = line.strip_prefix("OK ") {
@@ -67,6 +76,18 @@ mod tests {
     #[test]
     fn classifies_telemetry() {
         assert_eq!(classify_line("PRESS 1013.25"), LineKind::Telemetry(1013.25));
+    }
+
+    #[test]
+    fn classifies_event() {
+        assert_eq!(
+            classify_line("EVENT BUTTON PRESSED"),
+            LineKind::Event("BUTTON PRESSED".to_string())
+        );
+        assert_eq!(
+            classify_line("EVENT BUTTON PRESSED\r"),
+            LineKind::Event("BUTTON PRESSED".to_string())
+        );
     }
 
     #[test]

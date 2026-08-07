@@ -86,9 +86,18 @@ only, per spec):
 | `PRESS?` | One averaged pressure reading, prints `OK <mbar>` |
 | `PRESS START` | Begins continuous pressure streaming — prints timestamped `PRESS <mbar>` lines as they arrive, interleaved with anything else you type |
 | `PRESS STOP` | Stops streaming |
+| `led <r> <g> <b>` | Sets the RGB status LED (each channel `0`–`255`); convenience alias for the wire's `LED SET <r> <g> <b>`. E.g. `led 255 0 0` = red |
 
-Anything else is sent to the board as-is and will come back as `ERR
-UNKNOWN_COMMAND` — useful for deliberately testing that path.
+Debounced button presses arrive on their own as timestamped `EVENT BUTTON
+PRESSED` lines, interleaved with everything else — just like the `PRESS`
+stream, and independent of whether streaming is active.
+
+Anything else is sent to the board as-is: e.g. an unknown command comes back
+as `ERR UNKNOWN_COMMAND`, and the raw `LED SET <r> <g> <b>` form is passed
+through verbatim (so a deliberately malformed one like `LED SET 300 0 0`
+still reaches the firmware and returns `ERR BAD_ARGS`) — useful for testing
+those paths. The `led` convenience command instead validates `0`–`255`
+locally and never hits the wire when out of range.
 
 ### 4. Checking the relay→actuator mapping
 
@@ -112,6 +121,17 @@ startup, every streamed reading is also appended to that file as
 -failure pressure thresholds later. The on-screen printout and the CSV file
 get the same readings; the CSV is just for keeping more than terminal
 scrollback.
+
+### 6. Checking the status LED and button
+
+Send `led 255 0 0`, `led 0 255 0`, `led 0 0 255` and confirm the ring lights
+red, then green, then blue (this checks both the channel mapping and the
+common-anode inversion — `255` must be fully on, not off). `led 0 0 0` turns
+it off. Then press the button a few times, including deliberately sloppy/
+bouncy presses, and confirm exactly one `EVENT BUTTON PRESSED` line appears
+per physical press — not zero, not several. Verified on real hardware
+2026-08-08 (all three colors correct, debounce clean at 5/5 deliberate
+presses).
 
 ### Test results
 
