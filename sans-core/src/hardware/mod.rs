@@ -32,10 +32,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Opening the port resets the Arduino (its DTR auto-reset circuit), so
 /// only one `HwClient` should exist per physical connection at a time.
-/// Non-telemetry reply lines are matched to whichever command triggered
-/// them; unsolicited `PRESS <mbar>` telemetry lines (emitted only while
-/// streaming is active, `monospace.md` §6) are routed to `on_telemetry`
-/// instead, so a live stream can run concurrently with ordinary commands.
+/// Reply lines are matched to whichever command triggered them; the two
+/// kinds of unsolicited line are routed to callbacks instead so they never
+/// get mistaken for a command reply: `PRESS <mbar>` telemetry (while
+/// streaming is active, `monospace.md` §6) goes to `on_telemetry`, and
+/// `EVENT ...` lines (e.g. `EVENT BUTTON PRESSED`, §10) go to `on_event`.
 pub struct HwClient {
     write_half: Box<dyn SerialPort>,
     responses: Receiver<String>,
@@ -50,6 +51,7 @@ impl HwClient {
         baud: u32,
         boot_delay: Duration,
         mut on_telemetry: impl FnMut(f32) + Send + 'static,
+        mut on_event: impl FnMut(&str) + Send + 'static,
     ) -> Result<Self, HwError> {
         let port = serialport::new(path, baud)
             .timeout(Duration::from_millis(100))
@@ -76,6 +78,7 @@ impl HwClient {
                         }
                         match classify_line(&trimmed) {
                             LineKind::Telemetry(mbar) => on_telemetry(mbar),
+                            LineKind::Event(text) => on_event(&text),
                             _ => {
                                 if sender.send(trimmed).is_err() {
                                     break;
@@ -158,5 +161,14 @@ impl HwClient {
 
     pub fn stop_press_stream(&mut self) -> Result<(), HwError> {
         self.expect_ok("PRESS STOP")
+    }
+
+    /// Set the RGB status LED to raw 0..255 per-channel values (`LED SET`,
+    /// `monospace.md` §5/§10.3). The firmware handles the common-anode
+    /// inversion; these are plain host-facing values (0 = off, 255 = on).
+    /// Blinking is not a firmware mode — a caller wanting it sends repeated
+    /// `set_led` calls at whatever cadence it likes (§10.3).
+    pub fn set_led(&mut self, r: u8, g: u8, b: u8) -> Result<(), HwError> {
+        self.expect_ok(&format!("LED SET {r} {g} {b}"))
     }
 }
