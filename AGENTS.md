@@ -23,6 +23,10 @@ Use standard `rustfmt` output and four-space indentation. Name modules, function
 
 Place focused unit tests beside code in `#[cfg(test)]` modules and cross-module tests under `<crate>/tests/`. Use descriptive `snake_case` test names such as `classifies_malformed`. There is no configured coverage threshold; add regression tests for protocol parsing and other deterministic behavior. Record physical observations separately from automated test results.
 
+## Hardware Design Principles
+
+Treat Sans as a hackerspace machine: favor direct, simple, inspectable controls over commercial-style access control. Preserve safety through immutable electrical and motion ceilings, explicit motion commands, zero-PWM stop behavior, applicable soft limits, and supervised physical testing. Keep automated, component-level, and assembled-machine evidence distinct.
+
 ## Commit & Pull Request Guidelines
 
 Use Conventional Commits for every Jujutsu change description and Git commit message, for example `feat(scope): add ...` or `docs: update ...`. Keep each change focused and inspect it with `jj status` and `jj diff`. Pull requests should explain behavior and risk, link the relevant issue, list commands run, and call out hardware validation separately. Include screenshots for changes under `sans-server/static/` and attach representative logs or CSVs when hardware behavior changes.
