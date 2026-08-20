@@ -62,6 +62,12 @@
 > describes screens in framework-neutral prose (a carryover from before
 > this note existed) — read every one of them as `egui` widget/state
 > descriptions, not as HTML pages or HTTP routes.
+>
+> **Provenance note:** some historical decision/review paths cited below
+> are not present in this checkout. The requirements reproduced in this
+> file are authoritative for `sans`; those citations explain their origin
+> and are not required reading for implementation. Verify every claim
+> about an existing repository path against the current checkout.
 
 ---
 
@@ -78,10 +84,10 @@ in §8.
 ## Existing codebase — what to build on
 
 **This is not a from-scratch application.** It extends the existing
-`sans` repository (`sans-core` crate, Rust — `github.com/libreflip/sans`,
-locally under `incoming/github/sans`) — decided `architecture.md` AD-001
-(2026-08-09): `alexandria` fully discarded as a runtime base, `sans-core`
-kept and finished. Verify the current repo state before writing new
+`sans` repository (`sans-core` crate, Rust — `github.com/libreflip/sans`)
+— decided `architecture.md` AD-001 (2026-08-09): `alexandria` fully
+discarded as a runtime base and `sans-core` kept to extend. Verify the
+current repo state before writing new
 code against any of the facts below — they're accurate as of the cited
 reviews/decisions, not guaranteed current.
 
@@ -102,15 +108,16 @@ reviews/decisions, not guaranteed current.
     application's screens (§8) — a separate binary in the same crate.
     Useful as a reference for the client's shape and for manual hardware
     checks during development, not something §8's UI calls into.
-  - **`sans-core::config`** (`SansConfig`/`ConfigBackend`) — TOML
-    load/save via `serde`, described in
-    `reference/sans-code-reusability-review.md` as "the one part that's
-    genuinely solid." The actual struct fields are shaped for the old
-    single-Arduino architecture (`cameras`, `http_port`, `img_worker`, a
-    single `hw_port`) — no ESP32 port, no calibration parameters
-    (`page_width_mm` etc.), no job/sequence data. Reuse the *pattern*
-    (TOML struct-with-serde, save-with-fallback-defaults); extend the
-    struct itself, don't reuse it verbatim.
+  - **`sans-core::config`** (`SansConfig`/`ConfigBackend`) — a TOML
+    configuration boundary via `serde`. The actual struct fields are
+    shaped for the old single-Arduino architecture (`cameras`,
+    `http_port`, `img_worker`, a single `hw_port`) — no ESP32 port, no
+    calibration parameters
+    (`page_width_mm` etc.), no job/sequence data. Its current `save()`
+    opens without truncating, so a shorter rewrite can leave stale
+    trailing bytes. Reuse the data-model *pattern*, not the write
+    implementation verbatim; extend the struct and make persistence
+    safe as part of §7's storage work.
 - **Needs real modification, not verbatim reuse:**
   - **`sans-core::camera`** (`camera.rs` + `camera/vl_cam.rs`) — §2's
     camera capture. `capture_image()` via `rscam`/V4L2 is real and
@@ -134,15 +141,11 @@ reviews/decisions, not guaranteed current.
   established pattern (open serial port, dedicated thread, channel-based
   command/response) keeps it consistent with the Arduino client above —
   not a hard requirement, just the local convention.
-- **Exists, but not part of this application:**
-  **`sans-core/src/bin/foc_diag.rs`** — a separate diagnostic binary for
-  the `ligature` FOC board's own bring-up/commissioning
-  (`architecture.md` AD-008; `mvprototype-scope.md` §5's resolution:
-  FOC unit/motor calibration is the `ligature` firmware's own
-  commissioning procedure, not `sans`-app scope). Same crate, same
-  `sans-core/src/bin/` convention as `hw_diag`/`camcal.rs`
-  (camera-calibration binary, same location), but not one of §8's
-  touchscreen screens and not built as part of MVPrototype.
+- **Not present and not part of this application:** there is currently no
+  **`sans-core/src/bin/foc_diag.rs`** in this checkout. If a separate
+  diagnostic binary for `ligature` bring-up/commissioning is added later,
+  it follows the `hw_diag`/`camcal` same-crate convention but remains
+  outside the touchscreen application and the Sans MVPrototype scope.
 - **Do not build on these — confirmed dead ends by direct code reading,
   not assumption** (`reference/sans-code-reusability-review.md`,
   `architecture.md` AD-001/AD-007):
@@ -319,8 +322,12 @@ the board itself.
 
 Rust client speaking the line protocol defined in `monospace.md` over
 USB-serial (a second, independent serial connection from the FOC
-board's). **Corrected 2026-08-02** to match the actual merged
-implementation (`sans` repo, `sans-core/src/hardware/mod.rs`,
+board's). The existing `HwClient` command surface is the starting point,
+but its current `open()` waits for boot without sending `ALL OFF`; after
+every open or reconnect, Sans must successfully establish that safe state
+before accepting any other board command. **Corrected 2026-08-02** to
+match the actual merged implementation (`sans` repo,
+`sans-core/src/hardware/mod.rs`,
 `HwClient`) — an earlier version of this section described a
 speculative API (paired `x_on()`/`x_off()` functions, `light_auto()`,
 a stream call returning a `PressureStream` object) that was never
@@ -339,8 +346,8 @@ checked against what actually got built. Exposes:
   reading is needed (calibration baseline, §4 step 5; per-attempt
   baseline, §5.2 step 1).
 - **Streaming is callback-based, not a returned stream object:**
-  `open(path, baud, boot_delay, on_telemetry)` registers the telemetry
-  callback **once**, at connection-open time, for the connection's
+  `open(path, baud, boot_delay, on_telemetry, on_button_press)` registers
+  both callbacks **once**, at connection-open time, for the connection's
   whole lifetime — there is no separate "start streaming, get a handle
   back" call. `start_press_stream()`/`stop_press_stream()`
   (`PRESS START`/`PRESS STOP`) just toggle whether the *board* is

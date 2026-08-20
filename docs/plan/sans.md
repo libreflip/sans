@@ -37,6 +37,12 @@
 > that's a direct contradiction of this decision, not a valid
 > interpretation of it.
 >
+> **Provenance note:** some historical decision/review paths cited below
+> are not present in this checkout. The requirements reproduced in this
+> file are authoritative for `sans`; those citations explain their origin
+> and are not required reading for implementation. Verify every claim
+> about an existing repository path against the current checkout.
+>
 > **Governing requirement, applies to every screen in §8:** the machine
 > is operated by laypeople with no briefing. Every screen state must
 > include an explicit, plain-language instruction of what to do next —
@@ -64,15 +70,18 @@ guaranteed current.
 - **Reuse and extend, already real and hardware-tested:**
   - `sans-core::hardware::HwClient` (`sans-core/src/hardware/mod.rs`) —
     §2's Arduino client. Already implements the granular protocol
-    described there and is hardware-tested (~49Hz `PRESS STREAM`,
+    described there and is hardware-tested (~49Hz `PRESS START`,
     `architecture.md` AD-007). **Extend/verify this, don't rewrite it.**
   - `sans-core/src/bin/hw_diag.rs` — existing diagnostic CLI built on
     `HwClient`. Not part of §8's screens; a reference and a manual-test
     tool, not something the UI calls into.
-  - `sans-core::config` — existing TOML load/save pattern (solid), but
-    the struct itself is shaped for the old single-Arduino setup —
-    extend it (ESP32 port, calibration params, job/sequence data), don't
-    reuse verbatim.
+  - `sans-core::config` — existing serde/TOML configuration boundary,
+    but the struct is shaped for the old single-Arduino setup and the
+    current `save()` opens without truncating, so a shorter rewrite can
+    leave stale trailing bytes. Reuse the data-model pattern, not the
+    write implementation verbatim; extend it with the ESP32 port,
+    calibration parameters, and job/sequence data, and make persistence
+    safe as part of §7's storage work.
 - **Needs real modification:** `sans-core::camera` — §3's camera
   capture. Real single-shot v4l2/rscam capture exists, but has no
   pair/simultaneity handling, writes to a hardcoded path instead of
@@ -85,10 +94,11 @@ guaranteed current.
   exist before 2026-07-04. Build fresh; following `HwClient`'s
   serial-thread-channel pattern keeps it consistent, not a hard
   requirement.
-- **Exists, not part of this application:** `sans-core/src/bin/foc_diag.rs`
-  — separate `ligature`-board bring-up/commissioning tool
-  (`mvprototype-scope.md` §5). Same crate/convention as `hw_diag`, not
-  one of §8's screens, not MVPrototype scope.
+- **Not present and not part of this application:** there is currently no
+  `sans-core/src/bin/foc_diag.rs` in this checkout. If a separate
+  `ligature` bring-up/commissioning binary is added later, it follows the
+  `hw_diag`/`camcal` same-crate convention but remains outside §8 and
+  outside the Sans MVPrototype application.
 - **Do not build on — confirmed dead ends, not assumptions:**
   `alexandria` (discarded runtime, Node/NATS microservices — camera
   logic only, see above); the old `serif` repo's Ember.js frontend and
@@ -159,7 +169,11 @@ switched off first. Enforced by caller discipline, not the board.
 Rust client speaking the line protocol (`../monospace.md`) over a
 second, independent USB-serial connection. **Already implemented and
 hardware-tested as `HwClient` (`sans-core/src/hardware/mod.rs`) — see
-§0. Extend/verify, don't rewrite from scratch.**
+§0.** Its command surface is the starting point; extend/verify it rather
+than rewriting it from scratch. The current `HwClient::open()` waits for
+the board to boot but does not send `ALL OFF`: after every open or
+reconnect, Sans must successfully establish that safe state before it
+accepts any other board command.
 
 - `set_vacuum(bool)`, `set_fan(bool)`, `set_blower(bool)`,
   `set_light(bool)` — boolean-parameter style, not paired on/off
@@ -169,9 +183,9 @@ hardware-tested as `HwClient` (`sans-core/src/hardware/mod.rs`) — see
   untouched.
 - `press_once() -> mbar` — single-shot, blocking, averaged. Used
   wherever only one reading is needed (per-attempt baseline, §5 step 1).
-- `open(path, baud, boot_delay, on_telemetry)` registers the telemetry
-  callback **once**, at connection-open time, for the connection's whole
-  lifetime. `start_press_stream()`/`stop_press_stream()` just toggle
+- `open(path, baud, boot_delay, on_telemetry, on_button_press)` registers
+  both callbacks **once**, at connection-open time, for the connection's
+  whole lifetime. `start_press_stream()`/`stop_press_stream()` just toggle
   whether the board is actively emitting `PRESS <mbar>` lines; whatever
   arrives while active reaches `on_telemetry` directly, interleaved with
   ordinary command/response traffic (the `PRESS `-prefix framing
