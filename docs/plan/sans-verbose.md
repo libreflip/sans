@@ -38,6 +38,30 @@
 > UI language: English only. No localization infrastructure yet, but
 > avoid hard-coding strings in a way that makes adding German later a
 > rewrite.
+>
+> **UI toolkit: `egui`/`eframe` (Rust) — a native GUI in this process,
+> not a browser or HTTP-served UI. Missing from this file until
+> 2026-08-20 (a gap in the original `sans-serif.md` that carried through
+> T37 unnoticed — added retroactively once it caused an implementing
+> agent to reuse browser-UI code instead).** Decided
+> `project-management/decisions.md`, 2026-08-10 — the touchscreen UI is
+> a **complete rebuild on `egui`**, evaluated against Slint and Iced as
+> the other browserless/Rust-capable candidates, chosen for fitting the
+> already-Rust `sans-core` base (no language boundary). Explicitly
+> **not** reused: the old `serif` repository's Ember.js frontend (mostly
+> unmodified 2017-era Ember-CLI boilerplate plus a merged 7-year-old
+> community PR with a working 4-step tutorial — no scan overview, no
+> backend wiring, no live preview beyond that,
+> `docs/software/code-review.md`'s `serif` finding). That old `serif`
+> repo predates and is unrelated to the current meaning of `serif`
+> (`architecture.md` AD-012 later reused the name for the VM/server) —
+> the dead Ember code has nothing to do with either. Also not a starting
+> point: `sans-server`'s `actix-web`/Handlebars stub
+> (`reference/sans-code-reusability-review.md` — one static route,
+> hardcoded template, no functional API, never a real UI). §8 below
+> describes screens in framework-neutral prose (a carryover from before
+> this note existed) — read every one of them as `egui` widget/state
+> descriptions, not as HTML pages or HTTP routes.
 
 ---
 
@@ -51,9 +75,112 @@ in §8.
 
 ---
 
+## Existing codebase — what to build on
+
+**This is not a from-scratch application.** It extends the existing
+`sans` repository (`sans-core` crate, Rust — `github.com/libreflip/sans`,
+locally under `incoming/github/sans`) — decided `architecture.md` AD-001
+(2026-08-09): `alexandria` fully discarded as a runtime base, `sans-core`
+kept and finished. Verify the current repo state before writing new
+code against any of the facts below — they're accurate as of the cited
+reviews/decisions, not guaranteed current.
+
+- **Reuse and extend, already real:**
+  - **`sans-core::hardware::HwClient`** (`sans-core/src/hardware/mod.rs`)
+    — §1.2's Arduino client. As of 2026-08-02
+    (`architecture.md` AD-007, merged `sans` PR #6, commit `beab768`)
+    this already implements the granular protocol described in §1.2
+    (`set_vacuum`/`set_fan`/`set_blower`/`set_light`, `press_once`,
+    streaming, `set_led`, `on_button_press`) and is **hardware-tested**:
+    `PRESS START` streaming reached ~49Hz on real hardware (oversampling
+    2, target was ≥5Hz), relay-to-actuator mapping verified by ijon.
+    Extend/verify this client — don't rewrite it from scratch.
+  - **`sans-core/src/bin/hw_diag.rs`** — an existing interactive
+    diagnostic CLI built on `HwClient` (`press`, `press-stream` with
+    optional CSV logging, `vacuum`/`fan`/`blower`/`light on|off`,
+    `all-off` subcommands, `monospace.md` §9.1). Not part of this
+    application's screens (§8) — a separate binary in the same crate.
+    Useful as a reference for the client's shape and for manual hardware
+    checks during development, not something §8's UI calls into.
+  - **`sans-core::config`** (`SansConfig`/`ConfigBackend`) — TOML
+    load/save via `serde`, described in
+    `reference/sans-code-reusability-review.md` as "the one part that's
+    genuinely solid." The actual struct fields are shaped for the old
+    single-Arduino architecture (`cameras`, `http_port`, `img_worker`, a
+    single `hw_port`) — no ESP32 port, no calibration parameters
+    (`page_width_mm` etc.), no job/sequence data. Reuse the *pattern*
+    (TOML struct-with-serde, save-with-fallback-defaults); extend the
+    struct itself, don't reuse it verbatim.
+- **Needs real modification, not verbatim reuse:**
+  - **`sans-core::camera`** (`camera.rs` + `camera/vl_cam.rs`) — §2's
+    camera capture. `capture_image()` via `rscam`/V4L2 is real and
+    working (hardcoded 3840×2160 MJPG), but per
+    `reference/sans-code-reusability-review.md`: no pair/simultaneity
+    handling (it's a single-camera method, not a synchronized-pair
+    operation like `capture_pair()`), writes JPEGs straight to a
+    hardcoded path instead of returning bytes to the caller, no rotation
+    handling, and `auto_config` is `unimplemented!()`. All four need
+    real changes to match §2's shape. **Whether this code path actually
+    works against the real camera hardware is itself unconfirmed**
+    (`architecture.md` AD-001, 2026-08-09 decision) — the reference
+    images available were reportedly captured with `alexandria`, not
+    `sans`. `alexandria`'s camera/image-processing logic (discarded
+    entirely as a runtime base, see below) may be read for reference if
+    real-hardware issues surface here — read for how the problem was
+    solved, not copied as code.
+- **Greenfield, no existing code:** the FOC-board client (§1.1) — the
+  board and its G-code protocol (`ligature.md`) didn't exist before P1
+  (2026-07-04); build it fresh. Following `sans-core::hardware`'s
+  established pattern (open serial port, dedicated thread, channel-based
+  command/response) keeps it consistent with the Arduino client above —
+  not a hard requirement, just the local convention.
+- **Exists, but not part of this application:**
+  **`sans-core/src/bin/foc_diag.rs`** — a separate diagnostic binary for
+  the `ligature` FOC board's own bring-up/commissioning
+  (`architecture.md` AD-008; `mvprototype-scope.md` §5's resolution:
+  FOC unit/motor calibration is the `ligature` firmware's own
+  commissioning procedure, not `sans`-app scope). Same crate, same
+  `sans-core/src/bin/` convention as `hw_diag`/`camcal.rs`
+  (camera-calibration binary, same location), but not one of §8's
+  touchscreen screens and not built as part of MVPrototype.
+- **Do not build on these — confirmed dead ends by direct code reading,
+  not assumption** (`reference/sans-code-reusability-review.md`,
+  `architecture.md` AD-001/AD-007):
+  - **`alexandria`** — fully discarded as a runtime base. Node.js/
+    Moleculer/NATS microservices architecture, real operational overhead
+    (broker process, service discovery) that doesn't fit a single-
+    device/single-job model. Camera logic may still be read for
+    reference (above); nothing else from it.
+  - **The old `serif` repository's Ember.js frontend and
+    `sans-server`'s `actix-web`/Handlebars stub** — see this file's
+    header ("UI toolkit") for the full reasoning; neither is a
+    touchscreen-UI starting point.
+  - **`sans-worker`** (3-line stub, `println!("Hello, world!")`),
+    **`sans-ctrl`** (CLI argument parsing for a `sans-server` daemon,
+    zero subcommands implemented — talks to a server process that does
+    nothing, not a hardware-access tool despite the name),
+    **`sans-types`** (empty), **`sans-processing`** (empty trait/module
+    skeleton) — all confirmed stubs with no behavior to build on.
+
+**One more constraint, easy to violate by accident later:** the core
+scan loop (§1–§7) must work fully without network/VM connectivity — no
+blocking on reachability checks anywhere in it. Only the metadata-
+enrichment flow (§8.1 steps 3–5, §8.3 — MVProduct,
+`mvprototype-scope.md` #11c) is allowed to assume internet access
+(`architecture.md` AD-004, 2026-07-26: "MVP geht von vorhandener
+Internetverbindung aus, keine Fallback-Logik nötig... Gilt nur für
+diesen optionalen Anreicherungs-Flow, nicht für den Kern-Scan-Prozess
+(HAL/Auto-Scan), der weiterhin offline funktionieren muss").
+
+---
+
 ## 1. Hardware client layer
 
 ### 1.1 FOC-board client
+
+**Greenfield — no existing RPi-side code for this board (see "Existing
+codebase" above); follow `sans-core::hardware`'s serial-thread-channel
+pattern for consistency, not as a hard requirement.**
 
 **Substantially rewritten (`architecture.md` AD-011, 2026-08-16) to
 match `ligature.md`'s current protocol (§4/§5/§8/§9/§9a/§12.1) — this
@@ -258,6 +385,9 @@ this is where the assumption would break.
 ---
 
 ## 2. Camera capture & preview service
+
+**Starting point: `sans-core::camera` — needs real modification, not
+verbatim reuse (see "Existing codebase" above).**
 
 - **`capture_pair() -> (raw_left, raw_right)`** — triggers both UVC
   cameras via v4l2 for a synchronized shot. **Applies rotation here**
@@ -662,6 +792,11 @@ pending ijon's call.
 predates `architecture.md` AD-012. This UI is part of `sans` (there is
 no separate `sans-ui` application, AD-012); `serif` is the unrelated
 VM/server, see `serif-verbose.md`.
+
+**Toolkit reminder (see this file's header):** `egui`/`eframe`, native,
+in-process. Everything below is an `egui` screen/widget description —
+not a webpage, not a route. Not `sans-server`'s `actix-web` stub, not
+the old `serif` repo's Ember.js code.
 
 Pure presentation + input capture + navigation — no process logic of
 its own. Every screen below carries an explicit, plain-language
