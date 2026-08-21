@@ -65,7 +65,7 @@ pub struct ControllerSnapshot {
 /// A deferred constructor for controller-thread-owned Machine resources.
 pub trait MachineFactory: Send + 'static {
     /// Live Machine resources retained exclusively by the controller thread.
-    type Machine: Send + 'static;
+    type Machine: 'static;
 
     /// Open live resources after structural startup checks and report nonfatal Setup blockers.
     fn open(self, profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>>;
@@ -103,8 +103,14 @@ impl ControllerHandle {
 impl Drop for ControllerHandle {
     fn drop(&mut self) {
         let _ = self.intents.send(ControllerIntent::Exit);
-        if let Some(thread) = self.controller_thread.take() {
-            let _ = thread.join();
+        if self
+            .controller_thread
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            if let Some(thread) = self.controller_thread.take() {
+                let _ = thread.join();
+            }
         }
     }
 }

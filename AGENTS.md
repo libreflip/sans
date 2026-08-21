@@ -13,7 +13,7 @@ This repository is a Rust workspace. `sans-app/` builds the native `sans` touchs
 - `cargo run -p sans` starts the native application with the normal user Machine profile; use `-- --config <path>` for an explicit profile.
 - `cross build --target aarch64-unknown-linux-gnu` mirrors the 64-bit Raspberry Pi 4+ target used by CI.
 
-Run `cargo run -p sans-core --bin hw_diag -- --port /dev/ttyACM0` only during supervised hardware testing while the `sans` application is stopped. It opens a real serial device and can energize vacuum, fan, blower, and light relays.
+Run `cargo run -p sans-core --bin hw_diag -- --port /dev/ttyACM0` only during supervised hardware testing while the `sans` application is stopped. It opens a real serial device and can energize vacuum, flutter fan, turn blower, and light relays.
 
 ## Coding Style & Naming Conventions
 

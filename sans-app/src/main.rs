@@ -1,6 +1,7 @@
 //! Native portrait touchscreen entry point for Sans.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::Parser;
 use eframe::egui;
@@ -38,6 +39,7 @@ enum StartupView {
     Controller {
         handle: ControllerHandle,
         latest: Option<ControllerSnapshot>,
+        exit_requested: bool,
     },
 }
 
@@ -63,11 +65,15 @@ impl eframe::App for SansApp {
 
             match &mut self.startup {
                 StartupView::Fatal(message) => render_fatal(ui, &context, message),
-                StartupView::Controller { handle, latest } => {
+                StartupView::Controller {
+                    handle,
+                    latest,
+                    exit_requested,
+                } => {
                     while let Ok(snapshot) = handle.try_snapshot() {
                         *latest = Some(snapshot);
                     }
-                    render_controller(ui, &context, handle, latest.as_ref());
+                    render_controller(ui, &context, handle, latest.as_ref(), exit_requested);
                 }
             }
         });
@@ -92,6 +98,7 @@ fn render_controller(
     context: &egui::Context,
     handle: &ControllerHandle,
     snapshot: Option<&ControllerSnapshot>,
+    exit_requested: &mut bool,
 ) {
     match snapshot.map(|snapshot| &snapshot.screen) {
         None => {
@@ -117,11 +124,17 @@ fn render_controller(
     }
 
     ui.add_space(32.0);
-    if ui
+    if *exit_requested {
+        ui.spinner();
+        ui.label("Exiting Sans…");
+        context.request_repaint_after(Duration::from_millis(16));
+    } else if ui
         .add_sized([240.0, 64.0], egui::Button::new("Exit"))
         .clicked()
+        && handle.send(ControllerIntent::Exit).is_ok()
     {
-        let _ = handle.send(ControllerIntent::Exit);
+        *exit_requested = true;
+        context.request_repaint();
     }
 }
 
@@ -131,6 +144,7 @@ fn main() -> eframe::Result {
         Ok(handle) => StartupView::Controller {
             handle,
             latest: None,
+            exit_requested: false,
         },
         Err(error) => StartupView::Fatal(error.to_string()),
     };

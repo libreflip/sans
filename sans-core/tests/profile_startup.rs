@@ -71,7 +71,17 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
         (
             "identity = \"/dev/v4l/by-id/left-camera\"",
             "identity = \"/dev/video0\"",
-            "stable /dev/v4l",
+            "directly under /dev/v4l",
+        ),
+        (
+            "identity = \"/dev/v4l/by-id/left-camera\"",
+            "identity = \"/dev/v4l/by-id/\"",
+            "directly under /dev/v4l",
+        ),
+        (
+            "identity = \"/dev/v4l/by-id/left-camera\"",
+            "identity = \"/dev/v4l/by-id/../video0\"",
+            "directly under /dev/v4l",
         ),
         (
             "rotation_degrees = 90",
@@ -79,6 +89,12 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "quarter turn",
         ),
         ("width = 2000", "width = 0", "crop dimensions"),
+        ("width = 2000", "width = 2151", "post-rotation frame"),
+        (
+            "rotation_degrees = 90",
+            "rotation_degrees = 0",
+            "post-rotation frame",
+        ),
         ("minimum_mm = 100.0", "minimum_mm = 0.0", "minimum_mm"),
         ("command_ms = 2000", "command_ms = 0", "command_ms"),
         (
@@ -105,6 +121,11 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "final_lift_percent = 105.0",
             "final_lift_percent = 105.1",
             "immutable 105%",
+        ),
+        (
+            "blower_on_percent = 80.0",
+            "blower_on_percent = 70.0",
+            "anchors must be safely ordered",
         ),
         ("data_root = \"scan-data\"", "data_root = \"\"", "data_root"),
     ];
@@ -141,6 +162,21 @@ fn startup_fails_when_data_root_cannot_be_created_as_a_directory() {
     assert!(
         matches!(error, StartupError::DataRootUnavailable { path, .. } if path == temp.path().join("scan-data"))
     );
+}
+
+#[test]
+fn stale_legacy_write_probe_does_not_block_a_writable_data_root() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    let data_root = temp.path().join("scan-data");
+    fs::create_dir(&data_root).unwrap();
+    let stale_probe = data_root.join(format!(".sans-write-check-{}", std::process::id()));
+    fs::write(&stale_probe, "keep me").unwrap();
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+
+    prepare_machine_profile(Some(&profile_path)).unwrap();
+
+    assert_eq!(fs::read_to_string(stale_probe).unwrap(), "keep me");
 }
 
 #[test]

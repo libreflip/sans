@@ -3,7 +3,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -20,6 +20,8 @@ const MAX_VACUUM_OFF_PERCENT: f32 = 100.0;
 const MAX_FINAL_LIFT_PERCENT: f32 = 105.0;
 const MAX_BLOWER_OFF_DESCENT_PERCENT: f32 = 80.0;
 const MAX_STOP_TERMINAL_MS: u64 = 500;
+const CAMERA_FRAME_WIDTH: u32 = 3840;
+const CAMERA_FRAME_HEIGHT: u32 = 2160;
 
 /// Complete, versioned configuration for one Sans machine.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -453,24 +455,49 @@ fn validate_required_string(name: &str, value: &str, problems: &mut Vec<String>)
 
 fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<String>) {
     validate_required_string(&format!("{name}.identity"), &camera.identity, problems);
-    if !camera.identity.starts_with("/dev/v4l/by-id/")
-        && !camera.identity.starts_with("/dev/v4l/by-path/")
-    {
+    if !is_stable_camera_identity(&camera.identity) {
         problems.push(format!(
-            "{name}.identity must use a stable /dev/v4l/by-id or /dev/v4l/by-path identity"
+            "{name}.identity must name one device directly under /dev/v4l/by-id or /dev/v4l/by-path"
         ));
     }
-    if !matches!(camera.rotation_degrees, 0 | 90 | 180 | 270) {
-        problems.push(format!("{name}.rotation_degrees must be a quarter turn"));
-    }
+    let frame_dimensions = match camera.rotation_degrees {
+        0 | 180 => Some((CAMERA_FRAME_WIDTH, CAMERA_FRAME_HEIGHT)),
+        90 | 270 => Some((CAMERA_FRAME_HEIGHT, CAMERA_FRAME_WIDTH)),
+        _ => {
+            problems.push(format!("{name}.rotation_degrees must be a quarter turn"));
+            None
+        }
+    };
     if camera.crop.width == 0 || camera.crop.height == 0 {
         problems.push(format!("{name}.crop dimensions must be nonzero"));
     }
-    if camera.crop.x.checked_add(camera.crop.width).is_none()
-        || camera.crop.y.checked_add(camera.crop.height).is_none()
-    {
-        problems.push(format!("{name}.crop geometry overflows"));
+    match (
+        camera.crop.x.checked_add(camera.crop.width),
+        camera.crop.y.checked_add(camera.crop.height),
+    ) {
+        (Some(right), Some(bottom)) => {
+            if let Some((frame_width, frame_height)) = frame_dimensions {
+                if right > frame_width || bottom > frame_height {
+                    problems.push(format!(
+                        "{name}.crop must fit the {frame_width}x{frame_height} post-rotation frame"
+                    ));
+                }
+            }
+        }
+        _ => problems.push(format!("{name}.crop geometry overflows")),
     }
+}
+
+fn is_stable_camera_identity(identity: &str) -> bool {
+    ["/dev/v4l/by-id", "/dev/v4l/by-path"]
+        .iter()
+        .any(|directory| {
+            let Ok(relative) = Path::new(identity).strip_prefix(directory) else {
+                return false;
+            };
+            let mut components = relative.components();
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+        })
 }
 
 fn validate_timeout(name: &str, value: u64, ceiling: u64, problems: &mut Vec<String>) {
@@ -553,7 +580,8 @@ fn validate_motion(motion: &MotionProfile, problems: &mut Vec<String>) {
         && motion.wiggle_retreat_percent < motion.wiggle_start_percent
         && motion.wiggle_start_percent < motion.blower_on_percent
         && motion.blower_on_percent < motion.vacuum_off_percent
-        && motion.vacuum_off_percent < motion.final_lift_percent)
+        && motion.vacuum_off_percent < motion.final_lift_percent
+        && motion.blower_off_descent_percent <= motion.blower_on_percent)
     {
         problems.push("motion Lift-percentage anchors must be safely ordered".into());
     }
@@ -562,13 +590,10 @@ fn validate_motion(motion: &MotionProfile, problems: &mut Vec<String>) {
 fn ensure_writable_data_root(path: &Path) -> Result<(), StartupError> {
     let result = (|| -> io::Result<()> {
         fs::create_dir_all(path)?;
-        let probe = path.join(format!(".sans-write-check-{}", std::process::id()));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&probe)?;
-        file.write_all(b"writable")?;
-        fs::remove_file(probe)
+        let mut probe = tempfile::Builder::new()
+            .prefix(".sans-write-check-")
+            .tempfile_in(path)?;
+        probe.write_all(b"writable")
     })();
 
     result.map_err(|source| StartupError::DataRootUnavailable {
