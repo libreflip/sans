@@ -56,6 +56,9 @@ jobs:
         with:
           rustflags: ""
 
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install --yes libv4l-dev
+
       - name: Test workspace
         run: cargo test --workspace --locked
 

@@ -5,7 +5,7 @@ use sans_core::{Camera, CameraTrait, CameraType};
 
 #[cfg(target_os = "linux")]
 fn main() {
-    let left = Camera::new("/dev/video0".into(), CameraType::Left).unwrap();
+    let left = Camera::new("/dev/video0", CameraType::Left).unwrap();
     left.capture_image().unwrap();
 
     // let right = Camera::new("/dev/right".into(), CameraType::Right);
