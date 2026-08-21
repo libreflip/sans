@@ -11,7 +11,7 @@ This repository is a Rust workspace. `sans-core/` contains shared camera, config
 - `cargo fmt --all -- --check` checks formatting without rewriting files.
 - `cargo clippy --workspace --all-targets -- -D warnings` treats lint findings as failures.
 - `cargo run -p sans-server` starts the local HTTP service on `127.0.0.1:8080`.
-- `cross build --target armv7-unknown-linux-gnueabihf` mirrors the Raspberry Pi target used by CI and `Cross.toml`.
+- `cross build --target aarch64-unknown-linux-gnu` mirrors the 64-bit Raspberry Pi 4+ target used by CI.
 
 Run `cargo run -p sans-core --bin hw_diag -- --port /dev/ttyACM0` only during supervised hardware testing. It opens a real serial device and can energize vacuum, fan, blower, and light relays.
 

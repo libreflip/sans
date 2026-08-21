@@ -68,7 +68,10 @@ fn main() {
         eprintln!("warning: initial ALL OFF failed: {e:?}");
     }
 
-    println!("Connected to {}. Type a command (Ctrl-D to exit).", args.port);
+    println!(
+        "Connected to {}. Type a command (Ctrl-D to exit).",
+        args.port
+    );
 
     let stdin = io::stdin();
     loop {

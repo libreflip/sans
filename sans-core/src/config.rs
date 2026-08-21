@@ -6,7 +6,6 @@ use std::ops::Deref;
 
 use toml as serde_toml;
 
-
 #[derive(Serialize, Deserialize)]
 pub struct ConfigBackend {
     pub cameras: Cameras,
@@ -46,19 +45,22 @@ impl SansConfig {
             .write(true)
             .open(&self.path)
             .expect("Failed to open sans config! Does the directory exist?")
-            .write_all(&serde_toml::to_string_pretty(&self.backend)
-                .unwrap_or_else(|_| {
-                    serde_toml::to_string_pretty(&ConfigBackend {
-                        cameras: Cameras {
-                            left: String::new(),
-                            right: String::new(),
-                        },
-                        http_port: 8080,
-                        img_worker: (String::new(), 5505),
-                        hw_port: String::from("/dev/ttyUSB-libreflip"),
-                    }).unwrap()
-                })
-                .as_bytes())
+            .write_all(
+                &serde_toml::to_string_pretty(&self.backend)
+                    .unwrap_or_else(|_| {
+                        serde_toml::to_string_pretty(&ConfigBackend {
+                            cameras: Cameras {
+                                left: String::new(),
+                                right: String::new(),
+                            },
+                            http_port: 8080,
+                            img_worker: (String::new(), 5505),
+                            hw_port: String::from("/dev/ttyUSB-libreflip"),
+                        })
+                        .unwrap()
+                    })
+                    .as_bytes(),
+            )
             .expect("Failed to write sans config. Is your disk full?");
     }
 

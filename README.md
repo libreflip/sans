@@ -10,8 +10,8 @@
 
 <div align="center">
   <!-- Build Status -->
-  <a href="https://travis-ci.org/rustasync/tide">
-    <img src="https://img.shields.io/travis/Libreflip/sans.svg?style=flat-square"
+  <a href="https://github.com/libreflip/sans/actions/workflows/ci.yml">
+    <img src="https://github.com/libreflip/sans/actions/workflows/ci.yml/badge.svg"
       alt="Build Status" />
   </a>
 </div>
@@ -39,5 +39,5 @@ you need.
 
  - git
  - cargo
- - rust nightly
+ - Rust 1.98.0 via `rustup` (see `rust-toolchain.toml`)
  - libimagemagick 7.0
