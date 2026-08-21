@@ -1,43 +1,36 @@
-<h1 align="center">
-<img src="sans.png" />
-</h1>
+# Sans
 
-<div align="center">
- <strong>
-   Automated photo production platform
- </strong>
-</div>
+[![CI](https://github.com/libreflip/sans/actions/workflows/ci.yml/badge.svg)](https://github.com/libreflip/sans/actions/workflows/ci.yml)
 
-<div align="center">
-  <!-- Build Status -->
-  <a href="https://github.com/libreflip/sans/actions/workflows/ci.yml">
-    <img src="https://github.com/libreflip/sans/actions/workflows/ci.yml/badge.svg"
-      alt="Build Status" />
-  </a>
-</div>
+Sans is the native touchscreen application for the Libreflip MVPrototype book scanner. One in-process controller thread owns authoritative Machine state and device adapters; the `egui` render loop sends typed intents and renders snapshots without owning machine policy.
 
-The software that powers Libreflip. The two primary runtime components
-are `sans-server` which initialises the RESTful user interface and
-handles machine scheduling and `sans-worker` which can either be
-deployed on the same machine or an external computer that handles all
-image computation.
+## Run
 
-Additionally there is `sansctl` which can be used to get debug
-information from a local or remote server instance.
+Build and test the active workspace with:
 
-## `sans` crates
+```sh
+cargo build --workspace
+cargo test --workspace
+```
 
-As the entire software stack is written in Rust, the three core
-library components `sans-core`, `sans-types` and `sans-processing` are
-available on [crates.io](http://crates.io). You can link against them to build your
-own extentions and modules that hook into sans.
+The repository pins Rust 1.98.0 in `rust-toolchain.toml`.
 
-## Build dependencies
+Start the native application with the normal Machine-profile path:
 
-In order to build `sans`, there are some external dependencies that
-you need.
+```sh
+cargo run -p sans
+```
 
- - git
- - cargo
- - Rust 1.98.0 via `rustup` (see `rust-toolchain.toml`)
- - libimagemagick 7.0
+Use `cargo run -p sans -- --config /path/to/sans.toml` for an explicit development or deployment profile. The normal path is `$XDG_CONFIG_HOME/sans/sans.toml`, falling back to `~/.config/sans/sans.toml`.
+
+On first start, Sans writes the parseable [sans.example.toml](sans.example.toml) template to the selected path and exits with a path-specific fatal message. Fill every placeholder before restarting. A relative `data_root` is resolved against the profile location and must be writable.
+
+The active production workspace contains `sans-app/` and `sans-core/`. The old HTTP server, worker, remote CLI, shared-types crate, and processing stubs are not production workspace members.
+
+## Machine profile limits
+
+The profile is a complete, versioned commissioning file; the scan workflow never edits it. Protocol baud rates and the 3840×2160 MJPEG camera profile stay fixed in code. Structural validation rejects unstable Camera identities, invalid crops or rotations, nonpositive or unordered fields, and commissioned actuation values above the resolved Issue #15 starting anchors. Those 50% Touchdown-press and seven Lift-percentage values are immutable software maxima; profile edits may only lower them. The separately decided 500 ms Stop-terminal deadline is also fixed. Saves are direct truncating complete-file writes and report errors; they make no atomic replacement or storage-synchronization claim.
+
+## Direct diagnostics
+
+`sans-core` retains `hw_diag` and the Linux V4L2 `camcal` binary. Run them only during supervised hardware work while the `sans` application is stopped; they open devices directly, and `hw_diag` can energize relays.

@@ -9,14 +9,23 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
 use std::time::Duration;
+use thiserror::Error;
 
 pub use protocol::LineKind as HwLine;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum HwError {
+    /// Host-side serial I/O failed.
+    #[error(transparent)]
     Io(io::Error),
+    /// The serial device could not be opened or cloned.
+    #[error("hardware device error: {0}")]
     Device(String),
+    /// No protocol reply arrived before the fixed deadline.
+    #[error("hardware device did not reply before the deadline")]
     NoReply,
+    /// A reply did not match the typed command contract.
+    #[error("unexpected hardware reply: {0}")]
     UnexpectedReply(String),
 }
 

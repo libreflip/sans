@@ -1,0 +1,49 @@
+schema_version = 1
+data_root = "scan-data"
+
+[boards]
+ligature_path = "/dev/serial/by-id/ligature"
+monospace_path = "/dev/serial/by-id/monospace"
+
+[cameras.left]
+identity = "/dev/v4l/by-id/left-camera"
+rotation_degrees = 90
+[cameras.left.crop]
+x = 10
+y = 20
+width = 2000
+height = 3600
+
+[cameras.right]
+identity = "/dev/v4l/by-path/right-camera"
+rotation_degrees = 270
+[cameras.right.crop]
+x = 30
+y = 40
+width = 1900
+height = 3500
+
+[page_width]
+minimum_mm = 100.0
+maximum_mm = 350.0
+
+[timeouts]
+device_open_ms = 5000
+command_ms = 2000
+camera_capture_ms = 5000
+stop_terminal_ms = 500
+
+[pickup]
+vacuum_working_drop_mbar = 0.5
+pickup_drop_mbar = 1.2
+confirmation_samples = 3
+
+[motion]
+touchdown_press_percent = 50.0
+classification_start_percent = 10.0
+wiggle_start_percent = 65.0
+wiggle_retreat_percent = 5.0
+blower_on_percent = 80.0
+vacuum_off_percent = 100.0
+final_lift_percent = 105.0
+blower_off_descent_percent = 80.0

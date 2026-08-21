@@ -1,17 +1,3 @@
 [workspace]
-members = [
-
-    # Core sans library components
-    "sans-core",
-    # "sans-core/sans-processing",
-    "sans-core/sans-types",
-
-    # Core server run on machine
-    "sans-server",
-
-    # Task worker for processing pipeline
-    "sans-worker",
-
-    # Optional debugging and development CLI (sansctl)
-    "sans-ctrl"
-]
+resolver = "2"
+members = ["sans-app", "sans-core"]

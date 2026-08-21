@@ -7,7 +7,9 @@
 //! In the future this should also be possible via a plugin system that doesn't
 //! require other developers to have to modify `sans` sources.
 
+#[cfg(target_os = "linux")]
 mod vl_cam;
+#[cfg(target_os = "linux")]
 pub use self::vl_cam::VLCamera;
 
 /// The camera type, usually location

@@ -1,24 +1,26 @@
 [package]
 name = "sans-core"
 description = "A comprehensive software for running camera enabled workflows, including Libreflip"
-authors = ["Katharina Fey <kookie@spacekookie.de>"]
-edition = "2018"
+edition = "2021"
 version = "0.1.0"
 
 [dependencies]
-sans-types = { path = "sans-types" }
-
 # Serialisation/ Deserialisation
-serde = "1.0"
-serde_derive = "1.0"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.5"
+toml = "0.9"
+thiserror = "2"
 
 # Hardware bindings
-rscam = "0.5"
 serialport = "4"
 
 # hw_diag diagnostic CLI
 clap = { version = "4", features = ["derive"] }
 csv = "1"
 chrono = "0.4"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rscam = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
