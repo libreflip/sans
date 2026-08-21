@@ -23,6 +23,9 @@ jobs:
         with:
           rustflags: ""
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Test workspace
         run: cargo test --workspace --locked
 

@@ -60,7 +60,9 @@ impl HwClient {
 
         thread::sleep(boot_delay);
 
-        let read_half = port.try_clone().map_err(|e| HwError::Device(e.to_string()))?;
+        let read_half = port
+            .try_clone()
+            .map_err(|e| HwError::Device(e.to_string()))?;
         let write_half = port;
 
         let (sender, responses) = channel();

@@ -32,7 +32,8 @@ impl VLCamera {
                 // resolution: (4224, 3156),
                 format: b"MJPG",
                 ..Default::default()
-            }).unwrap();
+            })
+            .unwrap();
 
         Ok(VLCamera { backend, meta })
     }
