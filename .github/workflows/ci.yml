@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Workspace tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  aarch64:
+    name: ARMv7 build and tests
+    runs-on: ubuntu-24.04
+    env:
+      PKG_CONFIG_ALLOW_CROSS: "1"
+      RUST_BACKTRACE: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build ARMv7 workspace
+        run: cross build --workspace --locked --target armv7-unknown-linux-gnueabihf
+
+      - name: Test ARMv7 workspace
+        run: cross test --workspace --locked --target armv7-unknown-linux-gnueabihf
