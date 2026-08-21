@@ -30,7 +30,7 @@ jobs:
         run: cargo test --workspace --locked
 
   aarch64:
-    name: ARMv7 build and tests
+    name: aarch64
     runs-on: ubuntu-24.04
     env:
       PKG_CONFIG_ALLOW_CROSS: "1"
@@ -49,8 +49,8 @@ jobs:
         with:
           tool: cross
 
-      - name: Build ARMv7 workspace
-        run: cross build --workspace --locked --target armv7-unknown-linux-gnueabihf
+      - name: Build AArch64 workspace
+        run: cross build --workspace --locked --target aarch64-unknown-linux-gnu
 
-      - name: Test ARMv7 workspace
-        run: cross test --workspace --locked --target armv7-unknown-linux-gnueabihf
+      - name: Test AArch64 workspace
+        run: cross test --workspace --locked --target aarch64-unknown-linux-gnu
