@@ -58,7 +58,10 @@ pub fn capture_configured_camera(
 impl MachineFactory for V4lCameraMachineFactory {
     type Machine = CapturePairMachine;
 
-    fn open(self, prepared: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        prepared: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         let cameras = &prepared.profile().cameras;
         let (left_path, right_path) = resolve_live_camera_identities(
             Path::new(&cameras.left.identity),

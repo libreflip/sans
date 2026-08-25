@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use eframe::egui;
 #[cfg(target_os = "linux")]
-use sans_core::V4lCameraMachineFactory;
+use sans_core::SansMachineFactory;
 use sans_core::{
-    bootstrap, CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, MachineScreen,
-    SetupState,
+    bootstrap, CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, LigatureState,
+    MachineScreen, PositionTrust, SetupState,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{
@@ -22,8 +22,8 @@ use sans_core::{
 
 use crate::preview::{render_capture_preview, sync_preview_textures, PreviewTextures};
 
-const PORTRAIT_WIDTH: f32 = 600.0;
-const PORTRAIT_HEIGHT: f32 = 1_024.0;
+const PORTRAIT_WIDTH: f32 = 800.0;
+const PORTRAIT_HEIGHT: f32 = 1_280.0;
 const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
@@ -55,7 +55,10 @@ impl ControllerMachine for UnsupportedCameraMachine {
 impl MachineFactory for UnsupportedCameraFactory {
     type Machine = UnsupportedCameraMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         Err(vec![SetupBlocker::new(
             "Live Camera readiness requires Linux V4L2; diagnostics remain available.",
         )])
@@ -65,7 +68,7 @@ impl MachineFactory for UnsupportedCameraFactory {
 enum StartupView {
     Fatal(String),
     Controller {
-        handle: ControllerHandle,
+        handle: Box<ControllerHandle>,
         latest: Option<ControllerSnapshot>,
         exit_requested_at: Option<Instant>,
     },
@@ -99,9 +102,11 @@ impl eframe::App for SansApp {
                     latest,
                     exit_requested_at,
                 } => {
+                    context.request_repaint_after(Duration::from_millis(50));
                     while let Ok(snapshot) = handle.try_snapshot() {
                         *latest = Some(snapshot);
                     }
+                    while handle.try_event().is_ok() {}
                     let latest_pair = latest.as_ref().and_then(latest_complete_pair);
                     sync_preview_textures(
                         &context,
@@ -161,7 +166,35 @@ fn render_controller(
                 ui.label(format!("• {}", reason.summary));
             }
         }
+        Some(MachineScreen::Setup(SetupState::TransportFault { reasons })) => {
+            ui.colored_label(egui::Color32::LIGHT_RED, "Ligature connection fault");
+            ui.label("Scanning and motion controls are disabled.");
+            ui.add_space(12.0);
+            for reason in reasons {
+                ui.label(format!("• {}", reason.summary));
+            }
+            ui.add_space(16.0);
+            if ui
+                .add_sized([240.0, 64.0], egui::Button::new("Retry Ligature"))
+                .clicked()
+            {
+                let _ = handle.send(ControllerIntent::ReconnectLigature);
+            }
+        }
+        Some(MachineScreen::Setup(SetupState::Ready)) => {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, "Ligature connected");
+            render_ligature_status(ui, snapshot.and_then(|snapshot| snapshot.ligature.as_ref()));
+            ui.label("Camera capture is ready.");
+        }
+        Some(MachineScreen::Setup(SetupState::Uncommissioned)) => {
+            ui.colored_label(egui::Color32::YELLOW, "Ligature needs commissioning");
+            render_ligature_status(ui, snapshot.and_then(|snapshot| snapshot.ligature.as_ref()));
+            ui.label(
+                "The board is connected for diagnostics. Scanning and production motion are disabled.",
+            );
+        }
         Some(MachineScreen::CapturePreview(preview)) => {
+            render_ligature_status(ui, snapshot.and_then(|snapshot| snapshot.ligature.as_ref()));
             if render_capture_preview(ui, context, handle, preview, textures).is_err() {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
@@ -196,6 +229,33 @@ fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized([240.0, 56.0], egui::Button::new(label))
 }
 
+fn render_ligature_status(ui: &mut egui::Ui, status: Option<&sans_core::LigatureStatus>) {
+    let Some(status) = status else {
+        return;
+    };
+    let state = match status.state {
+        LigatureState::CommissioningOnly => "Commissioning only",
+        LigatureState::Idle => "Idle",
+        LigatureState::Armed => "Armed",
+        LigatureState::OverridePending => "Override pending",
+        LigatureState::Ready => "Ready",
+        LigatureState::Aligning => "Aligning",
+        LigatureState::Homing => "Homing",
+        LigatureState::Calibrating => "Calibrating",
+        LigatureState::Moving => "Moving",
+        LigatureState::TouchingDown => "Touching down",
+        LigatureState::Holding => "Holding",
+        LigatureState::Fault => "Fault",
+    };
+    let trust = match status.position_trust {
+        PositionTrust::Trusted => "Position trusted",
+        PositionTrust::Untrusted => "Position not trusted",
+    };
+    ui.label(format!("Motion board: {state}"));
+    ui.label(trust);
+    ui.add_space(16.0);
+}
+
 fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(requested_at) >= EXIT_FALLBACK_TIMEOUT
 }
@@ -203,12 +263,12 @@ fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
 fn main() -> eframe::Result {
     let arguments = Arguments::parse();
     #[cfg(target_os = "linux")]
-    let startup = bootstrap(arguments.config.as_deref(), V4lCameraMachineFactory);
+    let startup = bootstrap(arguments.config.as_deref(), SansMachineFactory);
     #[cfg(not(target_os = "linux"))]
     let startup = bootstrap(arguments.config.as_deref(), UnsupportedCameraFactory);
     let startup = match startup {
         Ok(handle) => StartupView::Controller {
-            handle,
+            handle: Box::new(handle),
             latest: None,
             exit_requested_at: None,
         },

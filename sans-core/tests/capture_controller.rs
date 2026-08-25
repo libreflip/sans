@@ -31,16 +31,22 @@ impl RoleCamera for ScriptedCamera {
 }
 
 struct FixtureFactory {
-    left: ScriptedCamera,
-    right: ScriptedCamera,
+    left: Option<ScriptedCamera>,
+    right: Option<ScriptedCamera>,
 }
 
 impl MachineFactory for FixtureFactory {
     type Machine = CapturePairMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
-        CapturePairMachine::new(Box::new(self.left), Box::new(self.right))
-            .map_err(|error| vec![SetupBlocker::new(error.to_string())])
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
+        CapturePairMachine::new(
+            Box::new(self.left.take().unwrap()),
+            Box::new(self.right.take().unwrap()),
+        )
+        .map_err(|error| vec![SetupBlocker::new(error.to_string())])
     }
 }
 
@@ -107,7 +113,10 @@ fn start_controller(left: ScriptedCamera, right: ScriptedCamera) -> sans_core::C
     .unwrap();
     bootstrap(
         Some(Path::new(&profile_path)),
-        FixtureFactory { left, right },
+        FixtureFactory {
+            left: Some(left),
+            right: Some(right),
+        },
     )
     .unwrap()
 }

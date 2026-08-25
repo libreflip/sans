@@ -21,7 +21,18 @@ pub use crate::config::{
     MACHINE_PROFILE_TEMPLATE,
 };
 pub use crate::controller::{
-    bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker, SetupState,
+    bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerEvent, ControllerHandle,
+    ControllerIntent, ControllerMachine, ControllerSnapshot, LigatureMachine,
+    LigatureMachineFactory, MachineFactory, MachineScreen, SetupBlocker, SetupState,
+};
+#[cfg(target_os = "linux")]
+pub use crate::controller::{SansMachine, SansMachineFactory};
+pub use crate::hardware::ligature::{
+    parse_ligature_line, ConnectionEpoch, LigatureBoot, LigatureCaptureSample, LigatureClient,
+    LigatureCommand, LigatureCommandToken, LigatureEvent, LigatureFault, LigatureLine,
+    LigaturePosition, LigatureProtocolError, LigatureReconnect, LigatureRequest, LigatureSession,
+    LigatureSessionError, LigatureState, LigatureStatus, LigatureTransportError, LigatureWire,
+    OperationId, PositionTrust, ProtocolErrorTerminal, ProtocolTerminal, RequestPriority,
+    SerialLigatureWire, LIGATURE_BAUD,
 };
 pub use crate::hardware::{HwClient, HwError, HwLine};

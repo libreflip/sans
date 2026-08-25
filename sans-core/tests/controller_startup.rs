@@ -41,7 +41,10 @@ struct RecordingFactory {
 impl MachineFactory for RecordingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         let current_thread = thread::current();
         self.open_threads.lock().unwrap().push((
             current_thread.id(),
@@ -56,7 +59,10 @@ struct NonSendMachineFactory;
 impl MachineFactory for NonSendMachineFactory {
     type Machine = NonSendMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         Ok(NonSendMachine {
             _marker: Rc::new(()),
         })
@@ -87,8 +93,8 @@ impl ControllerMachine for BlockingDropMachine {
 }
 
 struct BlockingDropFactory {
-    started: mpsc::Sender<()>,
-    release: mpsc::Receiver<()>,
+    started: Option<mpsc::Sender<()>>,
+    release: Option<mpsc::Receiver<()>>,
 }
 
 struct PanickingFactory;
@@ -96,7 +102,10 @@ struct PanickingFactory;
 impl MachineFactory for PanickingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         panic!("simulated controller startup panic");
     }
 }
@@ -104,10 +113,13 @@ impl MachineFactory for PanickingFactory {
 impl MachineFactory for BlockingDropFactory {
     type Machine = BlockingDropMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         Ok(BlockingDropMachine {
-            started: self.started,
-            release: self.release,
+            started: self.started.take().unwrap(),
+            release: self.release.take().unwrap(),
         })
     }
 }
@@ -115,7 +127,10 @@ impl MachineFactory for BlockingDropFactory {
 impl MachineFactory for BlockingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         self.started.send(()).unwrap();
         self.release.recv().unwrap();
         Ok(NoCaptureMachine)
@@ -241,8 +256,8 @@ fn controller_rejects_intents_after_exit_is_accepted() {
     let controller = bootstrap(
         Some(&profile_path),
         BlockingDropFactory {
-            started: drop_started_sender,
-            release: release_receiver,
+            started: Some(drop_started_sender),
+            release: Some(release_receiver),
         },
     )
     .unwrap();
