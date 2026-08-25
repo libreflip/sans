@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use super::{
     parse_ligature_line, LigatureCaptureSample, LigatureCommandToken, LigatureFault, LigatureLine,
-    LigatureProtocolError, LigatureState, LigatureStatus, ProtocolErrorTerminal, ProtocolTerminal,
+    LigatureProtocolError, LigatureState, LigatureStatus, PositionTrust, ProtocolErrorTerminal,
+    ProtocolTerminal,
 };
 
 /// Identity of one physical Ligature connection.
@@ -94,7 +95,79 @@ impl LigatureCommand {
             ][..],
             Self::Cancel | Self::Stop => &["CANCELLED", "Z", "STATE", "TRUST"][..],
         };
-        terminal.require_valid_fields(required)
+        terminal.require_valid_fields(required)?;
+        let state = terminal.state()?;
+        let trust = terminal.position_trust()?;
+        let valid_projection = match self {
+            Self::Arm => matches!(
+                (state, trust),
+                (LigatureState::Armed, PositionTrust::Untrusted)
+                    | (LigatureState::Ready, PositionTrust::Trusted)
+            ),
+            Self::Disarm => state == LigatureState::Idle,
+            Self::Home | Self::ReleaseHold => {
+                state == LigatureState::Ready && trust == PositionTrust::Trusted
+            }
+            Self::Align => {
+                matches!(
+                    state,
+                    LigatureState::CommissioningOnly | LigatureState::Idle
+                ) && trust == PositionTrust::Untrusted
+            }
+            Self::ClearFault => state_and_trust_are_consistent(state, trust),
+            Self::Cancel => matches!(
+                (state, trust),
+                (LigatureState::CommissioningOnly, PositionTrust::Untrusted)
+                    | (LigatureState::Idle, PositionTrust::Untrusted)
+                    | (LigatureState::Armed, PositionTrust::Untrusted)
+                    | (LigatureState::Ready, PositionTrust::Trusted)
+            ),
+            Self::Stop => state == LigatureState::Fault,
+        };
+        if !valid_projection {
+            return Err(LigatureProtocolError::InvalidField {
+                field: "terminal state",
+                value: format!("STATE:{state:?} TRUST:{trust:?}"),
+            });
+        }
+
+        if matches!(self, Self::Home | Self::ReleaseHold)
+            && matches!(terminal.field("Z"), Some("KNOWN" | "?"))
+        {
+            return Err(LigatureProtocolError::InvalidField {
+                field: "Z",
+                value: terminal.field("Z").unwrap_or_default().into(),
+            });
+        }
+        if matches!(self, Self::Cancel | Self::Stop) {
+            let expected = match trust {
+                PositionTrust::Trusted => "KNOWN",
+                PositionTrust::Untrusted => "?",
+            };
+            if terminal.field("Z") != Some(expected) {
+                return Err(LigatureProtocolError::InvalidField {
+                    field: "Z",
+                    value: terminal.field("Z").unwrap_or_default().into(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn state_and_trust_are_consistent(state: LigatureState, trust: PositionTrust) -> bool {
+    match state {
+        LigatureState::Ready
+        | LigatureState::Moving
+        | LigatureState::TouchingDown
+        | LigatureState::Holding => trust == PositionTrust::Trusted,
+        LigatureState::CommissioningOnly
+        | LigatureState::Armed
+        | LigatureState::OverridePending
+        | LigatureState::Aligning
+        | LigatureState::Homing
+        | LigatureState::Calibrating => trust == PositionTrust::Untrusted,
+        LigatureState::Idle | LigatureState::Fault => true,
     }
 }
 

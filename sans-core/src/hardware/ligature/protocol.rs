@@ -191,6 +191,22 @@ impl ProtocolTerminal {
             .ok_or(LigatureProtocolError::MissingField("CANCELLED"))?;
         parse_optional_command("CANCELLED", value)
     }
+
+    pub(super) fn state(&self) -> Result<LigatureState, LigatureProtocolError> {
+        LigatureState::parse(
+            self.fields
+                .get("STATE")
+                .ok_or(LigatureProtocolError::MissingField("STATE"))?,
+        )
+    }
+
+    pub(super) fn position_trust(&self) -> Result<PositionTrust, LigatureProtocolError> {
+        PositionTrust::parse(
+            self.fields
+                .get("TRUST")
+                .ok_or(LigatureProtocolError::MissingField("TRUST"))?,
+        )
+    }
 }
 
 /// A command error terminal with its required firmware reason.

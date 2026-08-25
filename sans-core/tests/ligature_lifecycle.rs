@@ -136,6 +136,13 @@ fn stop_is_not_blocked_by_an_outstanding_routine_cancel() {
     assert_eq!(cancel.priority, RequestPriority::Urgent);
     assert_eq!(stop.priority, RequestPriority::Urgent);
     assert!(matches!(
+        session.receive(
+            ConnectionEpoch(1),
+            "done M112 CANCELLED:G28 Z:KNOWN STATE:READY TRUST:1"
+        ),
+        Err(LigatureSessionError::Protocol(_))
+    ));
+    assert!(matches!(
         session
             .receive(
                 ConnectionEpoch(1),
@@ -245,6 +252,7 @@ fn terminal_missing_required_operation_fields_is_malformed() {
         "done G28 Z:garbage STATE:READY TRUST:1",
         "done G28 Z:-2.000 STATE:PRIVATE TRUST:1",
         "done G28 Z:-2.000 STATE:READY TRUST:9",
+        "done G28 Z:? STATE:FAULT TRUST:1",
     ] {
         assert!(matches!(
             session.receive(ConnectionEpoch(1), terminal),
