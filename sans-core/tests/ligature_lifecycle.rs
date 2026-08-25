@@ -1,3 +1,5 @@
+//! Pure tests for Ligature operation correlation, cancellation, and connection epochs.
+
 use sans_core::{
     ConnectionEpoch, LigatureCommand, LigatureEvent, LigatureSession, LigatureSessionError,
     OperationId, RequestPriority,
@@ -214,5 +216,19 @@ fn immediate_ordinary_command_serializes_without_an_acceptance_frame() {
             .receive(ConnectionEpoch(1), "done M3 STATE:READY TRUST:1")
             .unwrap(),
         LigatureEvent::Completed { operation_id, .. } if operation_id == arm.operation_id
+    ));
+}
+
+#[test]
+fn terminal_missing_required_operation_fields_is_malformed() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+    session.begin(LigatureCommand::Home).unwrap();
+    session.receive(ConnectionEpoch(1), "ok G28").unwrap();
+
+    assert!(matches!(
+        session.receive(ConnectionEpoch(1), "done G28"),
+        Err(LigatureSessionError::Protocol(
+            sans_core::LigatureProtocolError::MissingField("Z")
+        ))
     ));
 }

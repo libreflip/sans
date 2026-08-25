@@ -22,8 +22,8 @@ use sans_core::{
 
 use crate::preview::{render_capture_preview, sync_preview_textures, PreviewTextures};
 
-const PORTRAIT_WIDTH: f32 = 600.0;
-const PORTRAIT_HEIGHT: f32 = 1_024.0;
+const PORTRAIT_WIDTH: f32 = 800.0;
+const PORTRAIT_HEIGHT: f32 = 1_280.0;
 const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
@@ -55,7 +55,10 @@ impl ControllerMachine for UnsupportedCameraMachine {
 impl MachineFactory for UnsupportedCameraFactory {
     type Machine = UnsupportedCameraMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
         Err(vec![SetupBlocker::new(
             "Live Camera readiness requires Linux V4L2; diagnostics remain available.",
         )])
@@ -168,6 +171,13 @@ fn render_controller(
             ui.add_space(12.0);
             for reason in reasons {
                 ui.label(format!("• {}", reason.summary));
+            }
+            ui.add_space(16.0);
+            if ui
+                .add_sized([240.0, 64.0], egui::Button::new("Retry Ligature"))
+                .clicked()
+            {
+                let _ = handle.send(ControllerIntent::ReconnectLigature);
             }
         }
         Some(MachineScreen::Setup(SetupState::Ready)) => {

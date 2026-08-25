@@ -1,3 +1,5 @@
+//! Fake-wire tests for Ligature behavior at the controller intent and snapshot boundary.
+
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -42,6 +44,14 @@ impl LigatureWire for FakeWire {
         Ok(())
     }
 
+    fn query_current_state(&mut self) -> Result<(), LigatureTransportError> {
+        self.writes.lock().unwrap().push(Write {
+            priority: RequestPriority::Ordinary,
+            line: "?".into(),
+        });
+        Ok(())
+    }
+
     fn try_line(&mut self) -> Result<Option<(ConnectionEpoch, String)>, LigatureTransportError> {
         match self.incoming.try_recv() {
             Ok(line) => Ok(Some((self.epoch, line))),
@@ -52,19 +62,42 @@ impl LigatureWire for FakeWire {
 }
 
 struct FakeFactory {
-    wire: FakeWire,
+    wire: Option<FakeWire>,
     query: &'static str,
+}
+
+struct ReconnectFactory {
+    wire: Option<FakeWire>,
+    replacement: Option<FakeWire>,
 }
 
 impl MachineFactory for FakeFactory {
     type Machine = LigatureMachine<FakeWire>;
 
     fn open(
-        self,
+        &mut self,
         _profile: &PreparedMachineProfile,
     ) -> Result<Self::Machine, Vec<sans_core::SetupBlocker>> {
-        let client = LigatureClient::from_query(self.wire, self.query).unwrap();
+        let client = LigatureClient::from_query(self.wire.take().unwrap(), self.query).unwrap();
         Ok(LigatureMachine::new(client))
+    }
+}
+
+impl MachineFactory for ReconnectFactory {
+    type Machine = LigatureMachine<FakeWire>;
+
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<sans_core::SetupBlocker>> {
+        let client = LigatureClient::from_query(self.wire.take().unwrap(), READY).unwrap();
+        let mut replacement = self.replacement.take();
+        Ok(LigatureMachine::with_reconnect(client, move || {
+            replacement
+                .take()
+                .map(|wire| (wire, READY.into()))
+                .ok_or(LigatureTransportError::Closed)
+        }))
     }
 }
 
@@ -83,11 +116,11 @@ fn controller(
     let handle = bootstrap(
         Some(&profile_path),
         FakeFactory {
-            wire: FakeWire {
+            wire: Some(FakeWire {
                 writes: Arc::clone(&writes),
                 incoming: incoming_receiver,
                 epoch: ConnectionEpoch(1),
-            },
+            }),
             query,
         },
     )
@@ -130,6 +163,17 @@ fn controller_routes_operation_lifecycle_and_priority_cancel() {
             .unwrap(),
         ControllerEvent::Ligature(LigatureEvent::Cancelled { .. })
     ));
+    incoming.send(READY.into()).unwrap();
+    assert!(matches!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::Ligature(LigatureEvent::Status(_))
+    ));
+    let refreshed = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(refreshed.ligature.unwrap().state, LigatureState::Ready);
 
     assert_eq!(
         *writes.lock().unwrap(),
@@ -141,6 +185,10 @@ fn controller_routes_operation_lifecycle_and_priority_cancel() {
             Write {
                 priority: RequestPriority::Urgent,
                 line: "M53".into(),
+            },
+            Write {
+                priority: RequestPriority::Ordinary,
+                line: "?".into(),
             },
         ]
     );
@@ -175,6 +223,36 @@ fn controller_exposes_uncommissioned_as_connected_and_scan_disabled() {
 }
 
 #[test]
+fn controller_rejects_a_second_ordinary_operation_instead_of_queueing_it() {
+    let (controller, _incoming, writes) = controller(READY);
+    controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    controller
+        .send(ControllerIntent::Ligature(LigatureCommand::Home))
+        .unwrap();
+    controller
+        .send(ControllerIntent::Ligature(LigatureCommand::Arm))
+        .unwrap();
+
+    assert_eq!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::LigatureRejected(sans_core::LigatureSessionError::Busy)
+    );
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![Write {
+            priority: RequestPriority::Ordinary,
+            line: "G28".into(),
+        }]
+    );
+    controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
 fn malformed_completion_changes_setup_to_transport_fault() {
     let (controller, incoming, _writes) = controller(READY);
     controller
@@ -183,9 +261,14 @@ fn malformed_completion_changes_setup_to_transport_fault() {
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Home))
         .unwrap();
-    incoming
-        .send("done G0 Z:-2.000 STATE:READY TRUST:1".into())
-        .unwrap();
+    incoming.send("ok G28".into()).unwrap();
+    assert!(matches!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::Ligature(LigatureEvent::Accepted(_))
+    ));
+    incoming.send("done G28".into()).unwrap();
 
     assert!(matches!(
         controller
@@ -241,4 +324,72 @@ fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
         Some(LigatureEvent::Accepted(operation_id)) if operation_id == current.operation_id
     ));
     drop(first_sender);
+}
+
+#[test]
+fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let (first_sender, first_receiver) = mpsc::channel();
+    let (second_sender, second_receiver) = mpsc::channel();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let controller = bootstrap(
+        Some(&profile_path),
+        ReconnectFactory {
+            wire: Some(FakeWire {
+                writes: Arc::clone(&writes),
+                incoming: first_receiver,
+                epoch: ConnectionEpoch(1),
+            }),
+            replacement: Some(FakeWire {
+                writes,
+                incoming: second_receiver,
+                epoch: ConnectionEpoch(1),
+            }),
+        },
+    )
+    .unwrap();
+    controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    controller
+        .send(ControllerIntent::Ligature(LigatureCommand::Home))
+        .unwrap();
+    first_sender.send("ok G28".into()).unwrap();
+    controller
+        .recv_event_timeout(Duration::from_secs(1))
+        .unwrap();
+    first_sender.send("done G28".into()).unwrap();
+    assert!(matches!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::LigatureTransportFault(_)
+    ));
+    controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    controller
+        .send(ControllerIntent::ReconnectLigature)
+        .unwrap();
+    let recovered = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(recovered.screen, MachineScreen::Setup(SetupState::Ready));
+    assert_eq!(recovered.ligature.unwrap().state, LigatureState::Ready);
+
+    controller
+        .send(ControllerIntent::Ligature(LigatureCommand::Home))
+        .unwrap();
+    second_sender.send("ok G28".into()).unwrap();
+    assert!(matches!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::Ligature(LigatureEvent::Accepted(_))
+    ));
+    controller.send(ControllerIntent::Exit).unwrap();
 }

@@ -3,8 +3,8 @@
 use thiserror::Error;
 
 use super::{
-    parse_ligature_line, LigatureCaptureSample, LigatureFault, LigatureLine, LigatureProtocolError,
-    LigatureState, LigatureStatus, ProtocolErrorTerminal, ProtocolTerminal,
+    parse_ligature_line, LigatureCaptureSample, LigatureCommandToken, LigatureFault, LigatureLine,
+    LigatureProtocolError, LigatureState, LigatureStatus, ProtocolErrorTerminal, ProtocolTerminal,
 };
 
 /// Identity of one physical Ligature connection.
@@ -76,6 +76,26 @@ impl LigatureCommand {
     fn expects_acceptance(self) -> bool {
         matches!(self, Self::Home | Self::Align)
     }
+
+    fn token(self) -> LigatureCommandToken {
+        LigatureCommandToken::from_static(self.wire())
+    }
+
+    fn validate_done(self, terminal: &ProtocolTerminal) -> Result<(), LigatureProtocolError> {
+        let required = match self {
+            Self::Arm | Self::Disarm | Self::ClearFault => &["STATE", "TRUST"][..],
+            Self::Home | Self::ReleaseHold => &["Z", "STATE", "TRUST"][..],
+            Self::Align => &[
+                "ZERO_ELECTRICAL",
+                "SENSOR_DIRECTION",
+                "VOLATILE",
+                "STATE",
+                "TRUST",
+            ][..],
+            Self::Cancel | Self::Stop => &["CANCELLED", "Z", "STATE", "TRUST"][..],
+        };
+        terminal.require_fields(required)
+    }
 }
 
 /// A correlated command ready for the selected serial writer.
@@ -85,10 +105,13 @@ pub struct LigatureRequest {
     pub operation_id: OperationId,
     /// Physical connection that owns this lifecycle.
     pub epoch: ConnectionEpoch,
+    /// Typed identity used to correlate response frames.
+    pub command: LigatureCommandToken,
     /// Validated firmware command without the line terminator.
     pub line: String,
     /// Writer path selected for the command.
     pub priority: RequestPriority,
+    command_type: LigatureCommand,
 }
 
 #[derive(Clone, Debug)]
@@ -256,7 +279,7 @@ impl LigatureSession {
                 if self
                     .urgent
                     .iter()
-                    .any(|pending| pending.request.line == command.wire()) =>
+                    .any(|pending| pending.request.command == command.token()) =>
             {
                 return Err(LigatureSessionError::Busy)
             }
@@ -265,8 +288,10 @@ impl LigatureSession {
         let request = LigatureRequest {
             operation_id: OperationId(self.next_operation_id),
             epoch: self.epoch,
+            command: command.token(),
             line: command.wire().into(),
             priority,
+            command_type: command,
         };
         self.next_operation_id += 1;
         let pending = PendingRequest {
@@ -336,10 +361,13 @@ impl LigatureSession {
         }
     }
 
-    fn accept(&mut self, command: String) -> Result<LigatureEvent, LigatureSessionError> {
+    fn accept(
+        &mut self,
+        command: LigatureCommandToken,
+    ) -> Result<LigatureEvent, LigatureSessionError> {
         let pending = self.pending_for_command_mut(&command).ok_or_else(|| {
             LigatureSessionError::UnmatchedAcceptance {
-                command: command.clone(),
+                command: command.to_string(),
             }
         })?;
         if !pending.expects_acceptance {
@@ -365,21 +393,22 @@ impl LigatureSession {
         if self
             .urgent
             .iter()
-            .any(|pending| pending.request.line == terminal.command)
+            .any(|pending| pending.request.command == terminal.command)
         {
             return self.complete_urgent(terminal);
         }
         let Some(active) = self.active.as_ref() else {
             return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command,
+                command: terminal.command.to_string(),
             });
         };
-        if active.request.line != terminal.command {
+        if active.request.command != terminal.command {
             return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: active.request.line.clone(),
-                received: terminal.command,
+                expected: active.request.command.to_string(),
+                received: terminal.command.to_string(),
             });
         }
+        active.request.command_type.validate_done(&terminal)?;
         if active.expects_acceptance && !active.accepted {
             return Err(LigatureSessionError::ContradictoryTerminal {
                 expected: format!("ok {}", active.request.line),
@@ -388,7 +417,7 @@ impl LigatureSession {
         }
         let Some(active) = self.active.take() else {
             return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.clone(),
+                command: terminal.command.to_string(),
             });
         };
         let operation_id = active.request.operation_id;
@@ -405,7 +434,7 @@ impl LigatureSession {
         if let Some(index) = self
             .urgent
             .iter()
-            .position(|pending| pending.request.line == terminal.command)
+            .position(|pending| pending.request.command == terminal.command)
         {
             let operation_id = self.urgent.remove(index).request.operation_id;
             return Ok(LigatureEvent::Failed {
@@ -415,18 +444,18 @@ impl LigatureSession {
         }
         let Some(active) = self.active.as_ref() else {
             return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command,
+                command: terminal.command.to_string(),
             });
         };
-        if active.request.line != terminal.command {
+        if active.request.command != terminal.command {
             return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: active.request.line.clone(),
-                received: terminal.command,
+                expected: active.request.command.to_string(),
+                received: terminal.command.to_string(),
             });
         }
         let Some(active) = self.active.take() else {
             return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.clone(),
+                command: terminal.command.to_string(),
             });
         };
         let operation_id = active.request.operation_id;
@@ -443,21 +472,28 @@ impl LigatureSession {
         let Some(urgent_index) = self
             .urgent
             .iter()
-            .position(|pending| pending.request.line == terminal.command)
+            .position(|pending| pending.request.command == terminal.command)
         else {
             return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command,
+                command: terminal.command.to_string(),
             });
         };
-        let cancelled = terminal.field("CANCELLED").unwrap_or("NONE");
-        let expected = self
-            .active
-            .as_ref()
-            .map_or("NONE", |active| active.request.line.as_str());
-        if cancelled != expected {
+        let urgent_command = self.urgent[urgent_index].request.command_type;
+        urgent_command.validate_done(&terminal)?;
+        let cancelled = terminal.cancelled_command()?;
+        let expected = self.active.as_ref().map(|active| &active.request.command);
+        if cancelled.as_ref() != expected {
             return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: format!("CANCELLED:{expected}"),
-                received: format!("CANCELLED:{cancelled}"),
+                expected: format!(
+                    "CANCELLED:{}",
+                    expected.map_or("NONE", LigatureCommandToken::as_str)
+                ),
+                received: format!(
+                    "CANCELLED:{}",
+                    cancelled
+                        .as_ref()
+                        .map_or("NONE", LigatureCommandToken::as_str)
+                ),
             });
         }
         let by = self.urgent.remove(urgent_index).request.operation_id;
@@ -475,14 +511,20 @@ impl LigatureSession {
     }
 
     fn hard_fault(&mut self, fault: LigatureFault) -> Result<LigatureEvent, LigatureSessionError> {
-        let expected = self
-            .active
-            .as_ref()
-            .map_or("NONE", |active| active.request.line.as_str());
-        if fault.cancelled.as_deref().unwrap_or("NONE") != expected {
+        let expected = self.active.as_ref().map(|active| &active.request.command);
+        if fault.cancelled.as_ref() != expected {
             return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: format!("CANCELLED:{expected}"),
-                received: format!("CANCELLED:{}", fault.cancelled.as_deref().unwrap_or("NONE")),
+                expected: format!(
+                    "CANCELLED:{}",
+                    expected.map_or("NONE", LigatureCommandToken::as_str)
+                ),
+                received: format!(
+                    "CANCELLED:{}",
+                    fault
+                        .cancelled
+                        .as_ref()
+                        .map_or("NONE", LigatureCommandToken::as_str)
+                ),
             });
         }
         let mut retired = Vec::new();
@@ -497,18 +539,21 @@ impl LigatureSession {
         Ok(LigatureEvent::HardFault { fault, retired })
     }
 
-    fn pending_for_command_mut(&mut self, command: &str) -> Option<&mut PendingRequest> {
+    fn pending_for_command_mut(
+        &mut self,
+        command: &LigatureCommandToken,
+    ) -> Option<&mut PendingRequest> {
         if let Some(pending) = self
             .urgent
             .iter_mut()
-            .find(|pending| pending.request.line == command)
+            .find(|pending| pending.request.command == *command)
         {
             return Some(pending);
         }
         if self
             .active
             .as_ref()
-            .is_some_and(|pending| pending.request.line == command)
+            .is_some_and(|pending| pending.request.command == *command)
         {
             return self.active.as_mut();
         }

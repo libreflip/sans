@@ -1,3 +1,5 @@
+//! Pure conformance tests for Ligature's implemented production response frames.
+
 use sans_core::{
     parse_ligature_line, LigatureLine, LigaturePosition, LigatureState, PositionTrust,
 };
@@ -46,28 +48,29 @@ fn parses_status_acceptance_terminals_and_hard_faults() {
     assert_eq!(status.state, LigatureState::Moving);
     assert_eq!(status.position_trust, PositionTrust::Trusted);
     assert_eq!(status.position, LigaturePosition::Known(-12.5));
-    assert_eq!(status.active.as_deref(), Some("G1"));
-
     assert_eq!(
-        parse_ligature_line("ok G28").unwrap(),
-        LigatureLine::Accepted {
-            command: "G28".into()
-        }
+        status.active.as_ref().map(|token| token.as_str()),
+        Some("G1")
     );
+
+    let LigatureLine::Accepted { command } = parse_ligature_line("ok G28").unwrap() else {
+        panic!("expected acceptance");
+    };
+    assert_eq!(command.as_str(), "G28");
 
     let LigatureLine::Done(done) =
         parse_ligature_line("done M53 CANCELLED:G1 Z:KNOWN STATE:READY TRUST:1").unwrap()
     else {
         panic!("expected done terminal");
     };
-    assert_eq!(done.command, "M53");
+    assert_eq!(done.command.as_str(), "M53");
     assert_eq!(done.field("CANCELLED"), Some("G1"));
 
     let LigatureLine::Error(error) = parse_ligature_line("error G28 REASON:HOMING_FAILED").unwrap()
     else {
         panic!("expected error terminal");
     };
-    assert_eq!(error.command, "G28");
+    assert_eq!(error.command.as_str(), "G28");
     assert_eq!(error.reason, "HOMING_FAILED");
 
     let LigatureLine::Fault(fault) =
@@ -77,7 +80,10 @@ fn parses_status_acceptance_terminals_and_hard_faults() {
         panic!("expected hard fault");
     };
     assert_eq!(fault.reason, "ENDSTOP_UNEXPECTED");
-    assert_eq!(fault.cancelled.as_deref(), Some("G1"));
+    assert_eq!(
+        fault.cancelled.as_ref().map(|token| token.as_str()),
+        Some("G1")
+    );
     assert_eq!(fault.position_trust, PositionTrust::Untrusted);
 }
 

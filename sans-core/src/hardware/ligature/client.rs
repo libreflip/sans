@@ -42,6 +42,8 @@ pub trait LigatureWire: 'static {
     fn set_epoch(&mut self, epoch: ConnectionEpoch);
     /// Write one already-correlated request through its selected priority path.
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError>;
+    /// Request a fresh public-state frame after an asynchronous lifecycle change.
+    fn query_current_state(&mut self) -> Result<(), LigatureTransportError>;
     /// Poll one epoch-tagged response without blocking.
     fn try_line(&mut self) -> Result<Option<(ConnectionEpoch, String)>, LigatureTransportError>;
 }
@@ -92,10 +94,17 @@ impl<W: LigatureWire> LigatureClient<W> {
         let Some((epoch, line)) = self.wire.try_line()? else {
             return Ok(None);
         };
-        self.session
-            .receive(epoch, &line)
-            .map(Some)
-            .map_err(Into::into)
+        let event = self.session.receive(epoch, &line)?;
+        if matches!(
+            event,
+            LigatureEvent::Completed { .. }
+                | LigatureEvent::Failed { .. }
+                | LigatureEvent::Cancelled { .. }
+                | LigatureEvent::HardFault { .. }
+        ) {
+            self.wire.query_current_state()?;
+        }
+        Ok(Some(event))
     }
 }
 
@@ -178,6 +187,12 @@ impl LigatureWire for SerialLigatureWire {
         };
         sender
             .send(request.line.clone())
+            .map_err(|_| LigatureTransportError::Closed)
+    }
+
+    fn query_current_state(&mut self) -> Result<(), LigatureTransportError> {
+        self.ordinary
+            .send("?".into())
             .map_err(|_| LigatureTransportError::Closed)
     }
 

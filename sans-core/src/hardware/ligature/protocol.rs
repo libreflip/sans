@@ -1,6 +1,7 @@
 //! Pure parser for Ligature's production response frames.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use thiserror::Error;
 
@@ -50,6 +51,39 @@ impl LigatureState {
             "FAULT" => Ok(Self::Fault),
             _ => Err(LigatureProtocolError::UnknownState(value.into())),
         }
+    }
+}
+
+/// Validated command identity carried by acceptance and terminal frames.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct LigatureCommandToken(String);
+
+impl LigatureCommandToken {
+    /// Command text without parameters or a line terminator.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(super) fn from_static(value: &'static str) -> Self {
+        Self(value.into())
+    }
+
+    fn parse(value: &str) -> Result<Self, LigatureProtocolError> {
+        if value.is_empty()
+            || value.len() > 4
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'?')
+        {
+            return Err(LigatureProtocolError::InvalidCommand(value.into()));
+        }
+        Ok(Self(value.into()))
+    }
+}
+
+impl fmt::Display for LigatureCommandToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
@@ -109,7 +143,7 @@ pub struct LigatureStatus {
     /// Whether Touchdown press is set, or unavailable outside that state.
     pub press_is_set: Option<bool>,
     /// Active exclusive command token, if any.
-    pub active: Option<String>,
+    pub active: Option<LigatureCommandToken>,
     /// Latched firmware fault reason, if any.
     pub fault: Option<String>,
     /// Endstop input from a full query; absent from heartbeat frames.
@@ -124,7 +158,7 @@ pub struct LigatureStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolTerminal {
     /// Command completed by this terminal.
-    pub command: String,
+    pub command: LigatureCommandToken,
     fields: BTreeMap<String, String>,
 }
 
@@ -133,13 +167,35 @@ impl ProtocolTerminal {
     pub fn field(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }
+
+    pub(super) fn require_fields(
+        &self,
+        required: &[&'static str],
+    ) -> Result<(), LigatureProtocolError> {
+        for field in required {
+            if !self.fields.contains_key(*field) {
+                return Err(LigatureProtocolError::MissingField(field));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancelled_command(
+        &self,
+    ) -> Result<Option<LigatureCommandToken>, LigatureProtocolError> {
+        let value = self
+            .fields
+            .get("CANCELLED")
+            .ok_or(LigatureProtocolError::MissingField("CANCELLED"))?;
+        parse_optional_command("CANCELLED", value)
+    }
 }
 
 /// A command error terminal with its required firmware reason.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolErrorTerminal {
     /// Command completed by this error.
-    pub command: String,
+    pub command: LigatureCommandToken,
     /// Firmware reason code.
     pub reason: String,
     fields: BTreeMap<String, String>,
@@ -158,7 +214,7 @@ pub struct LigatureFault {
     /// Firmware hard-fault reason.
     pub reason: String,
     /// Exclusive command retired by the fault, if any.
-    pub cancelled: Option<String>,
+    pub cancelled: Option<LigatureCommandToken>,
     /// Position trust remaining after the fault.
     pub position_trust: PositionTrust,
 }
@@ -194,7 +250,7 @@ pub enum LigatureLine {
     /// Immediate acceptance of an asynchronous exclusive operation.
     Accepted {
         /// Accepted firmware command token.
-        command: String,
+        command: LigatureCommandToken,
     },
     /// Successful command terminal.
     Done(ProtocolTerminal),
@@ -314,7 +370,7 @@ fn parse_status<'a>(
             })
         }
     };
-    let active = parse_optional_token("ACTIVE", required("ACTIVE")?)?;
+    let active = parse_optional_command("ACTIVE", required("ACTIVE")?)?;
     let fault = parse_optional_token("FAULT", required("FAULT")?)?;
 
     let endstop_active = parse_optional_bool(&fields, "ENDSTOP")?;
@@ -385,7 +441,7 @@ fn parse_fault<'a>(
         .ok_or(LigatureProtocolError::MissingField("fault reason"))?
         .to_owned();
     let fields = parse_fields(words)?;
-    let cancelled = parse_optional_token(
+    let cancelled = parse_optional_command(
         "CANCELLED",
         fields
             .get("CANCELLED")
@@ -434,17 +490,24 @@ fn parse_fields<'a>(
     Ok(fields)
 }
 
-fn parse_command(value: Option<&str>) -> Result<String, LigatureProtocolError> {
+fn parse_command(value: Option<&str>) -> Result<LigatureCommandToken, LigatureProtocolError> {
     let value = value.ok_or(LigatureProtocolError::MissingField("command"))?;
-    if value.is_empty()
-        || value.len() > 4
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'?')
-    {
-        return Err(LigatureProtocolError::InvalidCommand(value.into()));
+    LigatureCommandToken::parse(value)
+}
+
+fn parse_optional_command(
+    field: &'static str,
+    value: &str,
+) -> Result<Option<LigatureCommandToken>, LigatureProtocolError> {
+    if value == "NONE" {
+        return Ok(None);
     }
-    Ok(value.into())
+    LigatureCommandToken::parse(value)
+        .map(Some)
+        .map_err(|_| LigatureProtocolError::InvalidField {
+            field,
+            value: value.into(),
+        })
 }
 
 fn parse_optional_token(

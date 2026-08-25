@@ -29,9 +29,10 @@ pub use crate::controller::{
 pub use crate::controller::{SansMachine, SansMachineFactory};
 pub use crate::hardware::ligature::{
     parse_ligature_line, ConnectionEpoch, LigatureCaptureSample, LigatureClient, LigatureCommand,
-    LigatureEvent, LigatureFault, LigatureLine, LigaturePosition, LigatureProtocolError,
-    LigatureReconnect, LigatureRequest, LigatureSession, LigatureSessionError, LigatureState,
-    LigatureStatus, LigatureTransportError, LigatureWire, OperationId, PositionTrust,
-    ProtocolErrorTerminal, ProtocolTerminal, RequestPriority, SerialLigatureWire, LIGATURE_BAUD,
+    LigatureCommandToken, LigatureEvent, LigatureFault, LigatureLine, LigaturePosition,
+    LigatureProtocolError, LigatureReconnect, LigatureRequest, LigatureSession,
+    LigatureSessionError, LigatureState, LigatureStatus, LigatureTransportError, LigatureWire,
+    OperationId, PositionTrust, ProtocolErrorTerminal, ProtocolTerminal, RequestPriority,
+    SerialLigatureWire, LIGATURE_BAUD,
 };
 pub use crate::hardware::{HwClient, HwError, HwLine};
