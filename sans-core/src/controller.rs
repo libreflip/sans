@@ -1,7 +1,9 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -75,12 +77,20 @@ pub trait MachineFactory: Send + 'static {
 pub struct ControllerHandle {
     intents: Sender<ControllerIntent>,
     snapshots: Receiver<ControllerSnapshot>,
+    accepting_intents: Arc<AtomicBool>,
     controller_thread: Option<JoinHandle<()>>,
 }
 
 impl ControllerHandle {
     /// Queue an intent without waiting for device or storage work.
     pub fn send(&self, intent: ControllerIntent) -> Result<(), ControllerClosed> {
+        if self
+            .accepting_intents
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ControllerClosed);
+        }
         self.intents.send(intent).map_err(|_| ControllerClosed)
     }
 
@@ -102,7 +112,7 @@ impl ControllerHandle {
 
 impl Drop for ControllerHandle {
     fn drop(&mut self) {
-        let _ = self.intents.send(ControllerIntent::Exit);
+        let _ = self.send(ControllerIntent::Exit);
         if self
             .controller_thread
             .as_ref()
@@ -135,9 +145,20 @@ fn spawn_controller(
 ) -> Result<ControllerHandle, StartupError> {
     let (intent_sender, intent_receiver) = mpsc::channel();
     let (snapshot_sender, snapshot_receiver) = mpsc::channel();
+    let accepting_intents = Arc::new(AtomicBool::new(true));
+    let worker_accepting_intents = Arc::clone(&accepting_intents);
     let controller_thread = thread::Builder::new()
         .name("sans-controller".into())
         .spawn(move || {
+            struct MarkControllerClosed(Arc<AtomicBool>);
+
+            impl Drop for MarkControllerClosed {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+
+            let _closed_on_return = MarkControllerClosed(worker_accepting_intents);
             let (setup, _machine) = match factory.open(&profile) {
                 Ok(machine) => (SetupState::Ready, Some(machine)),
                 Err(reasons) => (SetupState::Blocked { reasons }, None),
@@ -164,6 +185,7 @@ fn spawn_controller(
     Ok(ControllerHandle {
         intents: intent_sender,
         snapshots: snapshot_receiver,
+        accepting_intents,
         controller_thread: Some(controller_thread),
     })
 }

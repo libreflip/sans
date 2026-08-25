@@ -369,12 +369,12 @@ fn validate_profile(profile: &MachineProfile) -> Vec<String> {
     if profile.schema_version != 1 {
         problems.push("schema_version must be 1".into());
     }
-    validate_required_string(
+    validate_board_path(
         "boards.ligature_path",
         &profile.boards.ligature_path,
         &mut problems,
     );
-    validate_required_string(
+    validate_board_path(
         "boards.monospace_path",
         &profile.boards.monospace_path,
         &mut problems,
@@ -447,15 +447,24 @@ fn validate_profile(profile: &MachineProfile) -> Vec<String> {
     problems
 }
 
+fn validate_board_path(name: &str, value: &str, problems: &mut Vec<String>) {
+    validate_required_string(name, value, problems);
+    if !is_direct_device_identity(value, &["/dev/serial/by-id", "/dev/serial/by-path"]) {
+        problems.push(format!(
+            "{name} must name one device directly under /dev/serial/by-id or /dev/serial/by-path"
+        ));
+    }
+}
+
 fn validate_required_string(name: &str, value: &str, problems: &mut Vec<String>) {
-    if value.trim().is_empty() || value.contains('<') || value.contains('>') {
-        problems.push(format!("{name} must be commissioned and nonempty"));
+    if value.trim().is_empty() {
+        problems.push(format!("{name} must be nonempty"));
     }
 }
 
 fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<String>) {
     validate_required_string(&format!("{name}.identity"), &camera.identity, problems);
-    if !is_stable_camera_identity(&camera.identity) {
+    if !is_direct_device_identity(&camera.identity, &["/dev/v4l/by-id", "/dev/v4l/by-path"]) {
         problems.push(format!(
             "{name}.identity must name one device directly under /dev/v4l/by-id or /dev/v4l/by-path"
         ));
@@ -488,16 +497,14 @@ fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<St
     }
 }
 
-fn is_stable_camera_identity(identity: &str) -> bool {
-    ["/dev/v4l/by-id", "/dev/v4l/by-path"]
-        .iter()
-        .any(|directory| {
-            let Ok(relative) = Path::new(identity).strip_prefix(directory) else {
-                return false;
-            };
-            let mut components = relative.components();
-            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
-        })
+fn is_direct_device_identity(identity: &str, directories: &[&str]) -> bool {
+    directories.iter().any(|directory| {
+        let Ok(relative) = Path::new(identity).strip_prefix(directory) else {
+            return false;
+        };
+        let mut components = relative.components();
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+    })
 }
 
 fn validate_timeout(name: &str, value: u64, ceiling: u64, problems: &mut Vec<String>) {

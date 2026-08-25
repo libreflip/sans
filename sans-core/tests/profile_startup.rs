@@ -69,6 +69,26 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "boards.ligature_path",
         ),
         (
+            "ligature_path = \"/dev/serial/by-id/ligature\"",
+            "ligature_path = \"<set-stable-ligature-device-path>\"",
+            "directly under /dev/serial",
+        ),
+        (
+            "ligature_path = \"/dev/serial/by-id/ligature\"",
+            "ligature_path = \"/dev/serial/by-id/\"",
+            "directly under /dev/serial",
+        ),
+        (
+            "ligature_path = \"/dev/serial/by-id/ligature\"",
+            "ligature_path = \"/dev/serial/by-id/../ttyACM0\"",
+            "directly under /dev/serial",
+        ),
+        (
+            "identity = \"/dev/v4l/by-id/left-camera\"",
+            "identity = \"<set-/dev/v4l/by-id-or-by-path-identity>\"",
+            "directly under /dev/v4l",
+        ),
+        (
             "identity = \"/dev/v4l/by-id/left-camera\"",
             "identity = \"/dev/video0\"",
             "directly under /dev/v4l",
@@ -200,4 +220,24 @@ fn complete_profile_save_truncates_old_content_and_propagates_open_errors() {
     let directory_path = temp.path().join("not-a-file");
     fs::create_dir(&directory_path).unwrap();
     assert!(prepared.profile().save(&directory_path).is_err());
+}
+
+#[test]
+fn legitimate_device_names_may_contain_angle_brackets() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    let profile = VALID_PROFILE
+        .replacen(
+            "ligature_path = \"/dev/serial/by-id/ligature\"",
+            "ligature_path = \"/dev/serial/by-id/ligature<primary>\"",
+            1,
+        )
+        .replacen(
+            "identity = \"/dev/v4l/by-id/left-camera\"",
+            "identity = \"/dev/v4l/by-id/left-camera<primary>\"",
+            1,
+        );
+    fs::write(&profile_path, profile).unwrap();
+
+    prepare_machine_profile(Some(&profile_path)).unwrap();
 }

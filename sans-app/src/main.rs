@@ -1,7 +1,7 @@
 //! Native portrait touchscreen entry point for Sans.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
@@ -12,6 +12,7 @@ use sans_core::{
 
 const PORTRAIT_WIDTH: f32 = 800.0;
 const PORTRAIT_HEIGHT: f32 = 1_280.0;
+const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the native Sans touchscreen application")]
@@ -39,7 +40,7 @@ enum StartupView {
     Controller {
         handle: ControllerHandle,
         latest: Option<ControllerSnapshot>,
-        exit_requested: bool,
+        exit_requested_at: Option<Instant>,
     },
 }
 
@@ -68,12 +69,12 @@ impl eframe::App for SansApp {
                 StartupView::Controller {
                     handle,
                     latest,
-                    exit_requested,
+                    exit_requested_at,
                 } => {
                     while let Ok(snapshot) = handle.try_snapshot() {
                         *latest = Some(snapshot);
                     }
-                    render_controller(ui, &context, handle, latest.as_ref(), exit_requested);
+                    render_controller(ui, &context, handle, latest.as_ref(), exit_requested_at);
                 }
             }
         });
@@ -98,7 +99,7 @@ fn render_controller(
     context: &egui::Context,
     handle: &ControllerHandle,
     snapshot: Option<&ControllerSnapshot>,
-    exit_requested: &mut bool,
+    exit_requested_at: &mut Option<Instant>,
 ) {
     match snapshot.map(|snapshot| &snapshot.screen) {
         None => {
@@ -124,18 +125,29 @@ fn render_controller(
     }
 
     ui.add_space(32.0);
-    if *exit_requested {
+    if let Some(requested_at) = *exit_requested_at {
+        if exit_fallback_elapsed(requested_at, Instant::now()) {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         ui.spinner();
         ui.label("Exiting Sans…");
         context.request_repaint_after(Duration::from_millis(16));
     } else if ui
         .add_sized([240.0, 64.0], egui::Button::new("Exit"))
         .clicked()
-        && handle.send(ControllerIntent::Exit).is_ok()
     {
-        *exit_requested = true;
-        context.request_repaint();
+        if handle.send(ControllerIntent::Exit).is_ok() {
+            *exit_requested_at = Some(Instant::now());
+            context.request_repaint();
+        } else {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
+}
+
+fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(requested_at) >= EXIT_FALLBACK_TIMEOUT
 }
 
 fn main() -> eframe::Result {
@@ -144,7 +156,7 @@ fn main() -> eframe::Result {
         Ok(handle) => StartupView::Controller {
             handle,
             latest: None,
-            exit_requested: false,
+            exit_requested_at: None,
         },
         Err(error) => StartupView::Fatal(error.to_string()),
     };
@@ -161,4 +173,25 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |context| Ok(Box::new(SansApp::new(context, startup)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{exit_fallback_elapsed, EXIT_FALLBACK_TIMEOUT};
+
+    #[test]
+    fn exit_fallback_closes_after_controller_deadline() {
+        let requested_at = Instant::now();
+
+        assert!(!exit_fallback_elapsed(
+            requested_at,
+            requested_at + EXIT_FALLBACK_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(exit_fallback_elapsed(
+            requested_at,
+            requested_at + EXIT_FALLBACK_TIMEOUT
+        ));
+    }
 }

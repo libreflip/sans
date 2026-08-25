@@ -6,8 +6,8 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use sans_core::{
-    bootstrap, ControllerIntent, MachineFactory, MachineScreen, PreparedMachineProfile,
-    SetupBlocker, SetupState,
+    bootstrap, ControllerClosed, ControllerIntent, MachineFactory, MachineScreen,
+    PreparedMachineProfile, SetupBlocker, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -44,6 +44,44 @@ impl MachineFactory for NonSendMachineFactory {
 struct BlockingFactory {
     started: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
+}
+
+struct BlockingDropMachine {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+impl Drop for BlockingDropMachine {
+    fn drop(&mut self) {
+        self.started.send(()).unwrap();
+        self.release.recv().unwrap();
+    }
+}
+
+struct BlockingDropFactory {
+    started: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+struct PanickingFactory;
+
+impl MachineFactory for PanickingFactory {
+    type Machine = ();
+
+    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+        panic!("simulated controller startup panic");
+    }
+}
+
+impl MachineFactory for BlockingDropFactory {
+    type Machine = BlockingDropMachine;
+
+    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+        Ok(BlockingDropMachine {
+            started: self.started,
+            release: self.release,
+        })
+    }
 }
 
 impl MachineFactory for BlockingFactory {
@@ -157,5 +195,54 @@ fn dropping_controller_does_not_wait_for_blocked_machine_open() {
     assert!(
         dropped_promptly,
         "dropping the controller blocked on Machine open"
+    );
+}
+
+#[test]
+fn controller_rejects_intents_after_exit_is_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let (drop_started_sender, drop_started_receiver) = mpsc::channel();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let controller = bootstrap(
+        Some(&profile_path),
+        BlockingDropFactory {
+            started: drop_started_sender,
+            release: release_receiver,
+        },
+    )
+    .unwrap();
+    controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    controller.send(ControllerIntent::Exit).unwrap();
+    let exited = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(exited.screen, MachineScreen::Exited);
+    drop_started_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    let post_exit_send = controller.send(ControllerIntent::Exit);
+    release_sender.send(()).unwrap();
+
+    assert_eq!(post_exit_send, Err(ControllerClosed));
+}
+
+#[test]
+fn controller_rejects_intents_after_worker_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let controller = bootstrap(Some(&profile_path), PanickingFactory).unwrap();
+
+    let snapshot = controller.recv_snapshot_timeout(Duration::from_secs(1));
+
+    assert!(snapshot.is_err());
+    assert_eq!(
+        controller.send(ControllerIntent::Exit),
+        Err(ControllerClosed)
     );
 }
