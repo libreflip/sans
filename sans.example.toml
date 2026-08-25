@@ -1,0 +1,58 @@
+# Sans MVPrototype Machine profile.
+# Copy this file to the normal config path or let Sans generate it there.
+# Every <...> value and zero page-width bound must be commissioned before use.
+
+schema_version = 1
+data_root = "scans"
+
+[boards]
+ligature_path = "<set-stable-ligature-device-path>"
+monospace_path = "<set-stable-monospace-device-path>"
+
+[cameras.left]
+identity = "<set-/dev/v4l/by-id-or-by-path-identity>"
+rotation_degrees = 90
+
+[cameras.left.crop]
+x = 0
+y = 0
+width = 2160
+height = 3840
+
+[cameras.right]
+identity = "<set-distinct-/dev/v4l/by-id-or-by-path-identity>"
+rotation_degrees = 270
+
+[cameras.right.crop]
+x = 0
+y = 0
+width = 2160
+height = 3840
+
+[page_width]
+minimum_mm = 0.0
+maximum_mm = 0.0
+
+[timeouts]
+# All values must be positive; the Stop terminal has an immutable 500 ms maximum.
+device_open_ms = 5000
+command_ms = 2000
+camera_capture_ms = 5000
+stop_terminal_ms = 500
+
+[pickup]
+# Thresholds and confirmation_samples must be positive; thresholds must be ordered.
+vacuum_working_drop_mbar = 0.5
+pickup_drop_mbar = 1.2
+confirmation_samples = 3
+
+[motion]
+# These resolved starting values are also immutable maxima; edits may only lower actuation.
+touchdown_press_percent = 50.0
+classification_start_percent = 10.0
+wiggle_start_percent = 65.0
+wiggle_retreat_percent = 5.0
+blower_on_percent = 80.0
+vacuum_off_percent = 100.0
+final_lift_percent = 105.0
+blower_off_descent_percent = 80.0
