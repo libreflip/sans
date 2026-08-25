@@ -2,7 +2,8 @@
 
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sans_core::{
     bootstrap, ConnectionEpoch, ControllerEvent, ControllerIntent, LigatureClient, LigatureCommand,
@@ -139,6 +140,39 @@ fn controller(
     (handle, incoming_sender, writes)
 }
 
+fn wait_for_sent(
+    actions: &Arc<Mutex<Vec<FakeAction>>>,
+    priority: RequestPriority,
+    line: &str,
+    expected_count: usize,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let count = actions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action,
+                    FakeAction::Sent {
+                        priority: sent_priority,
+                        line: sent_line,
+                    } if *sent_priority == priority && sent_line == line
+                )
+            })
+            .count();
+        if count >= expected_count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "controller did not send {line} through the {priority:?} path"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[test]
 fn controller_routes_operation_lifecycle_and_priority_cancel() {
     let (controller, incoming, writes) = controller(READY);
@@ -154,6 +188,7 @@ fn controller_routes_operation_lifecycle_and_priority_cancel() {
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Home))
         .unwrap();
+    wait_for_sent(&writes, RequestPriority::Ordinary, "G28", 1);
     incoming.send("ok G28".into()).unwrap();
     assert!(matches!(
         controller
@@ -165,6 +200,7 @@ fn controller_routes_operation_lifecycle_and_priority_cancel() {
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Cancel))
         .unwrap();
+    wait_for_sent(&writes, RequestPriority::Urgent, "M53", 1);
     incoming
         .send("done M53 CANCELLED:G28 Z:KNOWN STATE:READY TRUST:1".into())
         .unwrap();
@@ -265,13 +301,14 @@ fn controller_rejects_a_second_ordinary_operation_instead_of_queueing_it() {
 
 #[test]
 fn malformed_completion_changes_setup_to_transport_fault() {
-    let (controller, incoming, _writes) = controller(READY);
+    let (controller, incoming, writes) = controller(READY);
     controller
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Home))
         .unwrap();
+    wait_for_sent(&writes, RequestPriority::Ordinary, "G28", 1);
     incoming.send("ok G28".into()).unwrap();
     assert!(matches!(
         controller
@@ -445,7 +482,7 @@ fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
                 epoch: ConnectionEpoch(1),
             }),
             replacement: Some(FakeWire {
-                writes,
+                writes: Arc::clone(&writes),
                 incoming: second_receiver,
                 epoch: ConnectionEpoch(1),
             }),
@@ -459,6 +496,7 @@ fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Home))
         .unwrap();
+    wait_for_sent(&writes, RequestPriority::Ordinary, "G28", 1);
     first_sender.send("ok G28".into()).unwrap();
     controller
         .recv_event_timeout(Duration::from_secs(1))
@@ -486,6 +524,7 @@ fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
     controller
         .send(ControllerIntent::Ligature(LigatureCommand::Home))
         .unwrap();
+    wait_for_sent(&writes, RequestPriority::Ordinary, "G28", 2);
     second_sender.send("ok G28".into()).unwrap();
     assert!(matches!(
         controller
