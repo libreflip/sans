@@ -127,7 +127,7 @@ pub struct CameraRoleProfile {
 }
 
 /// A post-rotation Camera crop rectangle in pixels.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CropGeometry {
     /// Horizontal origin from the left edge.
@@ -480,20 +480,12 @@ fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<St
     if camera.crop.width == 0 || camera.crop.height == 0 {
         problems.push(format!("{name}.crop dimensions must be nonzero"));
     }
-    match (
-        camera.crop.x.checked_add(camera.crop.width),
-        camera.crop.y.checked_add(camera.crop.height),
-    ) {
-        (Some(right), Some(bottom)) => {
-            if let Some((frame_width, frame_height)) = frame_dimensions {
-                if right > frame_width || bottom > frame_height {
-                    problems.push(format!(
-                        "{name}.crop must fit the {frame_width}x{frame_height} post-rotation frame"
-                    ));
-                }
-            }
+    if let Some((frame_width, frame_height)) = frame_dimensions {
+        if camera.crop.x >= frame_width || camera.crop.y >= frame_height {
+            problems.push(format!(
+                "{name}.crop must intersect the {frame_width}x{frame_height} post-rotation frame"
+            ));
         }
-        _ => problems.push(format!("{name}.crop geometry overflows")),
     }
 }
 

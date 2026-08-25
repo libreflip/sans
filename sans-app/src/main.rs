@@ -1,17 +1,29 @@
 //! Native portrait touchscreen entry point for Sans.
 
+mod preview;
+
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use eframe::egui;
+#[cfg(target_os = "linux")]
+use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, ControllerHandle, ControllerIntent, ControllerSnapshot, MachineFactory,
-    MachineScreen, PreparedMachineProfile, SetupBlocker, SetupState,
+    bootstrap, CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, MachineScreen,
+    SetupState,
+};
+#[cfg(not(target_os = "linux"))]
+use sans_core::{
+    CameraCaptureError, CameraRole, CapturePairError, ControllerMachine, MachineFactory,
+    PreparedMachineProfile, SetupBlocker,
 };
 
-const PORTRAIT_WIDTH: f32 = 800.0;
-const PORTRAIT_HEIGHT: f32 = 1_280.0;
+use crate::preview::{render_capture_preview, sync_preview_textures, PreviewTextures};
+
+const PORTRAIT_WIDTH: f32 = 600.0;
+const PORTRAIT_HEIGHT: f32 = 1_024.0;
 const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Parser)]
@@ -22,16 +34,31 @@ struct Arguments {
     config: Option<PathBuf>,
 }
 
-struct BootstrapMachineFactory;
+#[cfg(not(target_os = "linux"))]
+struct UnsupportedCameraFactory;
 
-impl MachineFactory for BootstrapMachineFactory {
-    type Machine = ();
+#[cfg(not(target_os = "linux"))]
+struct UnsupportedCameraMachine;
+
+#[cfg(not(target_os = "linux"))]
+impl ControllerMachine for UnsupportedCameraMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        Err(CameraCaptureError::Profile {
+            role: CameraRole::Left,
+            detail: "V4L2 Camera support requires Linux".into(),
+        }
+        .into())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl MachineFactory for UnsupportedCameraFactory {
+    type Machine = UnsupportedCameraMachine;
 
     fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
-        Err(vec![
-            SetupBlocker::new("Machine connections are not configured in this tracer bullet."),
-            SetupBlocker::new("Use direct diagnostics only while Sans is stopped."),
-        ])
+        Err(vec![SetupBlocker::new(
+            "Live Camera readiness requires Linux V4L2; diagnostics remain available.",
+        )])
     }
 }
 
@@ -46,12 +73,16 @@ enum StartupView {
 
 struct SansApp {
     startup: StartupView,
+    preview_textures: Option<PreviewTextures>,
 }
 
 impl SansApp {
     fn new(context: &eframe::CreationContext<'_>, startup: StartupView) -> Self {
         context.egui_ctx.set_visuals(egui::Visuals::dark());
-        Self { startup }
+        Self {
+            startup,
+            preview_textures: None,
+        }
     }
 }
 
@@ -59,10 +90,7 @@ impl eframe::App for SansApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.add_space(32.0);
             ui.heading("Sans");
-            ui.label("MVPrototype machine setup");
-            ui.add_space(32.0);
 
             match &mut self.startup {
                 StartupView::Fatal(message) => render_fatal(ui, &context, message),
@@ -74,10 +102,30 @@ impl eframe::App for SansApp {
                     while let Ok(snapshot) = handle.try_snapshot() {
                         *latest = Some(snapshot);
                     }
-                    render_controller(ui, &context, handle, latest.as_ref(), exit_requested_at);
+                    let latest_pair = latest.as_ref().and_then(latest_complete_pair);
+                    sync_preview_textures(
+                        &context,
+                        &mut self.preview_textures,
+                        latest_pair.cloned(),
+                    );
+                    render_controller(
+                        ui,
+                        &context,
+                        handle,
+                        latest.as_ref(),
+                        exit_requested_at,
+                        self.preview_textures.as_ref(),
+                    );
                 }
             }
         });
+    }
+}
+
+fn latest_complete_pair(snapshot: &ControllerSnapshot) -> Option<&Arc<CapturePair>> {
+    match &snapshot.screen {
+        MachineScreen::CapturePreview(preview) => preview.latest_complete_pair.as_ref(),
+        MachineScreen::Setup(_) | MachineScreen::Exited => None,
     }
 }
 
@@ -86,10 +134,7 @@ fn render_fatal(ui: &mut egui::Ui, context: &egui::Context, message: &str) {
     ui.add_space(16.0);
     ui.label(message);
     ui.add_space(24.0);
-    if ui
-        .add_sized([240.0, 64.0], egui::Button::new("Close Sans"))
-        .clicked()
-    {
+    if large_button(ui, "Close Sans").clicked() {
         context.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 }
@@ -100,23 +145,27 @@ fn render_controller(
     handle: &ControllerHandle,
     snapshot: Option<&ControllerSnapshot>,
     exit_requested_at: &mut Option<Instant>,
+    textures: Option<&PreviewTextures>,
 ) {
     match snapshot.map(|snapshot| &snapshot.screen) {
         None => {
             ui.spinner();
-            ui.label("Checking machine readiness…");
+            ui.label("Checking Camera readiness...");
+            context.request_repaint_after(Duration::from_millis(16));
         }
         Some(MachineScreen::Setup(SetupState::Blocked { reasons })) => {
             ui.colored_label(egui::Color32::YELLOW, "Setup blocked");
-            ui.label("Sans will not actuate the machine.");
-            ui.add_space(16.0);
+            ui.label("Scanning is disabled. Camera diagnostics remain available.");
+            ui.add_space(12.0);
             for reason in reasons {
                 ui.label(format!("• {}", reason.summary));
             }
         }
-        Some(MachineScreen::Setup(SetupState::Ready)) => {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, "Machine profile ready");
-            ui.label("No scan workflow is active.");
+        Some(MachineScreen::CapturePreview(preview)) => {
+            if render_capture_preview(ui, context, handle, preview, textures).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
         }
         Some(MachineScreen::Exited) => {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -124,19 +173,16 @@ fn render_controller(
         }
     }
 
-    ui.add_space(32.0);
+    ui.add_space(16.0);
     if let Some(requested_at) = *exit_requested_at {
         if exit_fallback_elapsed(requested_at, Instant::now()) {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
         ui.spinner();
-        ui.label("Exiting Sans…");
+        ui.label("Exiting Sans...");
         context.request_repaint_after(Duration::from_millis(16));
-    } else if ui
-        .add_sized([240.0, 64.0], egui::Button::new("Exit"))
-        .clicked()
-    {
+    } else if large_button(ui, "Exit").clicked() {
         if handle.send(ControllerIntent::Exit).is_ok() {
             *exit_requested_at = Some(Instant::now());
             context.request_repaint();
@@ -146,13 +192,21 @@ fn render_controller(
     }
 }
 
+fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    ui.add_sized([240.0, 56.0], egui::Button::new(label))
+}
+
 fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(requested_at) >= EXIT_FALLBACK_TIMEOUT
 }
 
 fn main() -> eframe::Result {
     let arguments = Arguments::parse();
-    let startup = match bootstrap(arguments.config.as_deref(), BootstrapMachineFactory) {
+    #[cfg(target_os = "linux")]
+    let startup = bootstrap(arguments.config.as_deref(), V4lCameraMachineFactory);
+    #[cfg(not(target_os = "linux"))]
+    let startup = bootstrap(arguments.config.as_deref(), UnsupportedCameraFactory);
+    let startup = match startup {
         Ok(handle) => StartupView::Controller {
             handle,
             latest: None,
@@ -164,7 +218,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Sans")
             .with_inner_size([PORTRAIT_WIDTH, PORTRAIT_HEIGHT])
-            .with_min_inner_size([600.0, 900.0]),
+            .with_min_inner_size([PORTRAIT_WIDTH, PORTRAIT_HEIGHT]),
         ..Default::default()
     };
 
