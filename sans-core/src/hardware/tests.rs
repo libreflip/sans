@@ -4,6 +4,15 @@ use std::thread;
 
 use super::*;
 
+fn acknowledge_readiness(reader: &mut impl BufRead, writer: &mut impl Write) {
+    for expected in ["ALL OFF\n", "PRESS STOP\n"] {
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        assert_eq!(command, expected);
+        writer.write_all(b"OK\n").unwrap();
+    }
+}
+
 #[test]
 fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
     let (host, board) = UnixStream::pair().unwrap();
@@ -12,15 +21,8 @@ fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        let mut commands = Vec::new();
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            commands.push(command);
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         release_receiver.recv().unwrap();
-        commands
     });
 
     let connection =
@@ -28,7 +30,7 @@ fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
 
     assert!(connection.client.is_usable());
     release_sender.send(()).unwrap();
-    assert_eq!(board_thread.join().unwrap(), ["ALL OFF\n", "PRESS STOP\n"]);
+    board_thread.join().unwrap();
 }
 
 #[test]
@@ -57,11 +59,7 @@ fn unsolicited_response_poisons_idle_correlation() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         thread::sleep(Duration::from_millis(20));
         writer.write_all(b"OK\n").unwrap();
         release_receiver.recv().unwrap();
@@ -94,11 +92,7 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         for sample in 0..100 {
             writeln!(writer, "PRESS {}", 1_000.0 + sample as f32).unwrap();
         }
@@ -150,11 +144,7 @@ fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
         thread::sleep(Duration::from_millis(80));
@@ -198,11 +188,7 @@ fn timeout_closes_both_connection_halves() {
             .unwrap();
         let mut reader = BufReader::new(board_reader);
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
         let mut trailing = String::new();
@@ -227,11 +213,7 @@ fn observed_disconnect_is_forwarded_after_timeout_fault() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -269,11 +251,7 @@ fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
         thread::sleep(Duration::from_millis(50));
@@ -435,11 +413,7 @@ fn disconnect_is_forwarded_and_poisons_the_connection() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
     });
@@ -466,11 +440,7 @@ fn ambiguous_urgent_write_retires_the_response_fifo() {
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
-        for _ in 0..2 {
-            let mut command = String::new();
-            reader.read_line(&mut command).unwrap();
-            writer.write_all(b"OK\n").unwrap();
-        }
+        acknowledge_readiness(&mut reader, &mut writer);
         let mut urgent_command = String::new();
         reader.read_line(&mut urgent_command).unwrap();
         urgent_command
@@ -508,11 +478,7 @@ fn reconnect_uses_a_fresh_epoch() {
         let board_thread = thread::spawn(move || {
             let mut reader = BufReader::new(board.try_clone().unwrap());
             let mut writer = board;
-            for _ in 0..2 {
-                let mut command = String::new();
-                reader.read_line(&mut command).unwrap();
-                writer.write_all(b"OK\n").unwrap();
-            }
+            acknowledge_readiness(&mut reader, &mut writer);
             release_receiver.recv().unwrap();
         });
         let connection =
