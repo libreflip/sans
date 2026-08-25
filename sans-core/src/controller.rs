@@ -1,9 +1,8 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -111,26 +110,25 @@ pub trait MachineFactory: Send + 'static {
 pub struct ControllerHandle {
     intents: Sender<ControllerIntent>,
     snapshots: Receiver<ControllerSnapshot>,
-    accepting_intents: Arc<AtomicBool>,
+    accepting_intents: Arc<Mutex<bool>>,
     controller_thread: Option<JoinHandle<()>>,
 }
 
 impl ControllerHandle {
     /// Queue an intent without waiting for device or storage work.
     pub fn send(&self, intent: ControllerIntent) -> Result<(), ControllerClosed> {
-        if !self.accepting_intents.load(Ordering::Acquire) {
+        let mut accepting_intents = self
+            .accepting_intents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*accepting_intents {
             return Err(ControllerClosed);
         }
-        if intent == ControllerIntent::Exit
-            && self
-                .accepting_intents
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return Err(ControllerClosed);
+        if intent == ControllerIntent::Exit {
+            *accepting_intents = false;
         }
         self.intents.send(intent).map_err(|_| {
-            self.accepting_intents.store(false, Ordering::Release);
+            *accepting_intents = false;
             ControllerClosed
         })
     }
@@ -186,16 +184,19 @@ fn spawn_controller(
 ) -> Result<ControllerHandle, StartupError> {
     let (intent_sender, intent_receiver) = mpsc::channel();
     let (snapshot_sender, snapshot_receiver) = mpsc::channel();
-    let accepting_intents = Arc::new(AtomicBool::new(true));
+    let accepting_intents = Arc::new(Mutex::new(true));
     let worker_accepting_intents = Arc::clone(&accepting_intents);
     let controller_thread = thread::Builder::new()
         .name("sans-controller".into())
         .spawn(move || {
-            struct MarkControllerClosed(Arc<AtomicBool>);
+            struct MarkControllerClosed(Arc<Mutex<bool>>);
 
             impl Drop for MarkControllerClosed {
                 fn drop(&mut self) {
-                    self.0.store(false, Ordering::Release);
+                    *self
+                        .0
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
                 }
             }
 
@@ -208,15 +209,7 @@ fn spawn_controller(
                         revision,
                         screen: MachineScreen::Setup(SetupState::Blocked { reasons }),
                     });
-                    while let Ok(intent) = intent_receiver.recv() {
-                        if intent == ControllerIntent::Exit {
-                            let _ = snapshot_sender.send(ControllerSnapshot {
-                                revision: revision + 1,
-                                screen: MachineScreen::Exited,
-                            });
-                            break;
-                        }
-                    }
+                    wait_for_exit(&intent_receiver, &snapshot_sender, revision);
                     return;
                 }
             };
@@ -286,6 +279,22 @@ fn spawn_controller(
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
+}
+
+fn wait_for_exit(
+    intent_receiver: &Receiver<ControllerIntent>,
+    snapshot_sender: &Sender<ControllerSnapshot>,
+    revision: u64,
+) {
+    while let Ok(intent) = intent_receiver.recv() {
+        if intent == ControllerIntent::Exit {
+            let _ = snapshot_sender.send(ControllerSnapshot {
+                revision: revision + 1,
+                screen: MachineScreen::Exited,
+            });
+            return;
+        }
+    }
 }
 
 fn capture_preview(

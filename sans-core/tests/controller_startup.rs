@@ -251,6 +251,10 @@ fn controller_rejects_intents_after_exit_is_accepted() {
         .unwrap();
 
     controller.send(ControllerIntent::Exit).unwrap();
+    assert_eq!(
+        controller.send(ControllerIntent::CapturePair),
+        Err(ControllerClosed)
+    );
     let exited = controller
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();

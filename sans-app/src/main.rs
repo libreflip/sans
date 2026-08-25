@@ -162,7 +162,10 @@ fn render_controller(
             }
         }
         Some(MachineScreen::CapturePreview(preview)) => {
-            render_capture_preview(ui, context, handle, preview, textures);
+            if render_capture_preview(ui, context, handle, preview, textures).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
         }
         Some(MachineScreen::Exited) => {
             context.send_viewport_cmd(egui::ViewportCommand::Close);

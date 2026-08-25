@@ -112,7 +112,21 @@ fn start_controller(left: ScriptedCamera, right: ScriptedCamera) -> sans_core::C
     .unwrap()
 }
 
-fn capture(controller: &sans_core::ControllerHandle) -> Arc<sans_core::CapturePair> {
+fn expect_ready(controller: &sans_core::ControllerHandle) {
+    let ready = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(
+        ready.screen,
+        MachineScreen::CapturePreview(ref preview)
+            if preview.status == CaptureStatus::Ready
+                && preview.latest_complete_pair.is_none()
+    ));
+}
+
+fn capture_snapshots(
+    controller: &sans_core::ControllerHandle,
+) -> (sans_core::ControllerSnapshot, sans_core::ControllerSnapshot) {
     controller.send(ControllerIntent::CapturePair).unwrap();
     let capturing = controller
         .recv_snapshot_timeout(Duration::from_secs(1))
@@ -124,6 +138,11 @@ fn capture(controller: &sans_core::ControllerHandle) -> Arc<sans_core::CapturePa
     let captured = controller
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
+    (capturing, captured)
+}
+
+fn capture(controller: &sans_core::ControllerHandle) -> Arc<sans_core::CapturePair> {
+    let (_, captured) = capture_snapshots(controller);
     match captured.screen {
         MachineScreen::CapturePreview(preview) => {
             assert_eq!(preview.status, CaptureStatus::Ready);
@@ -149,15 +168,7 @@ fn controller_retries_only_the_failed_camera_and_publishes_one_complete_pair() {
         ],
     );
     let controller = start_controller(left, right);
-    let ready = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    assert!(matches!(
-        ready.screen,
-        MachineScreen::CapturePreview(ref preview)
-            if preview.status == CaptureStatus::Ready
-                && preview.latest_complete_pair.is_none()
-    ));
+    expect_ready(&controller);
 
     let pair = capture(&controller);
 
@@ -190,24 +201,16 @@ fn exhausted_retry_blocks_capture_and_retains_the_previous_complete_pair() {
         ],
     );
     let controller = start_controller(left, right);
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    expect_ready(&controller);
     let expected_pair = capture(&controller);
 
-    controller.send(ControllerIntent::CapturePair).unwrap();
-    let capturing = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let (capturing, blocked) = capture_snapshots(&controller);
     assert!(matches!(
         capturing.screen,
         MachineScreen::CapturePreview(ref preview)
             if preview.status == CaptureStatus::Capturing
                 && preview.latest_complete_pair.as_deref() == Some(expected_pair.as_ref())
     ));
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
     assert!(matches!(
         blocked.screen,
         MachineScreen::CapturePreview(ref preview)
@@ -243,9 +246,7 @@ fn controller_publishes_rotated_frames_with_crops_clamped_to_each_role() {
     let (left, _) = scripted_camera(CameraRole::Left, vec![Ok(left_frame.clone())]);
     let (right, _) = scripted_camera(CameraRole::Right, vec![Ok(right_frame.clone())]);
     let controller = start_controller(left, right);
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    expect_ready(&controller);
 
     let pair = capture(&controller);
 
@@ -284,17 +285,9 @@ fn frame_tagged_for_the_wrong_camera_role_blocks_the_entire_pair() {
         vec![Ok(captured_frame(CameraRole::Right, 20))],
     );
     let controller = start_controller(left, right);
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    expect_ready(&controller);
 
-    controller.send(ControllerIntent::CapturePair).unwrap();
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let (_, blocked) = capture_snapshots(&controller);
 
     assert!(matches!(
         blocked.screen,
@@ -315,17 +308,9 @@ fn missing_native_detail_preview_warns_without_rejecting_the_complete_pair() {
     let (left, _) = scripted_camera(CameraRole::Left, vec![Ok(left_frame)]);
     let (right, _) = scripted_camera(CameraRole::Right, vec![Ok(right_frame)]);
     let controller = start_controller(left, right);
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    expect_ready(&controller);
 
-    controller.send(ControllerIntent::CapturePair).unwrap();
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    let captured = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let (_, captured) = capture_snapshots(&controller);
 
     assert!(matches!(
         captured.screen,
@@ -366,17 +351,9 @@ fn empty_post_rotation_crop_blocks_the_entire_pair() {
         vec![Ok(captured_frame(CameraRole::Right, 20))],
     );
     let controller = start_controller(left, right);
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    expect_ready(&controller);
 
-    controller.send(ControllerIntent::CapturePair).unwrap();
-    controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let (_, blocked) = capture_snapshots(&controller);
 
     assert!(matches!(
         blocked.screen,

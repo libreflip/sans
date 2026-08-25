@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use eframe::egui;
 use sans_core::{
-    CapturePair, CapturePreview, CaptureStatus, ControllerHandle, ControllerIntent, PreviewImage,
+    CapturePair, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle,
+    ControllerIntent, PreviewImage,
 };
 
 const FULL_PAGE_MAX_HEIGHT: f32 = 360.0;
@@ -38,22 +39,30 @@ pub(crate) fn sync_preview_textures(
         context,
         "latest-left-full-page",
         pair.left.full_page_preview(),
+        egui::TextureOptions::LINEAR,
     );
     let right_full_page = load_texture(
         context,
         "latest-right-full-page",
         pair.right.full_page_preview(),
+        egui::TextureOptions::LINEAR,
     );
-    let left_detail = pair
-        .left
-        .native_detail_preview()
-        .ok()
-        .map(|image| load_texture(context, "latest-left-100-percent", image));
-    let right_detail = pair
-        .right
-        .native_detail_preview()
-        .ok()
-        .map(|image| load_texture(context, "latest-right-100-percent", image));
+    let left_detail = pair.left.native_detail_preview().ok().map(|image| {
+        load_texture(
+            context,
+            "latest-left-100-percent",
+            image,
+            egui::TextureOptions::NEAREST,
+        )
+    });
+    let right_detail = pair.right.native_detail_preview().ok().map(|image| {
+        load_texture(
+            context,
+            "latest-right-100-percent",
+            image,
+            egui::TextureOptions::NEAREST,
+        )
+    });
     *textures = Some(PreviewTextures {
         pair,
         left_full_page,
@@ -63,10 +72,15 @@ pub(crate) fn sync_preview_textures(
     });
 }
 
-fn load_texture(context: &egui::Context, name: &str, image: &PreviewImage) -> egui::TextureHandle {
+fn load_texture(
+    context: &egui::Context,
+    name: &str,
+    image: &PreviewImage,
+    options: egui::TextureOptions,
+) -> egui::TextureHandle {
     let color_image =
         egui::ColorImage::from_rgb([image.width as usize, image.height as usize], image.rgb8());
-    context.load_texture(name, color_image, egui::TextureOptions::LINEAR)
+    context.load_texture(name, color_image, options)
 }
 
 pub(crate) fn render_capture_preview(
@@ -75,12 +89,12 @@ pub(crate) fn render_capture_preview(
     handle: &ControllerHandle,
     preview: &CapturePreview,
     textures: Option<&PreviewTextures>,
-) {
+) -> Result<(), ControllerClosed> {
     match &preview.status {
         CaptureStatus::Ready => {
             ui.colored_label(egui::Color32::LIGHT_GREEN, "Cameras ready");
             if large_button(ui, "Capture pair").clicked() {
-                let _ = handle.send(ControllerIntent::CapturePair);
+                handle.send(ControllerIntent::CapturePair)?;
                 context.request_repaint_after(Duration::from_millis(16));
             }
         }
@@ -95,7 +109,7 @@ pub(crate) fn render_capture_preview(
             ui.colored_label(egui::Color32::LIGHT_RED, "Capture blocked");
             ui.label(reason);
             if large_button(ui, "Retry Capture").clicked() {
-                let _ = handle.send(ControllerIntent::CapturePair);
+                handle.send(ControllerIntent::CapturePair)?;
                 context.request_repaint_after(Duration::from_millis(16));
             }
         }
@@ -111,6 +125,7 @@ pub(crate) fn render_capture_preview(
             ui.label("No complete Capture pair yet.");
         }
     }
+    Ok(())
 }
 
 fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures) {
@@ -239,15 +254,16 @@ fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::SystemTime;
 
-    use sans_core::{CameraRole, CapturedFrame, CropGeometry};
+    use sans_core::{CameraRole, CapturePair, CapturedFrame, CropGeometry};
 
-    use super::{full_page_layout, native_detail_layout};
+    use super::{full_page_layout, native_detail_layout, sync_preview_textures, PreviewTextures};
 
-    fn frame() -> CapturedFrame {
+    fn frame(role: CameraRole) -> CapturedFrame {
         CapturedFrame::from_rgb8(
-            CameraRole::Left,
+            role,
             400,
             300,
             vec![0; 400 * 300 * 3],
@@ -264,7 +280,7 @@ mod tests {
 
     #[test]
     fn full_page_preview_aspect_fits_without_distortion() {
-        let frame = frame();
+        let frame = frame(CameraRole::Left);
         let layout = full_page_layout(eframe::egui::vec2(100.0, 100.0), frame.full_page_preview());
 
         assert_eq!(layout.draw_size, eframe::egui::vec2(100.0, 50.0));
@@ -274,11 +290,60 @@ mod tests {
 
     #[test]
     fn detail_preview_centers_one_image_pixel_per_physical_display_pixel() {
-        let frame = frame();
+        let frame = frame(CameraRole::Left);
         let layout = native_detail_layout(80.0, 2.0, frame.native_detail_preview().unwrap());
 
         assert_eq!(layout.draw_size, eframe::egui::vec2(80.0, 50.0));
         assert_eq!(layout.uv.min, eframe::egui::pos2(20.0 / 200.0, 0.0));
         assert_eq!(layout.uv.max, eframe::egui::pos2(180.0 / 200.0, 1.0));
+    }
+
+    #[test]
+    fn full_page_and_detail_textures_use_their_required_filters() {
+        let context = eframe::egui::Context::default();
+        let pair = Arc::new(CapturePair {
+            left: frame(CameraRole::Left),
+            right: frame(CameraRole::Right),
+        });
+        let mut textures = None;
+
+        context.begin_pass(Default::default());
+        sync_preview_textures(&context, &mut textures, Some(pair));
+        let mut output = context.end_pass();
+        let PreviewTextures {
+            left_full_page,
+            right_full_page,
+            left_detail,
+            right_detail,
+            ..
+        } = textures.unwrap();
+        let options_for = |texture: &eframe::egui::TextureHandle| {
+            output
+                .textures_delta
+                .set
+                .iter()
+                .find(|(id, _)| **id == texture.id())
+                .and_then(|(_, deltas)| deltas.last())
+                .map(|delta| delta.options)
+                .unwrap()
+        };
+
+        assert_eq!(
+            options_for(&left_full_page),
+            eframe::egui::TextureOptions::LINEAR
+        );
+        assert_eq!(
+            options_for(&right_full_page),
+            eframe::egui::TextureOptions::LINEAR
+        );
+        assert_eq!(
+            options_for(left_detail.as_ref().unwrap()),
+            eframe::egui::TextureOptions::NEAREST
+        );
+        assert_eq!(
+            options_for(right_detail.as_ref().unwrap()),
+            eframe::egui::TextureOptions::NEAREST
+        );
+        output.textures_delta.clear();
     }
 }
