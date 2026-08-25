@@ -105,6 +105,44 @@ struct BlockingDropFactory {
 
 struct PanickingFactory;
 
+struct PollingFactory {
+    faults: mpsc::Receiver<SetupBlocker>,
+    epoch: u64,
+}
+
+struct PollingMachine {
+    faults: mpsc::Receiver<SetupBlocker>,
+}
+
+impl ControllerMachine for PollingMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        panic!("this startup fixture must not capture")
+    }
+}
+
+impl MachineFactory for PollingFactory {
+    type Machine = PollingMachine;
+
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
+        Ok((
+            PollingMachine {
+                faults: self.faults,
+            },
+            vec![SetupDiagnostic::ready(
+                "Monospace",
+                format!("Ready on connection epoch {}", self.epoch),
+            )],
+        ))
+    }
+
+    fn poll_setup(machine: &mut Self::Machine) -> Option<SetupBlocker> {
+        machine.faults.try_recv().ok()
+    }
+}
+
 impl MachineFactory for PanickingFactory {
     type Machine = NoCaptureMachine;
 
@@ -223,6 +261,128 @@ fn controller_can_own_a_non_send_machine() {
         })
     );
     controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
+fn live_connection_fault_replaces_ready_setup_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let (fault_sender, fault_receiver) = mpsc::channel();
+    let controller = bootstrap(
+        Some(&profile_path),
+        PollingFactory {
+            faults: fault_receiver,
+            epoch: 12,
+        },
+    )
+    .unwrap();
+
+    let ready = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(
+        ready.screen,
+        MachineScreen::Setup(SetupState::Ready { .. })
+    ));
+
+    fault_sender
+        .send(SetupBlocker::new(
+            "Monospace reply timeout poisoned connection epoch 12",
+        ))
+        .unwrap();
+    let blocked = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    assert_eq!(
+        blocked.screen,
+        MachineScreen::Setup(SetupState::Blocked {
+            reasons: vec![SetupBlocker::new(
+                "Monospace reply timeout poisoned connection epoch 12"
+            )]
+        })
+    );
+    controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
+fn controller_setup_snapshots_preserve_monospace_failure_categories() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let failures = [
+        "Monospace firmware error: RELAY_FAULT",
+        "Monospace reply timeout poisoned connection epoch 21",
+        "Monospace malformed frame on connection epoch 21",
+        "Monospace unexpected reply on connection epoch 21",
+        "Monospace disconnected on connection epoch 21",
+        "Monospace urgent writing poisoned connection epoch 21",
+    ];
+
+    for failure in failures {
+        let (fault_sender, fault_receiver) = mpsc::channel();
+        let controller = bootstrap(
+            Some(&profile_path),
+            PollingFactory {
+                faults: fault_receiver,
+                epoch: 21,
+            },
+        )
+        .unwrap();
+        let ready = controller
+            .recv_snapshot_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(matches!(
+            ready.screen,
+            MachineScreen::Setup(SetupState::Ready { .. })
+        ));
+
+        fault_sender.send(SetupBlocker::new(failure)).unwrap();
+        let blocked = controller
+            .recv_snapshot_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(
+            blocked.screen,
+            MachineScreen::Setup(SetupState::Blocked {
+                reasons: vec![SetupBlocker::new(failure)]
+            })
+        );
+        controller.send(ControllerIntent::Exit).unwrap();
+    }
+}
+
+#[test]
+fn controller_setup_snapshot_uses_the_reconnected_epoch() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+
+    let ready_summary = |epoch| {
+        let (_fault_sender, fault_receiver) = mpsc::channel();
+        let controller = bootstrap(
+            Some(&profile_path),
+            PollingFactory {
+                faults: fault_receiver,
+                epoch,
+            },
+        )
+        .unwrap();
+        let snapshot = controller
+            .recv_snapshot_timeout(Duration::from_secs(1))
+            .unwrap();
+        controller.send(ControllerIntent::Exit).unwrap();
+        match snapshot.screen {
+            MachineScreen::Setup(SetupState::Ready { diagnostics }) => {
+                diagnostics[0].summary.clone()
+            }
+            other => panic!("expected ready Setup snapshot, got {other:?}"),
+        }
+    };
+
+    assert_eq!(ready_summary(30), "Ready on connection epoch 30");
+    assert_eq!(ready_summary(31), "Ready on connection epoch 31");
 }
 
 #[test]
