@@ -27,6 +27,25 @@ pub struct SetupBlocker {
     pub summary: String,
 }
 
+/// One live readiness result shown on the Setup screen.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SetupDiagnostic {
+    /// Hardware or adapter whose gate passed.
+    pub component: String,
+    /// Current-connection evidence suitable for an operator or maintainer.
+    pub summary: String,
+}
+
+impl SetupDiagnostic {
+    /// Record a successful live readiness gate.
+    pub fn ready(component: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            component: component.into(),
+            summary: summary.into(),
+        }
+    }
+}
+
 impl SetupBlocker {
     /// Create an operator-facing Setup blocker.
     pub fn new(summary: impl Into<String>) -> Self {
@@ -39,6 +58,11 @@ impl SetupBlocker {
 /// Live readiness shown by the non-actuating Setup screen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupState {
+    /// Every adapter needed by this slice passed its live readiness gate.
+    Ready {
+        /// Current-connection evidence for each ready adapter.
+        diagnostics: Vec<SetupDiagnostic>,
+    },
     /// Live devices or commissioning are unavailable, so actuation remains disabled.
     Blocked {
         /// Diagnostics explaining what must be corrected.
@@ -103,7 +127,15 @@ pub trait MachineFactory: Send + 'static {
     type Machine: ControllerMachine;
 
     /// Open live resources after structural startup checks and report nonfatal Setup blockers.
-    fn open(self, profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>>;
+    fn open(
+        self,
+        profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>>;
+
+    /// Poll controller-owned resources for a live Setup failure.
+    fn poll_setup(_machine: &mut Self::Machine) -> Option<SetupBlocker> {
+        None
+    }
 }
 
 /// An intent channel that also exposes the latest controller projections.
@@ -178,9 +210,9 @@ pub fn bootstrap(
     spawn_controller(profile, factory)
 }
 
-fn spawn_controller(
+fn spawn_controller<Factory: MachineFactory>(
     profile: PreparedMachineProfile,
-    factory: impl MachineFactory,
+    factory: Factory,
 ) -> Result<ControllerHandle, StartupError> {
     let (intent_sender, intent_receiver) = mpsc::channel();
     let (snapshot_sender, snapshot_receiver) = mpsc::channel();
@@ -201,34 +233,60 @@ fn spawn_controller(
             }
 
             let _closed_on_return = MarkControllerClosed(worker_accepting_intents);
-            let mut revision = 0;
-            let mut machine = match factory.open(&profile) {
-                Ok(machine) => machine,
-                Err(reasons) => {
-                    let _ = snapshot_sender.send(ControllerSnapshot {
-                        revision,
-                        screen: MachineScreen::Setup(SetupState::Blocked { reasons }),
-                    });
-                    wait_for_exit(&intent_receiver, &snapshot_sender, revision);
-                    return;
-                }
+            let (setup, mut active_machine) = match factory.open(&profile) {
+                Ok((machine, diagnostics)) => (SetupState::Ready { diagnostics }, Some(machine)),
+                Err(reasons) => (SetupState::Blocked { reasons }, None),
             };
-
-            let mut latest_complete_pair = None;
             if snapshot_sender
                 .send(ControllerSnapshot {
-                    revision,
-                    screen: capture_preview(CaptureStatus::Ready, None),
+                    revision: 0,
+                    screen: MachineScreen::Setup(setup),
                 })
                 .is_err()
             {
                 return;
             }
 
-            while let Ok(intent) = intent_receiver.recv() {
-                revision += 1;
+            let mut revision = 0;
+            let mut latest_complete_pair = None;
+            loop {
+                if let Some(machine) = active_machine.as_mut() {
+                    if let Some(blocker) = Factory::poll_setup(machine) {
+                        revision += 1;
+                        if snapshot_sender
+                            .send(ControllerSnapshot {
+                                revision,
+                                screen: MachineScreen::Setup(SetupState::Blocked {
+                                    reasons: vec![blocker],
+                                }),
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        active_machine = None;
+                    }
+                }
+
+                let intent = if active_machine.is_some() {
+                    match intent_receiver.recv_timeout(Duration::from_millis(16)) {
+                        Ok(intent) => intent,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                } else {
+                    match intent_receiver.recv() {
+                        Ok(intent) => intent,
+                        Err(_) => return,
+                    }
+                };
+
                 match intent {
                     ControllerIntent::CapturePair => {
+                        let Some(machine) = active_machine.as_mut() else {
+                            continue;
+                        };
+                        revision += 1;
                         if snapshot_sender
                             .send(ControllerSnapshot {
                                 revision,
@@ -262,6 +320,7 @@ fn spawn_controller(
                         }
                     }
                     ControllerIntent::Exit => {
+                        revision += 1;
                         let _ = snapshot_sender.send(ControllerSnapshot {
                             revision,
                             screen: MachineScreen::Exited,
@@ -279,22 +338,6 @@ fn spawn_controller(
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
-}
-
-fn wait_for_exit(
-    intent_receiver: &Receiver<ControllerIntent>,
-    snapshot_sender: &Sender<ControllerSnapshot>,
-    revision: u64,
-) {
-    while let Ok(intent) = intent_receiver.recv() {
-        if intent == ControllerIntent::Exit {
-            let _ = snapshot_sender.send(ControllerSnapshot {
-                revision: revision + 1,
-                screen: MachineScreen::Exited,
-            });
-            return;
-        }
-    }
 }
 
 fn capture_preview(

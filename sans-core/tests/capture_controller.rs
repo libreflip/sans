@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use sans_core::{
     bootstrap, CameraCaptureError, CameraRole, CapturePairMachine, CaptureStatus, CapturedFrame,
     ControllerIntent, CropGeometry, MachineFactory, MachineScreen, PreparedMachineProfile,
-    RoleCamera, SetupBlocker,
+    RoleCamera, SetupBlocker, SetupDiagnostic, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -38,8 +38,12 @@ struct FixtureFactory {
 impl MachineFactory for FixtureFactory {
     type Machine = CapturePairMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         CapturePairMachine::new(Box::new(self.left), Box::new(self.right))
+            .map(|machine| (machine, Vec::new()))
             .map_err(|error| vec![SetupBlocker::new(error.to_string())])
     }
 }
@@ -118,9 +122,7 @@ fn expect_ready(controller: &sans_core::ControllerHandle) {
         .unwrap();
     assert!(matches!(
         ready.screen,
-        MachineScreen::CapturePreview(ref preview)
-            if preview.status == CaptureStatus::Ready
-                && preview.latest_complete_pair.is_none()
+        MachineScreen::Setup(SetupState::Ready { ref diagnostics }) if diagnostics.is_empty()
     ));
 }
 
