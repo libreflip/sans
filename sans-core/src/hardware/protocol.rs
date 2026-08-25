@@ -20,6 +20,7 @@ pub enum EventKind {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InvalidCommandLine {
     ControlByte,
+    NonAscii,
     Lowercase,
     TooLong,
 }
@@ -27,6 +28,9 @@ pub enum InvalidCommandLine {
 pub fn validate_command_line(line: &str) -> Result<(), InvalidCommandLine> {
     if line.contains(['\r', '\n', '\0']) {
         return Err(InvalidCommandLine::ControlByte);
+    }
+    if !line.is_ascii() {
+        return Err(InvalidCommandLine::NonAscii);
     }
     if line.chars().any(char::is_lowercase) {
         return Err(InvalidCommandLine::Lowercase);
@@ -118,6 +122,10 @@ mod tests {
             validate_command_line("vacuum on"),
             Err(InvalidCommandLine::Lowercase)
         );
+        assert_eq!(
+            validate_command_line("LED SET Ä"),
+            Err(InvalidCommandLine::NonAscii)
+        );
     }
 
     #[test]
@@ -131,10 +139,6 @@ mod tests {
                 "{}VACUUM ON",
                 "X".repeat(MAX_COMMAND_BYTES + 1 - "VACUUM ON".len())
             )),
-            Err(InvalidCommandLine::TooLong)
-        );
-        assert_eq!(
-            validate_command_line(&"Ä".repeat(MAX_COMMAND_BYTES / 2 + 1)),
             Err(InvalidCommandLine::TooLong)
         );
     }

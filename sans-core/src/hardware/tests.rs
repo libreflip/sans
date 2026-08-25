@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::thread;
 
@@ -13,12 +14,19 @@ fn acknowledge_readiness(reader: &mut impl BufRead, writer: &mut impl Write) {
     }
 }
 
-#[test]
-fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
+fn run_board<T: Send + 'static>(
+    script: impl FnOnce(UnixStream) -> T + Send + 'static,
+) -> (UnixStream, UnixStream, thread::JoinHandle<T>) {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
+    let board_thread = thread::spawn(move || script(board));
+    (host_reader, host, board_thread)
+}
+
+#[test]
+fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
     let (release_sender, release_receiver) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -35,48 +43,59 @@ fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
 
 #[test]
 fn firmware_error_during_gate_returns_no_client() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
         (&board).write_all(b"ERR RELAY_FAULT\n").unwrap();
-        command
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
+        [command, shutdown]
     });
 
     let result = MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100));
 
     assert!(matches!(result, Err(HwError::Firmware(reason)) if reason == "RELAY_FAULT"));
-    assert_eq!(board_thread.join().unwrap(), "ALL OFF\n");
+    assert_eq!(board_thread.join().unwrap(), ["ALL OFF\n", "ALL OFF\n"]);
 }
 
 #[test]
-fn expired_device_open_deadline_returns_no_client() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
+fn device_open_deadline_bounds_both_readiness_acknowledgements() {
+    let (host_reader, host, board_thread) = run_board(move |board| {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        let mut all_off = String::new();
+        reader.read_line(&mut all_off).unwrap();
+        writer.write_all(b"OK\n").unwrap();
+        let mut press_stop = String::new();
+        reader.read_line(&mut press_stop).unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
+        [all_off, press_stop, shutdown]
+    });
 
     let result = MonospaceClient::connect_streams_with_budget(
         host_reader,
         host,
         Duration::from_millis(100),
         ReadinessBudget::Until {
-            deadline: Instant::now(),
-            per_command_limit: Duration::from_millis(100),
+            deadline: Instant::now() + Duration::from_millis(250),
+            per_command_limit: Duration::from_secs(1),
         },
     );
-    drop(board);
 
     assert!(matches!(result, Err(HwError::DeviceOpenTimeout)));
+    assert_eq!(
+        board_thread.join().unwrap(),
+        ["ALL OFF\n", "PRESS STOP\n", "ALL OFF\n"]
+    );
 }
 
 #[test]
 fn unsolicited_response_reports_fault_and_poisons_idle_correlation() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (send_unsolicited, receive_unsolicited) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -109,10 +128,9 @@ fn unsolicited_response_reports_fault_and_poisons_idle_correlation() {
 
 #[test]
 fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_sender, release_receiver) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (events_sent, events_written) = mpsc::channel();
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -121,20 +139,26 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
         }
         writer.write_all(b"EVENT BUTTON PRESSED\n").unwrap();
         writer.write_all(b"EVENT BUTTON RELEASED\n").unwrap();
+        events_sent.send(()).unwrap();
         release_receiver.recv().unwrap();
     });
     let connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+    events_written.recv().unwrap();
 
     let mut pressure_count = 0;
+    let mut latest_pressure = None;
     let mut kinds = Vec::new();
-    while kinds.len() < 2 {
+    while kinds.len() < 2 || latest_pressure != Some(1_099.0) {
         let event = connection
             .events
             .recv_timeout(Duration::from_millis(500))
             .unwrap();
         match event.kind {
-            MonospaceEventKind::Pressure(_) => pressure_count += 1,
+            MonospaceEventKind::Pressure(mbar) => {
+                pressure_count += 1;
+                latest_pressure = Some(mbar);
+            }
             kind => kinds.push(kind),
         }
     }
@@ -147,24 +171,15 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
             MonospaceEventKind::UnknownEvent("BUTTON RELEASED".into())
         ]
     );
-    assert_eq!(
-        connection
-            .events
-            .recv_timeout(Duration::from_millis(100))
-            .unwrap()
-            .kind,
-        MonospaceEventKind::Pressure(1_099.0)
-    );
+    assert_eq!(latest_pressure, Some(1_099.0));
     release_sender.send(()).unwrap();
     board_thread.join().unwrap();
 }
 
 #[test]
 fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_board, wait_for_timeout) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -201,12 +216,7 @@ fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
 
 #[test]
 fn timeout_closes_both_connection_halves() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    host_reader
-        .set_read_timeout(Some(Duration::from_millis(10)))
-        .unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let board_reader = board.try_clone().unwrap();
         board_reader
             .set_read_timeout(Some(Duration::from_millis(500)))
@@ -224,6 +234,9 @@ fn timeout_closes_both_connection_halves() {
             reader.read_line(&mut trailing).unwrap(),
         )
     });
+    host_reader
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(30)).unwrap();
 
@@ -238,10 +251,8 @@ fn timeout_closes_both_connection_halves() {
 
 #[test]
 fn observed_disconnect_is_forwarded_after_timeout_fault() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_board, wait_for_timeout) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -281,10 +292,8 @@ fn observed_disconnect_is_forwarded_after_timeout_fault() {
 
 #[test]
 fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_board, wait_for_timeout) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -321,9 +330,7 @@ fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
 
 #[test]
 fn malformed_frame_poisons_the_connection() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         for response in [b"OK\n".as_slice(), b"OK\n", b"not a frame\n"] {
@@ -353,9 +360,7 @@ fn malformed_frame_poisons_the_connection() {
 
 #[test]
 fn empty_frame_poisons_the_connection() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         for response in [b"OK\n".as_slice(), b"OK\n", b"\n"] {
@@ -384,10 +389,8 @@ fn empty_frame_poisons_the_connection() {
 
 #[test]
 fn unexpected_typed_reply_poisons_the_connection() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_sender, release_receiver) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         for _ in 0..3 {
@@ -419,10 +422,8 @@ fn unexpected_typed_reply_poisons_the_connection() {
 
 #[test]
 fn firmware_err_is_reported_without_poisoning_correlation() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
     let (release_sender, release_receiver) = mpsc::channel();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         for response in [b"OK\n".as_slice(), b"OK\n", b"ERR RELAY_FAULT\n", b"OK\n"] {
@@ -447,14 +448,16 @@ fn firmware_err_is_reported_without_poisoning_correlation() {
 
 #[test]
 fn disconnect_is_forwarded_and_poisons_the_connection() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
+        writer.shutdown(Shutdown::Write).unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
+        [command, shutdown]
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
@@ -469,7 +472,7 @@ fn disconnect_is_forwarded_and_poisons_the_connection() {
         .unwrap();
     assert_eq!(event.kind, MonospaceEventKind::Disconnected);
     assert!(!connection.client.is_usable());
-    board_thread.join().unwrap();
+    assert_eq!(board_thread.join().unwrap(), ["VACUUM ON\n", "ALL OFF\n"]);
     assert_eq!(
         connection.events.recv_timeout(Duration::from_millis(100)),
         Err(RecvTimeoutError::Disconnected)
@@ -477,10 +480,31 @@ fn disconnect_is_forwarded_and_poisons_the_connection() {
 }
 
 #[test]
+fn dropped_event_receiver_retires_the_connection() {
+    let (send_event, event_requested) = mpsc::channel();
+    let (host_reader, host, board_thread) = run_board(move |board| {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        acknowledge_readiness(&mut reader, &mut writer);
+        event_requested.recv().unwrap();
+        writer.write_all(b"EVENT BUTTON PRESSED\n").unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
+        shutdown
+    });
+    let connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+    let MonospaceConnection { client, events } = connection;
+    drop(events);
+    send_event.send(()).unwrap();
+
+    assert_eq!(board_thread.join().unwrap(), "ALL OFF\n");
+    assert!(!client.is_usable());
+}
+
+#[test]
 fn ambiguous_urgent_write_retires_the_response_fifo() {
-    let (host, board) = UnixStream::pair().unwrap();
-    let host_reader = host.try_clone().unwrap();
-    let board_thread = thread::spawn(move || {
+    let (host_reader, host, board_thread) = run_board(move |board| {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
@@ -515,10 +539,8 @@ fn reconnect_uses_a_fresh_epoch() {
         mpsc::Sender<()>,
         thread::JoinHandle<()>,
     ) {
-        let (host, board) = UnixStream::pair().unwrap();
-        let host_reader = host.try_clone().unwrap();
         let (release_sender, release_receiver) = mpsc::channel();
-        let board_thread = thread::spawn(move || {
+        let (host_reader, host, board_thread) = run_board(move |board| {
             let mut reader = BufReader::new(board.try_clone().unwrap());
             let mut writer = board;
             acknowledge_readiness(&mut reader, &mut writer);

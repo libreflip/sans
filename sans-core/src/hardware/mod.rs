@@ -46,6 +46,14 @@ impl ReadinessBudget {
                 .ok_or(HwError::DeviceOpenTimeout),
         }
     }
+
+    fn deadline_elapsed(self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::PerCommand(_) => false,
+            Self::Until { deadline, .. } => Instant::now() >= deadline,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -482,7 +490,20 @@ impl MonospaceClient {
 
     fn complete_readiness_gate(&mut self, budget: ReadinessBudget) -> Result<(), HwError> {
         for command in [ALL_OFF_COMMAND, "PRESS STOP"] {
-            self.expect_ok_with_timeout(command, budget.next_timeout()?)?;
+            let result = budget
+                .next_timeout()
+                .and_then(|timeout| self.expect_ok_with_timeout(command, timeout));
+            if let Err(error) = result {
+                self.state.poison();
+                best_effort_all_off_and_close(&self.write_half);
+                return Err(
+                    if matches!(error, HwError::ReplyTimeout) && budget.deadline_elapsed() {
+                        HwError::DeviceOpenTimeout
+                    } else {
+                        error
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -516,6 +537,7 @@ impl MonospaceClient {
         validate_command_line(line).map_err(|reason| {
             let reason = match reason {
                 InvalidCommandLine::ControlByte => "embedded CR, LF, or NUL".into(),
+                InvalidCommandLine::NonAscii => "non-ASCII wire data".into(),
                 InvalidCommandLine::Lowercase => "lowercase wire data".into(),
                 InvalidCommandLine::TooLong => {
                     format!("more than {MAX_COMMAND_BYTES} bytes")
@@ -754,6 +776,8 @@ fn read_lines(
         }
         match reader.read_line(&mut line) {
             Ok(0) => {
+                state.poison();
+                best_effort_all_off_and_close(write_half);
                 report_disconnect(epoch, state, responses, events);
                 return;
             }
@@ -783,6 +807,9 @@ fn read_lines(
                             epoch,
                             kind: MonospaceEventKind::ButtonPressed,
                         }) {
+                            state.poison();
+                            best_effort_all_off_and_close(write_half);
+                            let _ = responses.send(ReaderReply::Disconnected);
                             return;
                         }
                     }
@@ -791,6 +818,9 @@ fn read_lines(
                             epoch,
                             kind: MonospaceEventKind::UnknownEvent(payload),
                         }) {
+                            state.poison();
+                            best_effort_all_off_and_close(write_half);
+                            let _ = responses.send(ReaderReply::Disconnected);
                             return;
                         }
                     }
