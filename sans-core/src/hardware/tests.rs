@@ -56,11 +56,14 @@ fn expired_device_open_deadline_returns_no_client() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
 
-    let result = MonospaceClient::connect_streams_before(
+    let result = MonospaceClient::connect_streams_with_budget(
         host_reader,
         host,
         Duration::from_millis(100),
-        Some(Instant::now()),
+        ReadinessBudget::Until {
+            deadline: Instant::now(),
+            per_command_limit: Duration::from_millis(100),
+        },
     );
     drop(board);
 
@@ -310,10 +313,10 @@ fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
     );
     release_board.send(()).unwrap();
     assert_eq!(board_thread.join().unwrap(), ["VACUUM ON\n", "ALL OFF\n"]);
-    assert!(matches!(
-        connection.events.try_recv(),
-        Err(TryRecvError::Empty | TryRecvError::Disconnected)
-    ));
+    assert_eq!(
+        connection.events.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Disconnected)
+    );
 }
 
 #[test]

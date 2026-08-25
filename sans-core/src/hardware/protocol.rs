@@ -122,13 +122,19 @@ mod tests {
 
     #[test]
     fn rejects_commands_that_exceed_the_firmware_buffer() {
-        assert_eq!(validate_command_line(&"X".repeat(39)), Ok(()));
         assert_eq!(
-            validate_command_line(&format!("{}VACUUM ON", "X".repeat(31))),
+            validate_command_line(&"X".repeat(MAX_COMMAND_BYTES)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_command_line(&format!(
+                "{}VACUUM ON",
+                "X".repeat(MAX_COMMAND_BYTES + 1 - "VACUUM ON".len())
+            )),
             Err(InvalidCommandLine::TooLong)
         );
         assert_eq!(
-            validate_command_line(&"Ä".repeat(20)),
+            validate_command_line(&"Ä".repeat(MAX_COMMAND_BYTES / 2 + 1)),
             Err(InvalidCommandLine::TooLong)
         );
     }

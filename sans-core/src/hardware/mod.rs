@@ -2,7 +2,10 @@
 
 mod protocol;
 
-use protocol::{classify_line, validate_command_line, EventKind, InvalidCommandLine, LineKind};
+use protocol::{
+    classify_line, validate_command_line, EventKind, InvalidCommandLine, LineKind,
+    MAX_COMMAND_BYTES,
+};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -17,6 +20,33 @@ pub const MONOSPACE_BAUD_RATE: u32 = 115_200;
 const ALL_OFF_COMMAND: &str = "ALL OFF";
 static NEXT_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+#[derive(Clone, Copy)]
+enum ReadinessBudget {
+    #[cfg(test)]
+    PerCommand(Duration),
+    Until {
+        deadline: Instant,
+        per_command_limit: Duration,
+    },
+}
+
+impl ReadinessBudget {
+    fn next_timeout(self) -> Result<Duration, HwError> {
+        match self {
+            #[cfg(test)]
+            Self::PerCommand(timeout) => Ok(timeout),
+            Self::Until {
+                deadline,
+                per_command_limit,
+            } => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .map(|remaining| remaining.min(per_command_limit))
+                .ok_or(HwError::DeviceOpenTimeout),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ConnectionStatus {
@@ -367,7 +397,15 @@ impl MonospaceClient {
             .try_clone()
             .map_err(|error| HwError::Device(error.to_string()))?;
 
-        Self::connect_streams_before(read_half, port, reply_timeout, Some(deadline))
+        Self::connect_streams_with_budget(
+            read_half,
+            port,
+            reply_timeout,
+            ReadinessBudget::Until {
+                deadline,
+                per_command_limit: reply_timeout,
+            },
+        )
     }
 
     #[cfg(test)]
@@ -376,14 +414,19 @@ impl MonospaceClient {
         write_half: impl Write + Send + 'static,
         reply_timeout: Duration,
     ) -> Result<MonospaceConnection, HwError> {
-        Self::connect_streams_before(read_half, write_half, reply_timeout, None)
+        Self::connect_streams_with_budget(
+            read_half,
+            write_half,
+            reply_timeout,
+            ReadinessBudget::PerCommand(reply_timeout),
+        )
     }
 
-    fn connect_streams_before(
+    fn connect_streams_with_budget(
         read_half: impl Read + Send + 'static,
         write_half: impl Write + Send + 'static,
         reply_timeout: Duration,
-        gate_deadline: Option<Instant>,
+        readiness_budget: ReadinessBudget,
     ) -> Result<MonospaceConnection, HwError> {
         let epoch = ConnectionEpoch(NEXT_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed));
         let state = Arc::new(ConnectionState::active());
@@ -426,7 +469,7 @@ impl MonospaceClient {
             reply_timeout,
             epoch,
         };
-        client.complete_readiness_gate(gate_deadline)?;
+        client.complete_readiness_gate(readiness_budget)?;
 
         Ok(MonospaceConnection {
             client,
@@ -437,19 +480,9 @@ impl MonospaceClient {
         })
     }
 
-    fn complete_readiness_gate(&mut self, deadline: Option<Instant>) -> Result<(), HwError> {
+    fn complete_readiness_gate(&mut self, budget: ReadinessBudget) -> Result<(), HwError> {
         for command in [ALL_OFF_COMMAND, "PRESS STOP"] {
-            let timeout = deadline
-                .map(|deadline| {
-                    deadline
-                        .checked_duration_since(Instant::now())
-                        .filter(|remaining| !remaining.is_zero())
-                        .ok_or(HwError::DeviceOpenTimeout)
-                        .map(|remaining| remaining.min(self.reply_timeout))
-                })
-                .transpose()?
-                .unwrap_or(self.reply_timeout);
-            self.expect_ok_with_timeout(command, timeout)?;
+            self.expect_ok_with_timeout(command, budget.next_timeout()?)?;
         }
         Ok(())
     }
@@ -482,11 +515,13 @@ impl MonospaceClient {
     fn send_raw_with_timeout(&mut self, line: &str, timeout: Duration) -> Result<String, HwError> {
         validate_command_line(line).map_err(|reason| {
             let reason = match reason {
-                InvalidCommandLine::ControlByte => "embedded CR, LF, or NUL",
-                InvalidCommandLine::Lowercase => "lowercase wire data",
-                InvalidCommandLine::TooLong => "more than 39 bytes",
+                InvalidCommandLine::ControlByte => "embedded CR, LF, or NUL".into(),
+                InvalidCommandLine::Lowercase => "lowercase wire data".into(),
+                InvalidCommandLine::TooLong => {
+                    format!("more than {MAX_COMMAND_BYTES} bytes")
+                }
             };
-            HwError::InvalidCommand(reason.into())
+            HwError::InvalidCommand(reason)
         })?;
         match self.state.begin_command() {
             Ok(()) => {}
