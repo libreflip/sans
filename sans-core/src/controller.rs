@@ -536,13 +536,9 @@ fn spawn_controller(
                     }
                     Ok(ControllerIntent::CapturePair) => {}
                     Ok(ControllerIntent::Ligature(command)) => {
-                        let result = if ligature_transport_faulted {
-                            Err(LigatureTransportError::Closed)
-                        } else {
-                            machine
-                                .as_mut()
-                                .ok_or(LigatureTransportError::Closed)
-                                .and_then(|machine| machine.begin_ligature(command))
+                        let result = match (ligature_transport_faulted, machine.as_mut()) {
+                            (false, Some(machine)) => machine.begin_ligature(command),
+                            _ => Err(LigatureTransportError::Closed),
                         };
                         if let Err(error) = result {
                             match error {

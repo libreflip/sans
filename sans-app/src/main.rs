@@ -102,6 +102,7 @@ impl eframe::App for SansApp {
                     latest,
                     exit_requested_at,
                 } => {
+                    context.request_repaint_after(Duration::from_millis(50));
                     while let Ok(snapshot) = handle.try_snapshot() {
                         *latest = Some(snapshot);
                     }

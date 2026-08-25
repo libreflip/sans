@@ -215,14 +215,11 @@ impl SerialLigatureWire {
                 return Err(LigatureTransportError::QueryTimeout);
             }
             match wire.incoming.recv_timeout(remaining) {
-                Ok(WireMessage::Line(line)) => match parse_ligature_line(&line) {
-                    Ok(LigatureLine::State(_)) => return Ok((wire, line)),
-                    Ok(LigatureLine::Status(_)) => continue,
-                    Ok(_) => return Err(LigatureTransportError::QueryInvalid(line)),
-                    Err(error) => {
-                        return Err(LigatureTransportError::QueryInvalid(error.to_string()))
+                Ok(WireMessage::Line(line)) => {
+                    if query_line_is_state(&line)? {
+                        return Ok((wire, line));
                     }
-                },
+                }
                 Ok(WireMessage::Failed(error)) => {
                     return Err(LigatureTransportError::Io(error));
                 }
@@ -230,6 +227,45 @@ impl SerialLigatureWire {
             }
         }
     }
+}
+
+fn query_line_is_state(line: &str) -> Result<bool, LigatureTransportError> {
+    if is_production_boot_preamble(line) {
+        return Ok(false);
+    }
+    match parse_ligature_line(line) {
+        Ok(LigatureLine::State(_)) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) => Err(LigatureTransportError::QueryInvalid(error.to_string())),
+    }
+}
+
+fn is_production_boot_preamble(line: &str) -> bool {
+    let mut words = line.split_ascii_whitespace();
+    if words.next() != Some("boot") || words.next() != Some("APP:production") {
+        return false;
+    }
+    let state = words.next();
+    if words.next() != Some("PWM:OFF") {
+        return false;
+    }
+    let commissioned = words.next();
+    let state_matches_commissioning = matches!(
+        (state, commissioned),
+        (Some("STATE:IDLE"), Some("COMMISSIONED:1"))
+            | (Some("STATE:COMMISSIONING_ONLY"), Some("COMMISSIONED:0"))
+    );
+    state_matches_commissioning
+        && matches!(words.next(), Some("DRIVER_INIT:0" | "DRIVER_INIT:1"))
+        && matches!(
+            words.next(),
+            Some("CURRENT_SENSE_INIT:0" | "CURRENT_SENSE_INIT:1")
+        )
+        && matches!(
+            words.next(),
+            Some("ENDSTOP_CONFIGURED:0" | "ENDSTOP_CONFIGURED:1")
+        )
+        && words.next().is_none()
 }
 
 impl LigatureWire for SerialLigatureWire {
@@ -353,4 +389,52 @@ fn write_line(port: &mut Box<dyn SerialPort>, line: &str) -> io::Result<()> {
     port.write_all(line.as_bytes())?;
     port.write_all(b"\n")?;
     port.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{query_line_is_state, LigatureTransportError};
+
+    #[test]
+    fn readiness_query_ignores_the_production_boot_preamble() {
+        for line in [
+            "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:1 DRIVER_INIT:1 \
+             CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+            "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:0 \
+             DRIVER_INIT:0 CURRENT_SENSE_INIT:0 ENDSTOP_CONFIGURED:0",
+        ] {
+            assert!(!query_line_is_state(line).unwrap());
+        }
+    }
+
+    #[test]
+    fn readiness_query_ignores_valid_lifecycle_frames_until_state() {
+        assert!(!query_line_is_state("ok G28").unwrap());
+        assert!(!query_line_is_state("error M53 REASON:FAULTED").unwrap());
+        assert!(!query_line_is_state(
+            "status STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ACTIVE:NONE FAULT:NONE"
+        )
+        .unwrap());
+        assert!(query_line_is_state(
+            "state STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ENDSTOP:0 PWM:OFF \
+             ACTIVE:NONE FAULT:NONE RUNTIME_MODIFIED:0"
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn readiness_query_rejects_unknown_or_malformed_preamble_lines() {
+        for line in [
+            "Ligature ready",
+            "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:0 DRIVER_INIT:1 \
+             CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+            "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:1 DRIVER_INIT:maybe \
+             CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+        ] {
+            assert!(matches!(
+                query_line_is_state(line),
+                Err(LigatureTransportError::QueryInvalid(_))
+            ));
+        }
+    }
 }

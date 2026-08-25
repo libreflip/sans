@@ -8,6 +8,9 @@ use sans_core::{
 const READY: &str = "state STATE:READY TRUST:1 Z:-2.000 VEL:0.000 IQ:0.000 \
                     PRESS:? ENDSTOP:0 PWM:ACTIVE ACTIVE:NONE FAULT:NONE \
                     RUNTIME_MODIFIED:0";
+const FAULT: &str = "state STATE:FAULT TRUST:0 Z:? VEL:0.000 IQ:0.000 \
+                    PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE FAULT:CURRENT_LIMIT \
+                    RUNTIME_MODIFIED:0";
 
 #[test]
 fn exclusive_operation_routes_status_between_acceptance_and_one_terminal() {
@@ -127,6 +130,47 @@ fn hard_fault_and_reconnect_retire_work_without_reusing_old_terminals() {
 }
 
 #[test]
+fn late_urgent_terminal_after_hard_fault_is_ignored_once() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+    session.begin(LigatureCommand::Home).unwrap();
+    let stop = session.begin(LigatureCommand::Stop).unwrap();
+
+    assert!(matches!(
+        session
+            .receive(
+                ConnectionEpoch(1),
+                "fault ENDSTOP_UNEXPECTED CANCELLED:G28 STATE:FAULT TRUST:0 Z:?"
+            )
+            .unwrap(),
+        LigatureEvent::HardFault {
+            ref retired,
+            ..
+        } if retired == &vec![OperationId(1), stop.operation_id]
+    ));
+    assert_eq!(
+        session.begin(LigatureCommand::Stop),
+        Err(LigatureSessionError::Busy)
+    );
+    assert_eq!(
+        session
+            .receive(
+                ConnectionEpoch(1),
+                "done M112 CANCELLED:NONE Z:? STATE:FAULT TRUST:0"
+            )
+            .unwrap(),
+        LigatureEvent::RetiredIgnored(stop.operation_id)
+    );
+    assert!(matches!(
+        session.receive(
+            ConnectionEpoch(1),
+            "done M112 CANCELLED:NONE Z:? STATE:FAULT TRUST:0"
+        ),
+        Err(LigatureSessionError::UnmatchedTerminal { .. })
+    ));
+    assert!(session.begin(LigatureCommand::Stop).is_ok());
+}
+
+#[test]
 fn stop_is_not_blocked_by_an_outstanding_routine_cancel() {
     let mut session = LigatureSession::from_query(READY).unwrap();
     session.begin(LigatureCommand::Home).unwrap();
@@ -171,6 +215,31 @@ fn commissioning_only_is_connected_but_rejects_scan_motion() {
     .unwrap();
 
     assert!(session.is_connected());
+    assert!(!session.scan_enabled());
+    assert_eq!(
+        session.begin(LigatureCommand::Home),
+        Err(LigatureSessionError::CommissioningOnly)
+    );
+}
+
+#[test]
+fn fault_state_does_not_claim_that_the_board_is_commissioned() {
+    let mut session = LigatureSession::from_query(FAULT).unwrap();
+
+    assert!(session.is_connected());
+    assert!(!session.scan_enabled());
+    assert_eq!(
+        session.begin(LigatureCommand::Home),
+        Err(LigatureSessionError::CommissioningOnly)
+    );
+}
+
+#[test]
+fn reconnect_in_fault_state_remains_fail_closed() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+
+    session.reconnect(FAULT).unwrap();
+
     assert!(!session.scan_enabled());
     assert_eq!(
         session.begin(LigatureCommand::Home),
