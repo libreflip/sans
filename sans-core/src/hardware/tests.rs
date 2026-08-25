@@ -335,6 +335,37 @@ fn malformed_frame_poisons_the_connection() {
 }
 
 #[test]
+fn empty_frame_poisons_the_connection() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+    let board_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        for response in [b"OK\n".as_slice(), b"OK\n", b"\n"] {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            writer.write_all(response).unwrap();
+        }
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+
+    assert!(matches!(
+        connection.client.set_vacuum(true),
+        Err(HwError::MalformedFrame(frame)) if frame.is_empty()
+    ));
+    assert_eq!(
+        connection
+            .events
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .kind,
+        MonospaceEventKind::Fault(MonospaceFault::MalformedFrame(String::new()))
+    );
+    board_thread.join().unwrap();
+}
+
+#[test]
 fn unexpected_typed_reply_poisons_the_connection() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
