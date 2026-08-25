@@ -85,30 +85,28 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
             return Some(blocker);
         }
         while let Ok(event) = machine.monospace.events.try_recv() {
-            match event.kind {
-                MonospaceEventKind::Pressure(_) | MonospaceEventKind::ButtonPressed => {}
-                MonospaceEventKind::UnknownEvent(payload) => {
-                    eprintln!(
-                        "ignored unknown Monospace event on epoch {}: {payload:?}",
-                        event.epoch.get()
-                    );
-                }
-                MonospaceEventKind::Disconnected => {
-                    return Some(SetupBlocker::new(format!(
-                        "Monospace disconnected on connection epoch {}",
-                        event.epoch.get()
-                    )));
-                }
-                MonospaceEventKind::Fault(fault) => {
-                    return Some(SetupBlocker::new(format!(
-                        "Monospace connection epoch {} is blocked: {}",
-                        event.epoch.get(),
-                        monospace_fault_summary(&fault)
-                    )));
-                }
+            if let Some(blocker) = monospace_setup_blocker(event.epoch.get(), event.kind) {
+                return Some(blocker);
             }
         }
         None
+    }
+}
+
+fn monospace_setup_blocker(epoch: u64, event: MonospaceEventKind) -> Option<SetupBlocker> {
+    match event {
+        MonospaceEventKind::Pressure(_) | MonospaceEventKind::ButtonPressed => None,
+        MonospaceEventKind::UnknownEvent(payload) => {
+            eprintln!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
+            None
+        }
+        MonospaceEventKind::Disconnected => Some(SetupBlocker::new(format!(
+            "Monospace disconnected on connection epoch {epoch}"
+        ))),
+        MonospaceEventKind::Fault(fault) => Some(SetupBlocker::new(format!(
+            "Monospace connection epoch {epoch} is blocked: {}",
+            monospace_fault_summary(&fault)
+        ))),
     }
 }
 
@@ -354,7 +352,12 @@ fn main() -> eframe::Result {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{exit_fallback_elapsed, EXIT_FALLBACK_TIMEOUT};
+    use sans_core::{MonospaceEventKind, MonospaceFault};
+
+    use super::{
+        exit_fallback_elapsed, monospace_fault_summary, monospace_setup_blocker,
+        EXIT_FALLBACK_TIMEOUT,
+    };
 
     #[test]
     fn exit_fallback_closes_after_controller_deadline() {
@@ -368,5 +371,47 @@ mod tests {
             requested_at,
             requested_at + EXIT_FALLBACK_TIMEOUT
         ));
+    }
+
+    #[test]
+    fn setup_fault_summaries_preserve_the_failure_class() {
+        assert_eq!(
+            monospace_fault_summary(&MonospaceFault::ReplyTimeout),
+            "reply timeout poisoned response correlation"
+        );
+        assert_eq!(
+            monospace_fault_summary(&MonospaceFault::MalformedFrame("broken".into())),
+            "malformed frame \"broken\""
+        );
+        assert_eq!(
+            monospace_fault_summary(&MonospaceFault::UnexpectedReply("OK 1".into())),
+            "unexpected reply \"OK 1\""
+        );
+        assert_eq!(
+            monospace_fault_summary(&MonospaceFault::AmbiguousUrgentWrite),
+            "urgent writing poisoned response correlation"
+        );
+    }
+
+    #[test]
+    fn typed_monospace_events_map_to_setup_without_promoting_unknown_buttons() {
+        assert!(monospace_setup_blocker(8, MonospaceEventKind::Pressure(1_013.0)).is_none());
+        assert!(monospace_setup_blocker(8, MonospaceEventKind::ButtonPressed).is_none());
+        assert!(
+            monospace_setup_blocker(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into()))
+                .is_none()
+        );
+        assert_eq!(
+            monospace_setup_blocker(8, MonospaceEventKind::Disconnected)
+                .unwrap()
+                .summary,
+            "Monospace disconnected on connection epoch 8"
+        );
+        assert_eq!(
+            monospace_setup_blocker(9, MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout))
+                .unwrap()
+                .summary,
+            "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
+        );
     }
 }

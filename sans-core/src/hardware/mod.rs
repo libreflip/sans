@@ -4,7 +4,7 @@ mod protocol;
 
 use protocol::{classify_line, validate_command_line, EventKind, InvalidCommandLine, LineKind};
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -18,27 +18,40 @@ const ALL_OFF_COMMAND: &str = "ALL OFF";
 static NEXT_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
 enum ConnectionStatus {
     Active,
     Poisoned,
     Retired,
 }
 
-struct ConnectionState(AtomicU8);
+struct ConnectionState(Mutex<ConnectionStateData>);
+
+struct ConnectionStateData {
+    status: ConnectionStatus,
+    pending_response: bool,
+}
+
+enum ResponseDisposition {
+    Accepted,
+    Unsolicited,
+    Retired,
+}
+
+enum BeginCommandError {
+    NotActive,
+    AlreadyPending,
+}
 
 impl ConnectionState {
     fn active() -> Self {
-        Self(AtomicU8::new(ConnectionStatus::Active as u8))
+        Self(Mutex::new(ConnectionStateData {
+            status: ConnectionStatus::Active,
+            pending_response: false,
+        }))
     }
 
     fn status(&self) -> ConnectionStatus {
-        match self.0.load(Ordering::Acquire) {
-            value if value == ConnectionStatus::Active as u8 => ConnectionStatus::Active,
-            value if value == ConnectionStatus::Poisoned as u8 => ConnectionStatus::Poisoned,
-            value if value == ConnectionStatus::Retired as u8 => ConnectionStatus::Retired,
-            _ => unreachable!("invalid Monospace connection state"),
-        }
+        self.lock().status
     }
 
     fn is_active(&self) -> bool {
@@ -46,49 +59,63 @@ impl ConnectionState {
     }
 
     fn poison(&self) -> bool {
-        self.0
-            .compare_exchange(
-                ConnectionStatus::Active as u8,
-                ConnectionStatus::Poisoned as u8,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn mark_poisoned(&self) {
-        self.0
-            .store(ConnectionStatus::Poisoned as u8, Ordering::Release);
+        let mut state = self.lock();
+        if state.status != ConnectionStatus::Active {
+            return false;
+        }
+        state.status = ConnectionStatus::Poisoned;
+        state.pending_response = false;
+        true
     }
 
     fn retire(&self) {
-        let _ = self.0.compare_exchange(
-            ConnectionStatus::Active as u8,
-            ConnectionStatus::Retired as u8,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let mut state = self.lock();
+        if state.status == ConnectionStatus::Active {
+            state.status = ConnectionStatus::Retired;
+            state.pending_response = false;
+        }
     }
 
     fn poison_and_get_previous(&self) -> ConnectionStatus {
-        loop {
-            let previous = self.status();
-            if previous != ConnectionStatus::Active {
-                return previous;
-            }
-            if self
-                .0
-                .compare_exchange(
-                    ConnectionStatus::Active as u8,
-                    ConnectionStatus::Poisoned as u8,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                return ConnectionStatus::Active;
-            }
+        let mut state = self.lock();
+        let previous = state.status;
+        if previous == ConnectionStatus::Active {
+            state.status = ConnectionStatus::Poisoned;
+            state.pending_response = false;
         }
+        previous
+    }
+
+    fn begin_command(&self) -> Result<(), BeginCommandError> {
+        let mut state = self.lock();
+        if state.status != ConnectionStatus::Active {
+            return Err(BeginCommandError::NotActive);
+        }
+        if state.pending_response {
+            return Err(BeginCommandError::AlreadyPending);
+        }
+        state.pending_response = true;
+        Ok(())
+    }
+
+    fn route_response(&self, send: impl FnOnce()) -> ResponseDisposition {
+        let mut state = self.lock();
+        if state.status != ConnectionStatus::Active {
+            return ResponseDisposition::Retired;
+        }
+        if !state.pending_response {
+            state.status = ConnectionStatus::Poisoned;
+            return ResponseDisposition::Unsolicited;
+        }
+        state.pending_response = false;
+        send();
+        ResponseDisposition::Accepted
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ConnectionStateData> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -271,7 +298,6 @@ pub struct MonospaceClient {
     responses: Receiver<ReaderReply>,
     event_sender: Sender<MonospaceEvent>,
     state: Arc<ConnectionState>,
-    pending_response: Arc<AtomicBool>,
     reply_timeout: Duration,
     epoch: ConnectionEpoch,
 }
@@ -285,15 +311,8 @@ pub struct MonospaceUrgentWriter {
     write_half: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     event_sender: Sender<MonospaceEvent>,
     state: Arc<ConnectionState>,
-    pending_response: Arc<AtomicBool>,
     epoch: ConnectionEpoch,
 }
-
-/// Compatibility name for the original typed Monospace command client.
-pub type HwClient = MonospaceClient;
-
-/// Compatibility name for the original urgent Monospace writer.
-pub type HwUrgentWriter = MonospaceUrgentWriter;
 
 impl MonospaceClient {
     /// Open Monospace at its fixed baud rate and complete the production gate.
@@ -326,13 +345,11 @@ impl MonospaceClient {
     ) -> Result<MonospaceConnection, HwError> {
         let epoch = ConnectionEpoch(NEXT_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed));
         let state = Arc::new(ConnectionState::active());
-        let pending_response = Arc::new(AtomicBool::new(false));
         let (response_sender, responses) = mpsc::channel();
         let (event_sender, reliable_events) = mpsc::channel();
         let latest_pressure = Arc::new(Mutex::new(None));
         let (reader_ready_sender, reader_ready_receiver) = mpsc::sync_channel(0);
         let reader_state = Arc::clone(&state);
-        let reader_pending_response = Arc::clone(&pending_response);
         let reader_event_sender = event_sender.clone();
         let reader_pressure = Arc::clone(&latest_pressure);
 
@@ -344,7 +361,6 @@ impl MonospaceClient {
                     read_half,
                     epoch,
                     &reader_state,
-                    &reader_pending_response,
                     &response_sender,
                     &reader_event_sender,
                     &reader_pressure,
@@ -360,7 +376,6 @@ impl MonospaceClient {
             responses,
             event_sender,
             state,
-            pending_response,
             reply_timeout,
             epoch,
         };
@@ -392,7 +407,6 @@ impl MonospaceClient {
             write_half: Arc::clone(&self.write_half),
             event_sender: self.event_sender.clone(),
             state: Arc::clone(&self.state),
-            pending_response: Arc::clone(&self.pending_response),
             epoch: self.epoch,
         }
     }
@@ -406,14 +420,13 @@ impl MonospaceClient {
             };
             HwError::InvalidCommand(reason.into())
         })?;
-        self.require_usable()?;
-        if self
-            .pending_response
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            self.poison(MonospaceFault::AmbiguousUrgentWrite);
-            return Err(HwError::AmbiguousUrgentWrite);
+        match self.state.begin_command() {
+            Ok(()) => {}
+            Err(BeginCommandError::NotActive) => return Err(self.retired_error()),
+            Err(BeginCommandError::AlreadyPending) => {
+                self.poison(MonospaceFault::AmbiguousUrgentWrite);
+                return Err(HwError::AmbiguousUrgentWrite);
+            }
         }
 
         self.write_and_receive(line)
@@ -435,7 +448,7 @@ impl MonospaceClient {
                 Err(HwError::UnexpectedReply(reply))
             }
             Ok(ReaderReply::Disconnected) => {
-                self.state.mark_poisoned();
+                self.state.poison();
                 self.close_writer();
                 Err(HwError::Disconnected)
             }
@@ -444,7 +457,7 @@ impl MonospaceClient {
                 Err(HwError::ReplyTimeout)
             }
             Err(RecvTimeoutError::Disconnected) => {
-                self.state.mark_poisoned();
+                self.state.poison();
                 self.close_writer();
                 Err(HwError::Disconnected)
             }
@@ -458,14 +471,6 @@ impl MonospaceClient {
             .map_err(|_| HwError::Device("Monospace writer lock is poisoned".into()))?;
         let writer = writer.as_mut().ok_or(HwError::Disconnected)?;
         write_line(writer.as_mut(), line).map_err(HwError::Io)
-    }
-
-    fn require_usable(&self) -> Result<(), HwError> {
-        if self.is_usable() {
-            Ok(())
-        } else {
-            Err(self.retired_error())
-        }
     }
 
     fn retired_error(&self) -> HwError {
@@ -567,7 +572,6 @@ impl MonospaceUrgentWriter {
         if !self.state.is_active() {
             return Err(HwError::Poisoned(self.epoch.get()));
         }
-        self.pending_response.store(true, Ordering::Release);
         if self.state.poison() {
             let _ = self.event_sender.send(MonospaceEvent {
                 epoch: self.epoch,
@@ -610,7 +614,6 @@ fn read_lines(
     read_half: impl Read,
     epoch: ConnectionEpoch,
     state: &ConnectionState,
-    pending_response: &AtomicBool,
     responses: &mpsc::Sender<ReaderReply>,
     events: &Sender<MonospaceEvent>,
     latest_pressure: &Mutex<Option<MonospaceEvent>>,
@@ -629,9 +632,6 @@ fn read_lines(
             Ok(_) => {
                 let frame = line.trim_end_matches(['\r', '\n']).to_string();
                 line.clear();
-                if frame.is_empty() {
-                    continue;
-                }
                 if !state.is_active() {
                     eprintln!(
                         "ignored stale Monospace frame for retired connection epoch {}: {}",
@@ -691,15 +691,16 @@ fn read_lines(
                         return;
                     }
                     _ => {
-                        if pending_response
-                            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            if responses.send(ReaderReply::Line(frame)).is_err() {
-                                return;
+                        let mut delivered = true;
+                        match state.route_response(|| {
+                            delivered = responses.send(ReaderReply::Line(frame.clone())).is_ok();
+                        }) {
+                            ResponseDisposition::Accepted => {
+                                if !delivered {
+                                    return;
+                                }
                             }
-                        } else {
-                            if state.poison() {
+                            ResponseDisposition::Unsolicited => {
                                 let _ = events.send(MonospaceEvent {
                                     epoch,
                                     kind: MonospaceEventKind::Fault(
@@ -707,8 +708,16 @@ fn read_lines(
                                     ),
                                 });
                                 let _ = responses.send(ReaderReply::Unexpected(frame));
+                                return;
                             }
-                            return;
+                            ResponseDisposition::Retired => {
+                                eprintln!(
+                                    "ignored stale Monospace response for retired connection epoch {}: {}",
+                                    epoch.get(),
+                                    frame
+                                );
+                                return;
+                            }
                         }
                     }
                 }
@@ -722,7 +731,8 @@ fn read_lines(
                 continue;
             }
             Err(error) => {
-                if !state.is_active() {
+                let previous = state.poison_and_get_previous();
+                if previous == ConnectionStatus::Retired {
                     eprintln!(
                         "ignored stale Monospace read failure for retired connection epoch {}: {}",
                         epoch.get(),
@@ -730,15 +740,19 @@ fn read_lines(
                     );
                     return;
                 }
-                if state.poison() {
+                if previous == ConnectionStatus::Active {
                     let _ = events.send(MonospaceEvent {
                         epoch,
                         kind: MonospaceEventKind::Fault(MonospaceFault::SerialIo(
                             error.to_string(),
                         )),
                     });
-                    let _ = responses.send(ReaderReply::Disconnected);
                 }
+                let _ = events.send(MonospaceEvent {
+                    epoch,
+                    kind: MonospaceEventKind::Disconnected,
+                });
+                let _ = responses.send(ReaderReply::Disconnected);
                 return;
             }
         }
