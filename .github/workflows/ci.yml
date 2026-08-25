@@ -87,3 +87,21 @@ jobs:
 
       - name: Test AArch64 workspace
         run: cross test --workspace --locked --target aarch64-unknown-linux-gnu
+
+      - name: Build Sans release binary
+        run: cross build --package sans --release --locked --target aarch64-unknown-linux-gnu
+
+      - name: Package Sans release binary
+        run: >-
+          tar --create --gzip
+          --file sans-aarch64-${{ github.sha }}.tar.gz
+          --directory target/aarch64-unknown-linux-gnu/release
+          sans
+
+      - name: Upload Sans release binary
+        uses: actions/upload-artifact@v7
+        with:
+          path: sans-aarch64-${{ github.sha }}.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
