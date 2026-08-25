@@ -1447,6 +1447,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -2573,6 +2575,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "image",
  "rscam",
  "serde",
  "serde_json",

@@ -6,20 +6,40 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use sans_core::{
-    bootstrap, ControllerClosed, ControllerIntent, MachineFactory, MachineScreen,
-    PreparedMachineProfile, SetupBlocker, SetupState,
+    bootstrap, CapturePair, CapturePairError, CaptureStatus, ControllerClosed, ControllerIntent,
+    ControllerMachine, MachineFactory, MachineScreen, PreparedMachineProfile, SetupBlocker,
+    SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
 type OpenThreads = Arc<Mutex<Vec<(ThreadId, Option<String>)>>>;
 
+#[derive(Clone)]
+struct NoCaptureMachine;
+
+impl ControllerMachine for NoCaptureMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        panic!("this startup fixture must not capture")
+    }
+}
+
+struct NonSendMachine {
+    _marker: Rc<()>,
+}
+
+impl ControllerMachine for NonSendMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        panic!("this startup fixture must not capture")
+    }
+}
+
 struct RecordingFactory {
     open_threads: OpenThreads,
-    result: Result<(), Vec<SetupBlocker>>,
+    result: Result<NoCaptureMachine, Vec<SetupBlocker>>,
 }
 
 impl MachineFactory for RecordingFactory {
-    type Machine = ();
+    type Machine = NoCaptureMachine;
 
     fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
         let current_thread = thread::current();
@@ -34,10 +54,12 @@ impl MachineFactory for RecordingFactory {
 struct NonSendMachineFactory;
 
 impl MachineFactory for NonSendMachineFactory {
-    type Machine = Rc<()>;
+    type Machine = NonSendMachine;
 
     fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
-        Ok(Rc::new(()))
+        Ok(NonSendMachine {
+            _marker: Rc::new(()),
+        })
     }
 }
 
@@ -58,6 +80,12 @@ impl Drop for BlockingDropMachine {
     }
 }
 
+impl ControllerMachine for BlockingDropMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        panic!("this startup fixture must not capture")
+    }
+}
+
 struct BlockingDropFactory {
     started: mpsc::Sender<()>,
     release: mpsc::Receiver<()>,
@@ -66,7 +94,7 @@ struct BlockingDropFactory {
 struct PanickingFactory;
 
 impl MachineFactory for PanickingFactory {
-    type Machine = ();
+    type Machine = NoCaptureMachine;
 
     fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
         panic!("simulated controller startup panic");
@@ -85,12 +113,12 @@ impl MachineFactory for BlockingDropFactory {
 }
 
 impl MachineFactory for BlockingFactory {
-    type Machine = ();
+    type Machine = NoCaptureMachine;
 
     fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
         self.started.send(()).unwrap();
         self.release.recv().unwrap();
-        Ok(())
+        Ok(NoCaptureMachine)
     }
 }
 
@@ -106,7 +134,7 @@ fn invalid_profile_never_invokes_the_machine_factory() {
     let open_threads = Arc::new(Mutex::new(Vec::new()));
     let factory = RecordingFactory {
         open_threads: Arc::clone(&open_threads),
-        result: Ok(()),
+        result: Ok(NoCaptureMachine),
     };
 
     let result = bootstrap(Some(Path::new(&profile_path)), factory);
@@ -161,7 +189,12 @@ fn controller_can_own_a_non_send_machine() {
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
 
-    assert_eq!(setup.screen, MachineScreen::Setup(SetupState::Ready));
+    assert!(matches!(
+        setup.screen,
+        MachineScreen::CapturePreview(preview)
+            if preview.status == CaptureStatus::Ready
+                && preview.latest_complete_pair.is_none()
+    ));
     controller.send(ControllerIntent::Exit).unwrap();
 }
 

@@ -109,12 +109,7 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "quarter turn",
         ),
         ("width = 2000", "width = 0", "crop dimensions"),
-        ("width = 2000", "width = 2151", "post-rotation frame"),
-        (
-            "rotation_degrees = 90",
-            "rotation_degrees = 0",
-            "post-rotation frame",
-        ),
+        ("x = 10", "x = 2160", "crop must intersect"),
         ("minimum_mm = 100.0", "minimum_mm = 0.0", "minimum_mm"),
         ("command_ms = 2000", "command_ms = 0", "command_ms"),
         (
@@ -168,6 +163,21 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             message
         );
     }
+}
+
+#[test]
+fn crop_extending_past_the_rotated_frame_is_valid_for_capture_time_clamping() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    let profile = VALID_PROFILE
+        .replacen("width = 2000", "width = 5000", 1)
+        .replacen("height = 3600", "height = 5000", 1);
+    fs::write(&profile_path, profile).unwrap();
+
+    let prepared = prepare_machine_profile(Some(&profile_path)).unwrap();
+
+    assert_eq!(prepared.profile().cameras.left.crop.width, 5000);
+    assert_eq!(prepared.profile().cameras.left.crop.height, 5000);
 }
 
 #[test]

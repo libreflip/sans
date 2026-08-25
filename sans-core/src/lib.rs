@@ -6,8 +6,14 @@ mod controller;
 mod hardware;
 
 #[cfg(target_os = "linux")]
-pub use crate::camera::VLCamera as Camera;
-pub use crate::camera::{Camera as CameraTrait, CameraConfig, CameraType};
+pub use crate::camera::{
+    capture_configured_camera, CameraDiagnosticError, V4lCameraMachineFactory,
+};
+pub use crate::camera::{
+    CameraCaptureError, CameraPairSetupError, CameraRole, CapturePair, CapturePairError,
+    CapturePairMachine, CapturedFrame, FrameBuildError, FrameCrop, NativeDetailPreviewError,
+    PreviewImage, RoleCamera,
+};
 pub use crate::config::{
     prepare_machine_profile, resolve_machine_profile_path, BoardProfile, CameraProfiles,
     CameraRoleProfile, CropGeometry, MachineProfile, MotionProfile, PageWidthProfile,
@@ -15,7 +21,7 @@ pub use crate::config::{
     MACHINE_PROFILE_TEMPLATE,
 };
 pub use crate::controller::{
-    bootstrap, ControllerClosed, ControllerHandle, ControllerIntent, ControllerSnapshot,
-    MachineFactory, MachineScreen, SetupBlocker, SetupState,
+    bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
+    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker, SetupState,
 };
 pub use crate::hardware::{HwClient, HwError, HwLine};
