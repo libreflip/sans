@@ -52,7 +52,7 @@ fn firmware_error_during_gate_returns_no_client() {
 }
 
 #[test]
-fn unsolicited_response_poisons_idle_correlation() {
+fn unsolicited_response_reports_fault_and_poisons_idle_correlation() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
     let (release_sender, release_receiver) = mpsc::channel();
@@ -75,10 +75,12 @@ fn unsolicited_response_poisons_idle_correlation() {
         fault.kind,
         MonospaceEventKind::Fault(MonospaceFault::UnexpectedReply("OK".into()))
     );
-    assert!(matches!(
-        connection.client.set_fan(true),
-        Err(HwError::UnexpectedReply(reply)) if reply == "OK"
-    ));
+    let epoch = connection.client.epoch().get();
+    match connection.client.set_fan(true) {
+        Err(HwError::UnexpectedReply(reply)) => assert_eq!(reply, "OK"),
+        Err(HwError::Poisoned(poisoned_epoch)) => assert_eq!(poisoned_epoch, epoch),
+        result => panic!("expected the unsolicited reply or poisoned epoch, got {result:?}"),
+    }
     assert!(!connection.client.is_usable());
     release_sender.send(()).unwrap();
     board_thread.join().unwrap();
