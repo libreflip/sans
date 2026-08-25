@@ -26,9 +26,14 @@ struct Write {
 struct FakeWire {
     writes: Arc<Mutex<Vec<Write>>>,
     incoming: mpsc::Receiver<String>,
+    epoch: ConnectionEpoch,
 }
 
 impl LigatureWire for FakeWire {
+    fn set_epoch(&mut self, epoch: ConnectionEpoch) {
+        self.epoch = epoch;
+    }
+
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError> {
         self.writes.lock().unwrap().push(Write {
             priority: request.priority,
@@ -39,7 +44,7 @@ impl LigatureWire for FakeWire {
 
     fn try_line(&mut self) -> Result<Option<(ConnectionEpoch, String)>, LigatureTransportError> {
         match self.incoming.try_recv() {
-            Ok(line) => Ok(Some((ConnectionEpoch(1), line))),
+            Ok(line) => Ok(Some((self.epoch, line))),
             Err(mpsc::TryRecvError::Empty) => Ok(None),
             Err(mpsc::TryRecvError::Disconnected) => Err(LigatureTransportError::Closed),
         }
@@ -81,6 +86,7 @@ fn controller(
             wire: FakeWire {
                 writes: Arc::clone(&writes),
                 incoming: incoming_receiver,
+                epoch: ConnectionEpoch(1),
             },
             query,
         },
@@ -196,4 +202,43 @@ fn malformed_completion_changes_setup_to_transport_fault() {
     ));
     assert!(fault.ligature.is_none());
     controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
+fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
+    let (first_sender, first_receiver) = mpsc::channel();
+    let first_writes = Arc::new(Mutex::new(Vec::new()));
+    let mut client = LigatureClient::from_query(
+        FakeWire {
+            writes: first_writes,
+            incoming: first_receiver,
+            epoch: ConnectionEpoch(1),
+        },
+        READY,
+    )
+    .unwrap();
+    client.begin(LigatureCommand::Home).unwrap();
+
+    let (second_sender, second_receiver) = mpsc::channel();
+    let second_writes = Arc::new(Mutex::new(Vec::new()));
+    let reconnect = client
+        .reconnect(
+            FakeWire {
+                writes: second_writes,
+                incoming: second_receiver,
+                epoch: ConnectionEpoch(1),
+            },
+            READY,
+        )
+        .unwrap();
+    assert_eq!(reconnect.epoch, ConnectionEpoch(2));
+    let current = client.begin(LigatureCommand::Home).unwrap();
+    assert_eq!(current.epoch, ConnectionEpoch(2));
+    second_sender.send("ok G28".into()).unwrap();
+
+    assert!(matches!(
+        client.try_event().unwrap(),
+        Some(LigatureEvent::Accepted(operation_id)) if operation_id == current.operation_id
+    ));
+    drop(first_sender);
 }

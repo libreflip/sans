@@ -241,15 +241,26 @@ pub fn parse_ligature_line(line: &str) -> Result<LigatureLine, LigatureProtocolE
     match kind {
         "state" => parse_status(words, true).map(LigatureLine::State),
         "status" => parse_status(words, false).map(LigatureLine::Status),
-        "ok" => Ok(LigatureLine::Accepted {
-            command: parse_command(words.next())?,
-        }),
+        "ok" => parse_acceptance(words),
         "done" => parse_done(words).map(LigatureLine::Done),
         "error" => parse_error(words).map(LigatureLine::Error),
         "fault" => parse_fault(words).map(LigatureLine::Fault),
         "capture" => parse_capture(words).map(LigatureLine::Capture),
         other => Err(LigatureProtocolError::UnknownKind(other.into())),
     }
+}
+
+fn parse_acceptance<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+) -> Result<LigatureLine, LigatureProtocolError> {
+    let command = parse_command(words.next())?;
+    if let Some(extra) = words.next() {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "acceptance",
+            value: extra.into(),
+        });
+    }
+    Ok(LigatureLine::Accepted { command })
 }
 
 fn parse_capture<'a>(

@@ -38,6 +38,8 @@ pub enum LigatureTransportError {
 
 /// Minimal wire boundary used by the controller and deterministic fakes.
 pub trait LigatureWire: 'static {
+    /// Tag subsequent responses with the connection epoch that opened this wire.
+    fn set_epoch(&mut self, epoch: ConnectionEpoch);
     /// Write one already-correlated request through its selected priority path.
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError>;
     /// Poll one epoch-tagged response without blocking.
@@ -52,11 +54,10 @@ pub struct LigatureClient<W> {
 
 impl<W: LigatureWire> LigatureClient<W> {
     /// Create a client from a wire whose open query already returned `query`.
-    pub fn from_query(wire: W, query: &str) -> Result<Self, LigatureTransportError> {
-        Ok(Self {
-            session: LigatureSession::from_query(query)?,
-            wire,
-        })
+    pub fn from_query(mut wire: W, query: &str) -> Result<Self, LigatureTransportError> {
+        let session = LigatureSession::from_query(query)?;
+        wire.set_epoch(ConnectionEpoch(1));
+        Ok(Self { session, wire })
     }
 
     /// Inspect the authoritative lifecycle and latest public status.
@@ -77,10 +78,11 @@ impl<W: LigatureWire> LigatureClient<W> {
     /// Install a freshly opened wire and query result, retiring all old-epoch work.
     pub fn reconnect(
         &mut self,
-        wire: W,
+        mut wire: W,
         query: &str,
     ) -> Result<super::LigatureReconnect, LigatureTransportError> {
         let reconnect = self.session.reconnect(query)?;
+        wire.set_epoch(reconnect.epoch);
         self.wire = wire;
         Ok(reconnect)
     }
@@ -165,6 +167,10 @@ impl SerialLigatureWire {
 }
 
 impl LigatureWire for SerialLigatureWire {
+    fn set_epoch(&mut self, epoch: ConnectionEpoch) {
+        self.epoch = epoch;
+    }
+
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError> {
         let sender = match request.priority {
             RequestPriority::Ordinary => &self.ordinary,
