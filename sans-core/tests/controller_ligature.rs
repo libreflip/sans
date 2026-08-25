@@ -23,13 +23,16 @@ const HOMING: &str = "state STATE:HOMING TRUST:0 Z:? VEL:-1.000 IQ:0.400 \
                       RUNTIME_MODIFIED:0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct Write {
-    priority: RequestPriority,
-    line: String,
+enum FakeAction {
+    Sent {
+        priority: RequestPriority,
+        line: String,
+    },
+    Shutdown,
 }
 
 struct FakeWire {
-    writes: Arc<Mutex<Vec<Write>>>,
+    writes: Arc<Mutex<Vec<FakeAction>>>,
     incoming: mpsc::Receiver<String>,
     epoch: ConnectionEpoch,
 }
@@ -40,7 +43,7 @@ impl LigatureWire for FakeWire {
     }
 
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError> {
-        self.writes.lock().unwrap().push(Write {
+        self.writes.lock().unwrap().push(FakeAction::Sent {
             priority: request.priority,
             line: request.line.clone(),
         });
@@ -48,7 +51,7 @@ impl LigatureWire for FakeWire {
     }
 
     fn query_current_state(&mut self) -> Result<(), LigatureTransportError> {
-        self.writes.lock().unwrap().push(Write {
+        self.writes.lock().unwrap().push(FakeAction::Sent {
             priority: RequestPriority::Ordinary,
             line: "?".into(),
         });
@@ -64,10 +67,7 @@ impl LigatureWire for FakeWire {
     }
 
     fn shutdown(self) -> Result<(), LigatureTransportError> {
-        self.writes.lock().unwrap().push(Write {
-            priority: RequestPriority::Ordinary,
-            line: "<shutdown>".into(),
-        });
+        self.writes.lock().unwrap().push(FakeAction::Shutdown);
         Ok(())
     }
 }
@@ -117,7 +117,7 @@ fn controller(
 ) -> (
     sans_core::ControllerHandle,
     mpsc::Sender<String>,
-    Arc<Mutex<Vec<Write>>>,
+    Arc<Mutex<Vec<FakeAction>>>,
 ) {
     let temp = tempfile::tempdir().unwrap();
     let profile_path = temp.path().join("sans.toml");
@@ -189,15 +189,15 @@ fn controller_routes_operation_lifecycle_and_priority_cancel() {
     assert_eq!(
         *writes.lock().unwrap(),
         vec![
-            Write {
+            FakeAction::Sent {
                 priority: RequestPriority::Ordinary,
                 line: "G28".into(),
             },
-            Write {
+            FakeAction::Sent {
                 priority: RequestPriority::Urgent,
                 line: "M53".into(),
             },
-            Write {
+            FakeAction::Sent {
                 priority: RequestPriority::Ordinary,
                 line: "?".into(),
             },
@@ -255,7 +255,7 @@ fn controller_rejects_a_second_ordinary_operation_instead_of_queueing_it() {
     );
     assert_eq!(
         *writes.lock().unwrap(),
-        vec![Write {
+        vec![FakeAction::Sent {
             priority: RequestPriority::Ordinary,
             line: "G28".into(),
         }]
@@ -319,8 +319,8 @@ fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
     let reconnect = client
         .reconnect_with(|| {
             assert_eq!(
-                closed_before_open.lock().unwrap().last().unwrap().line,
-                "<shutdown>"
+                closed_before_open.lock().unwrap().last(),
+                Some(&FakeAction::Shutdown)
             );
             Ok((
                 FakeWire {
@@ -362,7 +362,7 @@ fn opening_on_active_firmware_issues_priority_stop() {
     assert_eq!(client.session().status().state, LigatureState::Homing);
     assert_eq!(
         *writes.lock().unwrap(),
-        vec![Write {
+        vec![FakeAction::Sent {
             priority: RequestPriority::Urgent,
             line: "M112".into(),
         }]
@@ -399,7 +399,7 @@ fn reconnect_stops_firmware_work_orphaned_by_the_old_epoch() {
     assert_eq!(reconnect.epoch, ConnectionEpoch(2));
     assert_eq!(
         *second_writes.lock().unwrap(),
-        vec![Write {
+        vec![FakeAction::Sent {
             priority: RequestPriority::Urgent,
             line: "M112".into(),
         }]
@@ -416,11 +416,11 @@ fn reconnect_stops_firmware_work_orphaned_by_the_old_epoch() {
     assert_eq!(
         *second_writes.lock().unwrap(),
         vec![
-            Write {
+            FakeAction::Sent {
                 priority: RequestPriority::Urgent,
                 line: "M112".into(),
             },
-            Write {
+            FakeAction::Sent {
                 priority: RequestPriority::Ordinary,
                 line: "?".into(),
             },
