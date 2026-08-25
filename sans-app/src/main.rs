@@ -12,7 +12,7 @@ use eframe::egui;
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
     bootstrap, CapturePair, CapturePairError, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, HwClient, MachineFactory, MachineScreen,
+    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, MonospaceClient,
     MonospaceConnection, MonospaceEventKind, MonospaceFault, PreparedMachineProfile, SetupBlocker,
     SetupDiagnostic, SetupState,
 };
@@ -59,7 +59,7 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
         let cameras = self.cameras.open(profile);
         let path = &profile.profile().boards.monospace_path;
         let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
-        let monospace = HwClient::connect(path, MONOSPACE_BOOT_DELAY, reply_timeout)
+        let monospace = MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, reply_timeout)
             .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
 
         match (cameras, monospace) {

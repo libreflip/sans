@@ -24,7 +24,7 @@ fn connection_waits_for_exact_all_off_then_press_stop_acknowledgements() {
     });
 
     let connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
 
     assert!(connection.client.is_usable());
     release_sender.send(()).unwrap();
@@ -43,10 +43,47 @@ fn firmware_error_during_gate_returns_no_client() {
         command
     });
 
-    let result = HwClient::connect_streams(host_reader, host, Duration::from_millis(100));
+    let result = MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100));
 
     assert!(matches!(result, Err(HwError::Firmware(reason)) if reason == "RELAY_FAULT"));
     assert_eq!(board_thread.join().unwrap(), "ALL OFF\n");
+}
+
+#[test]
+fn unsolicited_response_poisons_idle_correlation() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+    let (release_sender, release_receiver) = mpsc::channel();
+    let board_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        for _ in 0..2 {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            writer.write_all(b"OK\n").unwrap();
+        }
+        thread::sleep(Duration::from_millis(20));
+        writer.write_all(b"OK\n").unwrap();
+        release_receiver.recv().unwrap();
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+
+    let fault = connection
+        .events
+        .recv_timeout(Duration::from_millis(100))
+        .unwrap();
+    assert_eq!(
+        fault.kind,
+        MonospaceEventKind::Fault(MonospaceFault::UnexpectedReply("OK".into()))
+    );
+    assert!(matches!(
+        connection.client.set_fan(true),
+        Err(HwError::UnexpectedReply(reply)) if reply == "OK"
+    ));
+    assert!(!connection.client.is_usable());
+    release_sender.send(()).unwrap();
+    board_thread.join().unwrap();
 }
 
 #[test]
@@ -70,7 +107,7 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
         release_receiver.recv().unwrap();
     });
     let connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
     thread::sleep(Duration::from_millis(20));
 
     let mut pressure_count = 0;
@@ -107,7 +144,7 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
 }
 
 #[test]
-fn timeout_poisons_session_and_late_reply_cannot_satisfy_new_work() {
+fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
     let board_thread = thread::spawn(move || {
@@ -125,7 +162,7 @@ fn timeout_poisons_session_and_late_reply_cannot_satisfy_new_work() {
         command
     });
     let mut connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
 
     assert!(matches!(
         connection.client.set_vacuum(true),
@@ -148,7 +185,125 @@ fn timeout_poisons_session_and_late_reply_cannot_satisfy_new_work() {
 }
 
 #[test]
-fn malformed_frame_poisons_the_session() {
+fn timeout_closes_both_connection_halves() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+    host_reader
+        .set_read_timeout(Some(Duration::from_millis(10)))
+        .unwrap();
+    let board_thread = thread::spawn(move || {
+        let board_reader = board.try_clone().unwrap();
+        board_reader
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let mut reader = BufReader::new(board_reader);
+        let mut writer = board;
+        for _ in 0..2 {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            writer.write_all(b"OK\n").unwrap();
+        }
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        let mut trailing = String::new();
+        (command, reader.read_line(&mut trailing).unwrap())
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(30)).unwrap();
+
+    assert!(matches!(
+        connection.client.set_vacuum(true),
+        Err(HwError::ReplyTimeout)
+    ));
+    let (command, bytes_after_retirement) = board_thread.join().unwrap();
+    assert_eq!(command, "VACUUM ON\n");
+    assert_eq!(bytes_after_retirement, 0);
+}
+
+#[test]
+fn observed_disconnect_is_forwarded_after_timeout_fault() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+    let board_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        for _ in 0..2 {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            writer.write_all(b"OK\n").unwrap();
+        }
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        thread::sleep(Duration::from_millis(50));
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
+
+    assert!(matches!(
+        connection.client.set_vacuum(true),
+        Err(HwError::ReplyTimeout)
+    ));
+    assert_eq!(
+        connection
+            .events
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .kind,
+        MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)
+    );
+    assert_eq!(
+        connection
+            .events
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .kind,
+        MonospaceEventKind::Disconnected
+    );
+    board_thread.join().unwrap();
+}
+
+#[test]
+fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+    let board_thread = thread::spawn(move || {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        for _ in 0..2 {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            writer.write_all(b"OK\n").unwrap();
+        }
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        writer.write_all(b"EVENT BUTTON PRESSED\n").unwrap();
+        thread::sleep(Duration::from_millis(20));
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
+
+    assert!(matches!(
+        connection.client.set_vacuum(true),
+        Err(HwError::ReplyTimeout)
+    ));
+    assert_eq!(
+        connection
+            .events
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .kind,
+        MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)
+    );
+    board_thread.join().unwrap();
+    assert!(matches!(
+        connection.events.try_recv(),
+        Err(TryRecvError::Empty | TryRecvError::Disconnected)
+    ));
+}
+
+#[test]
+fn malformed_frame_poisons_the_connection() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
     let board_thread = thread::spawn(move || {
@@ -161,7 +316,7 @@ fn malformed_frame_poisons_the_session() {
         }
     });
     let mut connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
 
     assert!(matches!(
         connection.client.set_vacuum(true),
@@ -180,7 +335,7 @@ fn malformed_frame_poisons_the_session() {
 }
 
 #[test]
-fn unexpected_typed_reply_poisons_the_session() {
+fn unexpected_typed_reply_poisons_the_connection() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
     let (release_sender, release_receiver) = mpsc::channel();
@@ -195,7 +350,7 @@ fn unexpected_typed_reply_poisons_the_session() {
         release_receiver.recv().unwrap();
     });
     let mut connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
 
     assert!(matches!(
         connection.client.press_once(),
@@ -230,7 +385,7 @@ fn firmware_err_is_reported_without_poisoning_correlation() {
         release_receiver.recv().unwrap();
     });
     let mut connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
 
     assert!(matches!(
         connection.client.set_vacuum(true),
@@ -243,7 +398,7 @@ fn firmware_err_is_reported_without_poisoning_correlation() {
 }
 
 #[test]
-fn disconnect_is_forwarded_and_poisons_the_session() {
+fn disconnect_is_forwarded_and_poisons_the_connection() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
     let board_thread = thread::spawn(move || {
@@ -258,7 +413,7 @@ fn disconnect_is_forwarded_and_poisons_the_session() {
         reader.read_line(&mut command).unwrap();
     });
     let mut connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
 
     assert!(matches!(
         connection.client.set_vacuum(true),
@@ -290,7 +445,7 @@ fn ambiguous_urgent_write_retires_the_response_fifo() {
         urgent_command
     });
     let connection =
-        HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
     let urgent = connection.client.urgent_writer();
 
     assert!(matches!(
@@ -330,7 +485,8 @@ fn reconnect_uses_a_fresh_epoch() {
             release_receiver.recv().unwrap();
         });
         let connection =
-            HwClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+            MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100))
+                .unwrap();
         (connection, release_sender, board_thread)
     }
 

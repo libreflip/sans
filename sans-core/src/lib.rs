@@ -26,6 +26,7 @@ pub use crate::controller::{
     SetupDiagnostic, SetupState,
 };
 pub use crate::hardware::{
-    ConnectionEpoch, HwClient, HwError, HwUrgentWriter, MonospaceConnection, MonospaceEvent,
-    MonospaceEventKind, MonospaceEvents, MonospaceFault, MONOSPACE_BAUD_RATE,
+    ConnectionEpoch, HwClient, HwError, HwUrgentWriter, MonospaceClient, MonospaceConnection,
+    MonospaceEvent, MonospaceEventKind, MonospaceEvents, MonospaceFault, MonospaceUrgentWriter,
+    MONOSPACE_BAUD_RATE,
 };

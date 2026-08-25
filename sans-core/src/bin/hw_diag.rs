@@ -4,12 +4,12 @@
 //! Not a one-shot-per-invocation CLI: opening the serial port resets the
 //! Arduino (its DTR auto-reset circuit), so re-invoking per command would
 //! reset the board mid-sequence. Instead this opens the connection once
-//! and stays running as a single persistent interactive session (§9.1).
+//! and stays running as one persistent interactive connection (§9.1).
 
 use chrono::Local;
 use clap::Parser;
 use csv::Writer;
-use sans_core::{HwClient, MonospaceEventKind};
+use sans_core::{MonospaceClient, MonospaceEventKind};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,7 +36,7 @@ fn main() {
         Arc::new(Mutex::new(Writer::from_writer(file)))
     });
 
-    let connection = HwClient::connect(&args.port, BOOT_DELAY, REPLY_TIMEOUT)
+    let connection = MonospaceClient::connect(&args.port, BOOT_DELAY, REPLY_TIMEOUT)
         .expect("failed Monospace readiness gate");
     let mut client = connection.client;
     let events = connection.events;
