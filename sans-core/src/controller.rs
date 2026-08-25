@@ -238,8 +238,7 @@ impl<W: LigatureWire> ControllerMachine for LigatureMachine<W> {
             .reconnect
             .as_mut()
             .ok_or(LigatureTransportError::Closed)?;
-        let (wire, query) = reconnect()?;
-        self.client.reconnect(wire, &query)
+        self.client.reconnect_with(reconnect)
     }
 }
 

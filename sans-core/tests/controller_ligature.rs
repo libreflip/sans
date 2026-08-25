@@ -62,6 +62,14 @@ impl LigatureWire for FakeWire {
             Err(mpsc::TryRecvError::Disconnected) => Err(LigatureTransportError::Closed),
         }
     }
+
+    fn shutdown(self) -> Result<(), LigatureTransportError> {
+        self.writes.lock().unwrap().push(Write {
+            priority: RequestPriority::Ordinary,
+            line: "<shutdown>".into(),
+        });
+        Ok(())
+    }
 }
 
 struct FakeFactory {
@@ -296,7 +304,7 @@ fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
     let first_writes = Arc::new(Mutex::new(Vec::new()));
     let mut client = LigatureClient::from_query(
         FakeWire {
-            writes: first_writes,
+            writes: Arc::clone(&first_writes),
             incoming: first_receiver,
             epoch: ConnectionEpoch(1),
         },
@@ -307,15 +315,22 @@ fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
 
     let (second_sender, second_receiver) = mpsc::channel();
     let second_writes = Arc::new(Mutex::new(Vec::new()));
+    let closed_before_open = Arc::clone(&first_writes);
     let reconnect = client
-        .reconnect(
-            FakeWire {
-                writes: second_writes,
-                incoming: second_receiver,
-                epoch: ConnectionEpoch(1),
-            },
-            READY,
-        )
+        .reconnect_with(|| {
+            assert_eq!(
+                closed_before_open.lock().unwrap().last().unwrap().line,
+                "<shutdown>"
+            );
+            Ok((
+                FakeWire {
+                    writes: second_writes,
+                    incoming: second_receiver,
+                    epoch: ConnectionEpoch(1),
+                },
+                READY.into(),
+            ))
+        })
         .unwrap();
     assert_eq!(reconnect.epoch, ConnectionEpoch(2));
     let current = client.begin(LigatureCommand::Home).unwrap();
@@ -370,14 +385,16 @@ fn reconnect_stops_firmware_work_orphaned_by_the_old_epoch() {
     let second_writes = Arc::new(Mutex::new(Vec::new()));
 
     let reconnect = client
-        .reconnect(
-            FakeWire {
-                writes: Arc::clone(&second_writes),
-                incoming: second_receiver,
-                epoch: ConnectionEpoch(1),
-            },
-            HOMING,
-        )
+        .reconnect_with(|| {
+            Ok((
+                FakeWire {
+                    writes: Arc::clone(&second_writes),
+                    incoming: second_receiver,
+                    epoch: ConnectionEpoch(1),
+                },
+                HOMING.into(),
+            ))
+        })
         .unwrap();
     assert_eq!(reconnect.epoch, ConnectionEpoch(2));
     assert_eq!(

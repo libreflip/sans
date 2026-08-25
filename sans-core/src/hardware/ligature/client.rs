@@ -1,8 +1,10 @@
 //! Ligature session wiring, including the production serial adapter.
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use serialport::SerialPort;
@@ -46,12 +48,19 @@ pub trait LigatureWire: 'static {
     fn query_current_state(&mut self) -> Result<(), LigatureTransportError>;
     /// Poll one epoch-tagged response without blocking.
     fn try_line(&mut self) -> Result<Option<(ConnectionEpoch, String)>, LigatureTransportError>;
+    /// Stop all access to the physical connection before a replacement is opened.
+    fn shutdown(self) -> Result<(), LigatureTransportError>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
 }
 
 /// Correlated Ligature lifecycle over an injected wire.
 pub struct LigatureClient<W> {
     session: LigatureSession,
-    wire: W,
+    wire: Option<W>,
 }
 
 impl<W: LigatureWire> LigatureClient<W> {
@@ -60,7 +69,10 @@ impl<W: LigatureWire> LigatureClient<W> {
         let mut session = LigatureSession::from_query(query)?;
         wire.set_epoch(ConnectionEpoch(1));
         stop_orphaned_firmware_work(&mut session, &mut wire)?;
-        Ok(Self { session, wire })
+        Ok(Self {
+            session,
+            wire: Some(wire),
+        })
     }
 
     /// Inspect the authoritative lifecycle and latest public status.
@@ -74,26 +86,37 @@ impl<W: LigatureWire> LigatureClient<W> {
         command: LigatureCommand,
     ) -> Result<LigatureRequest, LigatureTransportError> {
         let request = self.session.begin(command)?;
-        self.wire.send(&request)?;
+        self.wire
+            .as_mut()
+            .ok_or(LigatureTransportError::Closed)?
+            .send(&request)?;
         Ok(request)
     }
 
-    /// Install a freshly opened wire and query result, retiring all old-epoch work.
-    pub fn reconnect(
+    /// Close the old wire, then open, query, and install a fresh connection epoch.
+    pub fn reconnect_with(
         &mut self,
-        mut wire: W,
-        query: &str,
+        open: impl FnOnce() -> Result<(W, String), LigatureTransportError>,
     ) -> Result<super::LigatureReconnect, LigatureTransportError> {
-        let reconnect = self.session.reconnect(query)?;
+        if let Some(wire) = self.wire.take() {
+            wire.shutdown()?;
+        }
+        let (mut wire, query) = open()?;
+        let reconnect = self.session.reconnect(&query)?;
         wire.set_epoch(reconnect.epoch);
         stop_orphaned_firmware_work(&mut self.session, &mut wire)?;
-        self.wire = wire;
+        self.wire = Some(wire);
         Ok(reconnect)
     }
 
     /// Route at most one currently available wire line.
     pub fn try_event(&mut self) -> Result<Option<LigatureEvent>, LigatureTransportError> {
-        let Some((epoch, line)) = self.wire.try_line()? else {
+        let Some((epoch, line)) = self
+            .wire
+            .as_mut()
+            .ok_or(LigatureTransportError::Closed)?
+            .try_line()?
+        else {
             return Ok(None);
         };
         let event = self.session.receive(epoch, &line)?;
@@ -104,7 +127,10 @@ impl<W: LigatureWire> LigatureClient<W> {
                 | LigatureEvent::Cancelled { .. }
                 | LigatureEvent::HardFault { .. }
         ) {
-            self.wire.query_current_state()?;
+            self.wire
+                .as_mut()
+                .ok_or(LigatureTransportError::Closed)?
+                .query_current_state()?;
         }
         Ok(Some(event))
     }
@@ -132,6 +158,8 @@ pub struct SerialLigatureWire {
     urgent: Sender<String>,
     incoming: Receiver<WireMessage>,
     epoch: ConnectionEpoch,
+    shutdown: Arc<AtomicBool>,
+    workers: Vec<JoinHandle<()>>,
 }
 
 impl SerialLigatureWire {
@@ -151,14 +179,30 @@ impl SerialLigatureWire {
         let (ordinary_sender, ordinary_receiver) = mpsc::channel();
         let (urgent_sender, urgent_receiver) = mpsc::channel();
         let (incoming_sender, incoming_receiver) = mpsc::channel();
-        spawn_reader(read_port, incoming_sender.clone())?;
-        spawn_writer(port, ordinary_receiver, urgent_receiver, incoming_sender)?;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let reader = spawn_reader(read_port, incoming_sender.clone(), Arc::clone(&shutdown))?;
+        let writer = match spawn_writer(
+            port,
+            ordinary_receiver,
+            urgent_receiver,
+            incoming_sender,
+            Arc::clone(&shutdown),
+        ) {
+            Ok(writer) => writer,
+            Err(error) => {
+                shutdown.store(true, Ordering::Release);
+                let _ = reader.join();
+                return Err(error);
+            }
+        };
 
         let wire = Self {
             ordinary: ordinary_sender,
             urgent: urgent_sender,
             incoming: incoming_receiver,
             epoch: ConnectionEpoch(1),
+            shutdown,
+            workers: vec![reader, writer],
         };
         wire.ordinary
             .send("?".into())
@@ -217,18 +261,39 @@ impl LigatureWire for SerialLigatureWire {
             Err(TryRecvError::Disconnected) => Err(LigatureTransportError::Closed),
         }
     }
+
+    fn shutdown(mut self) -> Result<(), LigatureTransportError> {
+        self.stop_workers();
+        Ok(())
+    }
+}
+
+impl SerialLigatureWire {
+    fn stop_workers(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for SerialLigatureWire {
+    fn drop(&mut self) {
+        self.stop_workers();
+    }
 }
 
 fn spawn_reader(
     mut port: Box<dyn SerialPort>,
     incoming: Sender<WireMessage>,
-) -> Result<(), LigatureTransportError> {
+    shutdown: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, LigatureTransportError> {
     thread::Builder::new()
         .name("ligature-reader".into())
         .spawn(move || {
             let mut reader = BufReader::new(&mut port);
             let mut line = String::new();
-            loop {
+            while !shutdown.load(Ordering::Acquire) {
                 match reader.read_line(&mut line) {
                     Ok(0) => {
                         let _ = incoming.send(WireMessage::Failed("device disconnected".into()));
@@ -251,7 +316,6 @@ fn spawn_reader(
                 }
             }
         })
-        .map(|_| ())
         .map_err(|error| LigatureTransportError::Device(error.to_string()))
 }
 
@@ -260,26 +324,28 @@ fn spawn_writer(
     ordinary: Receiver<String>,
     urgent: Receiver<String>,
     incoming: Sender<WireMessage>,
-) -> Result<(), LigatureTransportError> {
+    shutdown: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>, LigatureTransportError> {
     thread::Builder::new()
         .name("ligature-writer".into())
-        .spawn(move || loop {
-            let line = match urgent.try_recv() {
-                Ok(line) => line,
-                Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
-                    match ordinary.recv_timeout(Duration::from_millis(5)) {
-                        Ok(line) => line,
-                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        .spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                let line = match urgent.try_recv() {
+                    Ok(line) => line,
+                    Err(TryRecvError::Disconnected) | Err(TryRecvError::Empty) => {
+                        match ordinary.recv_timeout(Duration::from_millis(5)) {
+                            Ok(line) => line,
+                            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        }
                     }
+                };
+                if let Err(error) = write_line(&mut port, &line) {
+                    let _ = incoming.send(WireMessage::Failed(error.to_string()));
+                    return;
                 }
-            };
-            if let Err(error) = write_line(&mut port, &line) {
-                let _ = incoming.send(WireMessage::Failed(error.to_string()));
-                return;
             }
         })
-        .map(|_| ())
         .map_err(|error| LigatureTransportError::Device(error.to_string()))
 }
 
