@@ -168,14 +168,16 @@ impl ProtocolTerminal {
         self.fields.get(name).map(String::as_str)
     }
 
-    pub(super) fn require_fields(
+    pub(super) fn require_valid_fields(
         &self,
         required: &[&'static str],
     ) -> Result<(), LigatureProtocolError> {
         for field in required {
-            if !self.fields.contains_key(*field) {
-                return Err(LigatureProtocolError::MissingField(field));
-            }
+            let value = self
+                .fields
+                .get(*field)
+                .ok_or(LigatureProtocolError::MissingField(field))?;
+            validate_terminal_field(field, value)?;
         }
         Ok(())
     }
@@ -458,8 +460,18 @@ fn parse_fault<'a>(
             value: fields.get("STATE").cloned().unwrap_or_default(),
         });
     }
-    if !fields.contains_key("Z") {
-        return Err(LigatureProtocolError::MissingField("Z"));
+    let position = fields
+        .get("Z")
+        .ok_or(LigatureProtocolError::MissingField("Z"))?;
+    let expected_position = match position_trust {
+        PositionTrust::Trusted => "KNOWN",
+        PositionTrust::Untrusted => "?",
+    };
+    if position != expected_position {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "Z",
+            value: position.clone(),
+        });
     }
     Ok(LigatureFault {
         reason,
@@ -538,6 +550,33 @@ fn parse_optional_bool(
             value: value.into(),
         }),
         None => Ok(None),
+    }
+}
+
+fn validate_terminal_field(field: &'static str, value: &str) -> Result<(), LigatureProtocolError> {
+    match field {
+        "STATE" => LigatureState::parse(value).map(|_| ()),
+        "TRUST" => PositionTrust::parse(value).map(|_| ()),
+        "Z" => {
+            if matches!(value, "KNOWN" | "?") {
+                Ok(())
+            } else {
+                parse_finite(field, value).map(|_| ())
+            }
+        }
+        "CANCELLED" => parse_optional_command(field, value).map(|_| ()),
+        "ZERO_ELECTRICAL" => parse_finite(field, value).map(|_| ()),
+        "SENSOR_DIRECTION" if matches!(value, "CW" | "CCW") => Ok(()),
+        "SENSOR_DIRECTION" => Err(LigatureProtocolError::InvalidField {
+            field,
+            value: value.into(),
+        }),
+        "VOLATILE" if value == "1" => Ok(()),
+        "VOLATILE" => Err(LigatureProtocolError::InvalidField {
+            field,
+            value: value.into(),
+        }),
+        _ => Ok(()),
     }
 }
 

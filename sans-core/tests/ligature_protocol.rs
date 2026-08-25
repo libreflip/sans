@@ -96,6 +96,10 @@ fn rejects_incomplete_or_unknown_frames() {
     .is_err());
     assert!(parse_ligature_line("done").is_err());
     assert!(parse_ligature_line("ok G28 EXTRA").is_err());
+    assert!(parse_ligature_line(
+        "fault ENDSTOP_UNEXPECTED CANCELLED:G1 STATE:FAULT TRUST:0 Z:KNOWN"
+    )
+    .is_err());
     assert!(parse_ligature_line("wat G28").is_err());
 }
 

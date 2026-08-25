@@ -94,7 +94,7 @@ impl LigatureCommand {
             ][..],
             Self::Cancel | Self::Stop => &["CANCELLED", "Z", "STATE", "TRUST"][..],
         };
-        terminal.require_fields(required)
+        terminal.require_valid_fields(required)
     }
 }
 

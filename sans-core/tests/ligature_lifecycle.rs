@@ -59,6 +59,15 @@ fn urgent_cancel_retires_active_operation_without_host_queueing() {
     assert_eq!(cancel.line, "M53");
     assert_eq!(cancel.priority, RequestPriority::Urgent);
     assert!(matches!(
+        session.receive(
+            ConnectionEpoch(1),
+            "done M53 CANCELLED:G28 Z:garbage STATE:PRIVATE TRUST:9"
+        ),
+        Err(LigatureSessionError::Protocol(
+            sans_core::LigatureProtocolError::InvalidField { .. }
+        ))
+    ));
+    assert!(matches!(
         session
             .receive(
                 ConnectionEpoch(1),
@@ -230,5 +239,22 @@ fn terminal_missing_required_operation_fields_is_malformed() {
         Err(LigatureSessionError::Protocol(
             sans_core::LigatureProtocolError::MissingField("Z")
         ))
+    ));
+
+    for terminal in [
+        "done G28 Z:garbage STATE:READY TRUST:1",
+        "done G28 Z:-2.000 STATE:PRIVATE TRUST:1",
+        "done G28 Z:-2.000 STATE:READY TRUST:9",
+    ] {
+        assert!(matches!(
+            session.receive(ConnectionEpoch(1), terminal),
+            Err(LigatureSessionError::Protocol(_))
+        ));
+    }
+    assert!(matches!(
+        session
+            .receive(ConnectionEpoch(1), "done G28 Z:-2.000 STATE:READY TRUST:1")
+            .unwrap(),
+        LigatureEvent::Completed { .. }
     ));
 }
