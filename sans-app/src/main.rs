@@ -11,20 +11,20 @@ use eframe::egui;
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, MachineScreen,
-    SetupState,
+    bootstrap, CapturePair, CapturePairError, ControllerHandle, ControllerIntent,
+    ControllerMachine, ControllerSnapshot, HwClient, MachineFactory, MachineScreen,
+    MonospaceConnection, MonospaceEventKind, MonospaceFault, PreparedMachineProfile, SetupBlocker,
+    SetupDiagnostic, SetupState,
 };
 #[cfg(not(target_os = "linux"))]
-use sans_core::{
-    CameraCaptureError, CameraRole, CapturePairError, ControllerMachine, MachineFactory,
-    PreparedMachineProfile, SetupBlocker,
-};
+use sans_core::{CameraCaptureError, CameraRole};
 
 use crate::preview::{render_capture_preview, sync_preview_textures, PreviewTextures};
 
 const PORTRAIT_WIDTH: f32 = 600.0;
 const PORTRAIT_HEIGHT: f32 = 1_024.0;
 const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
+const MONOSPACE_BOOT_DELAY: Duration = Duration::from_millis(2_500);
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the native Sans touchscreen application")]
@@ -32,6 +32,96 @@ struct Arguments {
     /// Use an explicit Machine profile instead of the normal user config path.
     #[arg(long)]
     config: Option<PathBuf>,
+}
+
+struct BootstrapMachineFactory<CameraFactory> {
+    cameras: CameraFactory,
+}
+
+struct BootstrapMachine<CameraMachine> {
+    cameras: CameraMachine,
+    monospace: MonospaceConnection,
+}
+
+impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        self.cameras.capture_pair()
+    }
+}
+
+impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<CameraFactory> {
+    type Machine = BootstrapMachine<CameraFactory::Machine>;
+
+    fn open(
+        self,
+        profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
+        let cameras = self.cameras.open(profile);
+        let path = &profile.profile().boards.monospace_path;
+        let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
+        let monospace = HwClient::connect(path, MONOSPACE_BOOT_DELAY, reply_timeout)
+            .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
+
+        match (cameras, monospace) {
+            (Ok((cameras, mut diagnostics)), Ok(monospace)) => {
+                let epoch = monospace.client.epoch().get();
+                diagnostics.push(SetupDiagnostic::ready(
+                    "Monospace",
+                    format!("Ready at {path} on connection epoch {epoch}"),
+                ));
+                Ok((BootstrapMachine { cameras, monospace }, diagnostics))
+            }
+            (Err(mut camera_blockers), Err(mut monospace_blockers)) => {
+                camera_blockers.append(&mut monospace_blockers);
+                Err(camera_blockers)
+            }
+            (Err(camera_blockers), Ok(_)) => Err(camera_blockers),
+            (Ok(_), Err(monospace_blockers)) => Err(monospace_blockers),
+        }
+    }
+
+    fn poll_setup(machine: &mut Self::Machine) -> Option<SetupBlocker> {
+        if let Some(blocker) = CameraFactory::poll_setup(&mut machine.cameras) {
+            return Some(blocker);
+        }
+        while let Ok(event) = machine.monospace.events.try_recv() {
+            match event.kind {
+                MonospaceEventKind::Pressure(_) | MonospaceEventKind::ButtonPressed => {}
+                MonospaceEventKind::UnknownEvent(payload) => {
+                    eprintln!(
+                        "ignored unknown Monospace event on epoch {}: {payload:?}",
+                        event.epoch.get()
+                    );
+                }
+                MonospaceEventKind::Disconnected => {
+                    return Some(SetupBlocker::new(format!(
+                        "Monospace disconnected on connection epoch {}",
+                        event.epoch.get()
+                    )));
+                }
+                MonospaceEventKind::Fault(fault) => {
+                    return Some(SetupBlocker::new(format!(
+                        "Monospace connection epoch {} is blocked: {}",
+                        event.epoch.get(),
+                        monospace_fault_summary(&fault)
+                    )));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn monospace_fault_summary(fault: &MonospaceFault) -> String {
+    match fault {
+        MonospaceFault::MalformedFrame(frame) => format!("malformed frame {frame:?}"),
+        MonospaceFault::ReplyTimeout => "reply timeout poisoned response correlation".into(),
+        MonospaceFault::UnexpectedReply(reply) => format!("unexpected reply {reply:?}"),
+        MonospaceFault::AmbiguousUrgentWrite => {
+            "urgent writing poisoned response correlation".into()
+        }
+        MonospaceFault::SerialIo(error) => format!("serial I/O failure: {error}"),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -55,7 +145,10 @@ impl ControllerMachine for UnsupportedCameraMachine {
 impl MachineFactory for UnsupportedCameraFactory {
     type Machine = UnsupportedCameraMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         Err(vec![SetupBlocker::new(
             "Live Camera readiness requires Linux V4L2; diagnostics remain available.",
         )])
@@ -147,7 +240,15 @@ fn render_controller(
     exit_requested_at: &mut Option<Instant>,
     textures: Option<&PreviewTextures>,
 ) {
-    match snapshot.map(|snapshot| &snapshot.screen) {
+    let screen = snapshot.map(|snapshot| &snapshot.screen);
+    if matches!(
+        screen,
+        Some(MachineScreen::Setup(SetupState::Ready { .. }) | MachineScreen::CapturePreview(_))
+    ) {
+        context.request_repaint_after(Duration::from_millis(16));
+    }
+
+    match screen {
         None => {
             ui.spinner();
             ui.label("Checking Camera readiness...");
@@ -155,10 +256,24 @@ fn render_controller(
         }
         Some(MachineScreen::Setup(SetupState::Blocked { reasons })) => {
             ui.colored_label(egui::Color32::YELLOW, "Setup blocked");
-            ui.label("Scanning is disabled. Camera diagnostics remain available.");
+            ui.label("Scanning is disabled. Non-actuating diagnostics remain available.");
             ui.add_space(12.0);
             for reason in reasons {
                 ui.label(format!("• {}", reason.summary));
+            }
+        }
+        Some(MachineScreen::Setup(SetupState::Ready { diagnostics })) => {
+            ui.colored_label(egui::Color32::LIGHT_GREEN, "Machine ready");
+            for diagnostic in diagnostics {
+                ui.label(format!("{}: {}", diagnostic.component, diagnostic.summary));
+            }
+            ui.add_space(12.0);
+            if large_button(ui, "Capture pair").clicked() {
+                if handle.send(ControllerIntent::CapturePair).is_err() {
+                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
+                context.request_repaint_after(Duration::from_millis(16));
             }
         }
         Some(MachineScreen::CapturePreview(preview)) => {
@@ -203,9 +318,15 @@ fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
 fn main() -> eframe::Result {
     let arguments = Arguments::parse();
     #[cfg(target_os = "linux")]
-    let startup = bootstrap(arguments.config.as_deref(), V4lCameraMachineFactory);
+    let camera_factory = V4lCameraMachineFactory;
     #[cfg(not(target_os = "linux"))]
-    let startup = bootstrap(arguments.config.as_deref(), UnsupportedCameraFactory);
+    let camera_factory = UnsupportedCameraFactory;
+    let startup = bootstrap(
+        arguments.config.as_deref(),
+        BootstrapMachineFactory {
+            cameras: camera_factory,
+        },
+    );
     let startup = match startup {
         Ok(handle) => StartupView::Controller {
             handle,

@@ -9,6 +9,28 @@
 //! button press regardless of streaming state. This module is pure/I/O-free
 //! so it can be unit-tested without real hardware.
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum EventKind {
+    ButtonPressed,
+    Unknown(String),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum InvalidCommandLine {
+    ControlByte,
+    Lowercase,
+}
+
+pub fn validate_command_line(line: &str) -> Result<(), InvalidCommandLine> {
+    if line.contains(['\r', '\n', '\0']) {
+        return Err(InvalidCommandLine::ControlByte);
+    }
+    if line.chars().any(char::is_lowercase) {
+        return Err(InvalidCommandLine::Lowercase);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LineKind {
     /// Bare `OK`
@@ -21,7 +43,7 @@ pub enum LineKind {
     Telemetry(f32),
     /// Unsolicited `EVENT ...` line — carries the text after `EVENT `
     /// (e.g. `BUTTON PRESSED`, §10). Like telemetry, never a command reply.
-    Event(String),
+    Event(EventKind),
     /// Anything that doesn't match one of the above shapes
     Malformed(String),
 }
@@ -30,20 +52,24 @@ pub fn classify_line(line: &str) -> LineKind {
     let line = line.trim_end_matches('\r');
 
     if let Some(rest) = line.strip_prefix("PRESS ") {
-        return match rest.parse::<f32>() {
-            Ok(mbar) => LineKind::Telemetry(mbar),
-            Err(_) => LineKind::Malformed(line.to_string()),
+        return match parse_finite_pressure(rest) {
+            Some(mbar) => LineKind::Telemetry(mbar),
+            None => LineKind::Malformed(line.to_string()),
         };
     }
 
     if let Some(rest) = line.strip_prefix("EVENT ") {
-        return LineKind::Event(rest.to_string());
+        return LineKind::Event(if rest == "BUTTON PRESSED" {
+            EventKind::ButtonPressed
+        } else {
+            EventKind::Unknown(rest.to_string())
+        });
     }
 
     if let Some(rest) = line.strip_prefix("OK ") {
-        return match rest.parse::<f32>() {
-            Ok(mbar) => LineKind::OkPress(mbar),
-            Err(_) => LineKind::Malformed(line.to_string()),
+        return match parse_finite_pressure(rest) {
+            Some(mbar) => LineKind::OkPress(mbar),
+            None => LineKind::Malformed(line.to_string()),
         };
     }
 
@@ -58,9 +84,35 @@ pub fn classify_line(line: &str) -> LineKind {
     LineKind::Malformed(line.to_string())
 }
 
+fn parse_finite_pressure(text: &str) -> Option<f32> {
+    text.parse::<f32>().ok().filter(|value| value.is_finite())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_one_uppercase_command_without_control_bytes() {
+        assert_eq!(validate_command_line("LED SET 1 20 255"), Ok(()));
+        assert_eq!(validate_command_line("PRESS?"), Ok(()));
+    }
+
+    #[test]
+    fn rejects_command_injection_and_lowercase_wire_data() {
+        assert_eq!(
+            validate_command_line("VACUUM ON\nBLOWER ON"),
+            Err(InvalidCommandLine::ControlByte)
+        );
+        assert_eq!(
+            validate_command_line("VACUUM ON\0BLOWER ON"),
+            Err(InvalidCommandLine::ControlByte)
+        );
+        assert_eq!(
+            validate_command_line("vacuum on"),
+            Err(InvalidCommandLine::Lowercase)
+        );
+    }
 
     #[test]
     fn classifies_ok() {
@@ -82,11 +134,15 @@ mod tests {
     fn classifies_event() {
         assert_eq!(
             classify_line("EVENT BUTTON PRESSED"),
-            LineKind::Event("BUTTON PRESSED".to_string())
+            LineKind::Event(EventKind::ButtonPressed)
         );
         assert_eq!(
             classify_line("EVENT BUTTON PRESSED\r"),
-            LineKind::Event("BUTTON PRESSED".to_string())
+            LineKind::Event(EventKind::ButtonPressed)
+        );
+        assert_eq!(
+            classify_line("EVENT BUTTON RELEASED"),
+            LineKind::Event(EventKind::Unknown("BUTTON RELEASED".to_string()))
         );
     }
 
@@ -108,6 +164,14 @@ mod tests {
         assert_eq!(
             classify_line("garbage"),
             LineKind::Malformed("garbage".to_string())
+        );
+        assert_eq!(
+            classify_line("PRESS NaN"),
+            LineKind::Malformed("PRESS NaN".to_string())
+        );
+        assert_eq!(
+            classify_line("OK inf"),
+            LineKind::Malformed("OK inf".to_string())
         );
     }
 }

@@ -12,7 +12,7 @@ use super::{
     CapturePairMachine, CapturedFrame, RoleCamera,
 };
 use crate::config::{CameraRoleProfile, PreparedMachineProfile};
-use crate::controller::{MachineFactory, SetupBlocker};
+use crate::controller::{MachineFactory, SetupBlocker, SetupDiagnostic};
 
 const FRAME_WIDTH: u32 = 3840;
 const FRAME_HEIGHT: u32 = 2160;
@@ -58,7 +58,10 @@ pub fn capture_configured_camera(
 impl MachineFactory for V4lCameraMachineFactory {
     type Machine = CapturePairMachine;
 
-    fn open(self, prepared: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        prepared: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         let cameras = &prepared.profile().cameras;
         let (left_path, right_path) = resolve_live_camera_identities(
             Path::new(&cameras.left.identity),
@@ -77,8 +80,18 @@ impl MachineFactory for V4lCameraMachineFactory {
             return Err(blockers);
         }
 
-        CapturePairMachine::new(Box::new(left.unwrap()), Box::new(right.unwrap()))
-            .map_err(|error| vec![SetupBlocker::new(error.to_string())])
+        let machine = CapturePairMachine::new(Box::new(left.unwrap()), Box::new(right.unwrap()))
+            .map_err(|error| vec![SetupBlocker::new(error.to_string())])?;
+        Ok((
+            machine,
+            vec![
+                SetupDiagnostic::ready("Left Camera", format!("Ready at {}", left_path.display())),
+                SetupDiagnostic::ready(
+                    "Right Camera",
+                    format!("Ready at {}", right_path.display()),
+                ),
+            ],
+        ))
     }
 }
 
