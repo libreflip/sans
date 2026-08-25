@@ -11,6 +11,12 @@ const READY: &str = "state STATE:READY TRUST:1 Z:-2.000 VEL:0.000 IQ:0.000 \
 const FAULT: &str = "state STATE:FAULT TRUST:0 Z:? VEL:0.000 IQ:0.000 \
                     PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE FAULT:CURRENT_LIMIT \
                     RUNTIME_MODIFIED:0";
+const IDLE: &str = "state STATE:IDLE TRUST:0 Z:? VEL:0.000 IQ:0.000 \
+                   PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE FAULT:NONE \
+                   RUNTIME_MODIFIED:0";
+const UNCOMMISSIONED: &str = "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0.000 \
+                             IQ:0.000 PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE \
+                             FAULT:NONE RUNTIME_MODIFIED:0";
 
 #[test]
 fn exclusive_operation_routes_status_between_acceptance_and_one_terminal() {
@@ -208,11 +214,7 @@ fn stop_is_not_blocked_by_an_outstanding_routine_cancel() {
 
 #[test]
 fn commissioning_only_is_connected_but_rejects_scan_motion() {
-    let mut session = LigatureSession::from_query(
-        "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0.000 IQ:0.000 PRESS:? \
-         ENDSTOP:0 PWM:OFF ACTIVE:NONE FAULT:NONE RUNTIME_MODIFIED:0",
-    )
-    .unwrap();
+    let mut session = LigatureSession::from_query(UNCOMMISSIONED).unwrap();
 
     assert!(session.is_connected());
     assert!(!session.scan_enabled());
@@ -239,6 +241,25 @@ fn reconnect_in_fault_state_remains_fail_closed() {
     let mut session = LigatureSession::from_query(READY).unwrap();
 
     session.reconnect(FAULT).unwrap();
+
+    assert!(!session.scan_enabled());
+    session.receive(ConnectionEpoch(2), IDLE).unwrap();
+    assert!(session.scan_enabled());
+}
+
+#[test]
+fn uncommissioned_marker_survives_fault_clear_to_idle() {
+    let mut session = LigatureSession::from_query(UNCOMMISSIONED).unwrap();
+
+    session.reconnect(FAULT).unwrap();
+    let clear = session.begin(LigatureCommand::ClearFault).unwrap();
+    assert!(matches!(
+        session
+            .receive(ConnectionEpoch(2), "done M999 STATE:IDLE TRUST:0")
+            .unwrap(),
+        LigatureEvent::Completed { operation_id, .. } if operation_id == clear.operation_id
+    ));
+    session.receive(ConnectionEpoch(2), IDLE).unwrap();
 
     assert!(!session.scan_enabled());
     assert_eq!(

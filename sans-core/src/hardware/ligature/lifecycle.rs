@@ -334,7 +334,7 @@ impl LigatureSession {
 
     /// Whether production motion may pass the commissioning gate.
     pub fn scan_enabled(&self) -> bool {
-        self.commissioned
+        self.commissioned && self.status.state != LigatureState::Fault
     }
 
     /// Current public status from the query or latest heartbeat.
@@ -409,7 +409,7 @@ impl LigatureSession {
         );
         self.retired_urgent.clear();
         self.epoch = ConnectionEpoch(self.epoch.0 + 1);
-        self.commissioned = state_proves_commissioned(status.state);
+        self.preserve_commission_marker(status.state);
         self.orphaned_active = status.active.clone();
         self.status = status;
         Ok(LigatureReconnect {
@@ -439,7 +439,7 @@ impl LigatureSession {
         }
         match parse_ligature_line(line)? {
             LigatureLine::State(status) | LigatureLine::Status(status) => {
-                self.commissioned = state_proves_commissioned(status.state);
+                self.preserve_commission_marker(status.state);
                 self.status = status.clone();
                 Ok(LigatureEvent::Status(status))
             }
@@ -644,6 +644,12 @@ impl LigatureSession {
         self.retired_urgent
             .iter()
             .position(|pending| pending.request.command == *command)
+    }
+
+    fn preserve_commission_marker(&mut self, state: LigatureState) {
+        if state == LigatureState::CommissioningOnly {
+            self.commissioned = false;
+        }
     }
 
     fn pending_for_command_mut(
