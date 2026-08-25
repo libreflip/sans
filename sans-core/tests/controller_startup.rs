@@ -6,9 +6,9 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use sans_core::{
-    bootstrap, CapturePair, CapturePairError, CaptureStatus, ControllerClosed, ControllerIntent,
+    bootstrap, CapturePair, CapturePairError, ControllerClosed, ControllerIntent,
     ControllerMachine, MachineFactory, MachineScreen, PreparedMachineProfile, SetupBlocker,
-    SetupState,
+    SetupDiagnostic, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -35,13 +35,16 @@ impl ControllerMachine for NonSendMachine {
 
 struct RecordingFactory {
     open_threads: OpenThreads,
-    result: Result<NoCaptureMachine, Vec<SetupBlocker>>,
+    result: Result<(NoCaptureMachine, Vec<SetupDiagnostic>), Vec<SetupBlocker>>,
 }
 
 impl MachineFactory for RecordingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         let current_thread = thread::current();
         self.open_threads.lock().unwrap().push((
             current_thread.id(),
@@ -56,10 +59,19 @@ struct NonSendMachineFactory;
 impl MachineFactory for NonSendMachineFactory {
     type Machine = NonSendMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
-        Ok(NonSendMachine {
-            _marker: Rc::new(()),
-        })
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
+        Ok((
+            NonSendMachine {
+                _marker: Rc::new(()),
+            },
+            vec![SetupDiagnostic::ready(
+                "Monospace",
+                "Ready on connection epoch 7",
+            )],
+        ))
     }
 }
 
@@ -96,7 +108,10 @@ struct PanickingFactory;
 impl MachineFactory for PanickingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         panic!("simulated controller startup panic");
     }
 }
@@ -104,21 +119,30 @@ impl MachineFactory for PanickingFactory {
 impl MachineFactory for BlockingDropFactory {
     type Machine = BlockingDropMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
-        Ok(BlockingDropMachine {
-            started: self.started,
-            release: self.release,
-        })
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
+        Ok((
+            BlockingDropMachine {
+                started: self.started,
+                release: self.release,
+            },
+            Vec::new(),
+        ))
     }
 }
 
 impl MachineFactory for BlockingFactory {
     type Machine = NoCaptureMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         self.started.send(()).unwrap();
         self.release.recv().unwrap();
-        Ok(NoCaptureMachine)
+        Ok((NoCaptureMachine, Vec::new()))
     }
 }
 
@@ -134,7 +158,7 @@ fn invalid_profile_never_invokes_the_machine_factory() {
     let open_threads = Arc::new(Mutex::new(Vec::new()));
     let factory = RecordingFactory {
         open_threads: Arc::clone(&open_threads),
-        result: Ok(NoCaptureMachine),
+        result: Ok((NoCaptureMachine, Vec::new())),
     };
 
     let result = bootstrap(Some(Path::new(&profile_path)), factory);
@@ -189,12 +213,15 @@ fn controller_can_own_a_non_send_machine() {
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
 
-    assert!(matches!(
+    assert_eq!(
         setup.screen,
-        MachineScreen::CapturePreview(preview)
-            if preview.status == CaptureStatus::Ready
-                && preview.latest_complete_pair.is_none()
-    ));
+        MachineScreen::Setup(SetupState::Ready {
+            diagnostics: vec![SetupDiagnostic::ready(
+                "Monospace",
+                "Ready on connection epoch 7"
+            )]
+        })
+    );
     controller.send(ControllerIntent::Exit).unwrap();
 }
 

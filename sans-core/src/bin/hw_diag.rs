@@ -9,7 +9,7 @@
 use chrono::Local;
 use clap::Parser;
 use csv::Writer;
-use sans_core::HwClient;
+use sans_core::{HwClient, MonospaceEventKind};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,8 +27,7 @@ struct Args {
 }
 
 const BOOT_DELAY: Duration = Duration::from_millis(2500);
-const BAUD: u32 = 115200;
-
+const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 fn main() {
     let args = Args::parse();
 
@@ -37,36 +36,37 @@ fn main() {
         Arc::new(Mutex::new(Writer::from_writer(file)))
     });
 
-    let csv_for_telemetry = csv_writer.clone();
-    let mut client = HwClient::open(
-        &args.port,
-        BAUD,
-        BOOT_DELAY,
-        move |mbar| {
-            let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
-            println!("[{ts}] PRESS {mbar:.2}");
-            if let Some(w) = &csv_for_telemetry {
-                let mut w = w.lock().unwrap();
-                let _ = w.write_record([ts.to_string(), format!("{mbar:.2}")]);
-                let _ = w.flush();
+    let connection = HwClient::connect(&args.port, BOOT_DELAY, REPLY_TIMEOUT)
+        .expect("failed Monospace readiness gate");
+    let mut client = connection.client;
+    let events = connection.events;
+    std::thread::spawn(move || {
+        for event in events {
+            let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
+            match event.kind {
+                MonospaceEventKind::Pressure(mbar) => {
+                    println!("[{timestamp}] PRESS {mbar:.2}");
+                    if let Some(writer) = &csv_writer {
+                        let mut writer = writer.lock().unwrap();
+                        let _ = writer.write_record([timestamp.to_string(), format!("{mbar:.2}")]);
+                        let _ = writer.flush();
+                    }
+                }
+                MonospaceEventKind::ButtonPressed => {
+                    println!("[{timestamp}] EVENT BUTTON PRESSED");
+                }
+                MonospaceEventKind::UnknownEvent(payload) => {
+                    println!("[{timestamp}] UNKNOWN EVENT {payload}");
+                }
+                MonospaceEventKind::Disconnected => {
+                    eprintln!("[{timestamp}] DISCONNECTED");
+                }
+                MonospaceEventKind::Fault(fault) => {
+                    eprintln!("[{timestamp}] FAULT {fault:?}");
+                }
             }
-        },
-        // Unsolicited board events (currently only `BUTTON PRESSED`, §10),
-        // timestamped like the PRESS stream. Not logged to --log: that file
-        // is the pressure-stream CSV (§9.1), events would corrupt its shape.
-        |event| {
-            let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f");
-            println!("[{ts}] EVENT {event}");
-        },
-    )
-    .expect("failed to open serial connection");
-
-    // Reconnect-recovery pattern (monospace.md §4): always start from a
-    // known state before showing a prompt, in case the board was already
-    // left in some state from a previous session.
-    if let Err(e) = client.all_off() {
-        eprintln!("warning: initial ALL OFF failed: {e:?}");
-    }
+        }
+    });
 
     println!(
         "Connected to {}. Type a command (Ctrl-D to exit).",
