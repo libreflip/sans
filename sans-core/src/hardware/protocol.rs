@@ -9,6 +9,8 @@
 //! button press regardless of streaming state. This module is pure/I/O-free
 //! so it can be unit-tested without real hardware.
 
+pub const MAX_COMMAND_BYTES: usize = 39;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EventKind {
     ButtonPressed,
@@ -19,6 +21,7 @@ pub enum EventKind {
 pub enum InvalidCommandLine {
     ControlByte,
     Lowercase,
+    TooLong,
 }
 
 pub fn validate_command_line(line: &str) -> Result<(), InvalidCommandLine> {
@@ -27,6 +30,9 @@ pub fn validate_command_line(line: &str) -> Result<(), InvalidCommandLine> {
     }
     if line.chars().any(char::is_lowercase) {
         return Err(InvalidCommandLine::Lowercase);
+    }
+    if line.len() > MAX_COMMAND_BYTES {
+        return Err(InvalidCommandLine::TooLong);
     }
     Ok(())
 }
@@ -111,6 +117,19 @@ mod tests {
         assert_eq!(
             validate_command_line("vacuum on"),
             Err(InvalidCommandLine::Lowercase)
+        );
+    }
+
+    #[test]
+    fn rejects_commands_that_exceed_the_firmware_buffer() {
+        assert_eq!(validate_command_line(&"X".repeat(39)), Ok(()));
+        assert_eq!(
+            validate_command_line(&format!("{}VACUUM ON", "X".repeat(31))),
+            Err(InvalidCommandLine::TooLong)
+        );
+        assert_eq!(
+            validate_command_line(&"Ä".repeat(20)),
+            Err(InvalidCommandLine::TooLong)
         );
     }
 

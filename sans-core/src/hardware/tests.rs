@@ -52,20 +52,38 @@ fn firmware_error_during_gate_returns_no_client() {
 }
 
 #[test]
+fn expired_device_open_deadline_returns_no_client() {
+    let (host, board) = UnixStream::pair().unwrap();
+    let host_reader = host.try_clone().unwrap();
+
+    let result = MonospaceClient::connect_streams_before(
+        host_reader,
+        host,
+        Duration::from_millis(100),
+        Some(Instant::now()),
+    );
+    drop(board);
+
+    assert!(matches!(result, Err(HwError::DeviceOpenTimeout)));
+}
+
+#[test]
 fn unsolicited_response_reports_fault_and_poisons_idle_correlation() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
+    let (send_unsolicited, receive_unsolicited) = mpsc::channel();
     let (release_sender, release_receiver) = mpsc::channel();
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
-        thread::sleep(Duration::from_millis(20));
+        receive_unsolicited.recv().unwrap();
         writer.write_all(b"OK\n").unwrap();
         release_receiver.recv().unwrap();
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
+    send_unsolicited.send(()).unwrap();
 
     let fault = connection
         .events
@@ -104,7 +122,6 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
     });
     let connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
-    thread::sleep(Duration::from_millis(20));
 
     let mut pressure_count = 0;
     let mut kinds = Vec::new();
@@ -143,15 +160,18 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
 fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
+    let (release_board, wait_for_timeout) = mpsc::channel();
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
-        thread::sleep(Duration::from_millis(80));
+        wait_for_timeout.recv().unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
         writer.write_all(b"OK\n").unwrap();
-        command
+        [command, shutdown]
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
@@ -160,6 +180,7 @@ fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
         connection.client.set_vacuum(true),
         Err(HwError::ReplyTimeout)
     ));
+    release_board.send(()).unwrap();
     let fault = connection
         .events
         .recv_timeout(Duration::from_millis(100))
@@ -168,12 +189,11 @@ fn timeout_poisons_connection_and_late_reply_cannot_satisfy_new_work() {
         fault.kind,
         MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)
     );
-    thread::sleep(Duration::from_millis(100));
     assert!(matches!(
         connection.client.set_fan(true),
         Err(HwError::Poisoned(_))
     ));
-    assert_eq!(board_thread.join().unwrap(), "VACUUM ON\n");
+    assert_eq!(board_thread.join().unwrap(), ["VACUUM ON\n", "ALL OFF\n"]);
 }
 
 #[test]
@@ -193,8 +213,13 @@ fn timeout_closes_both_connection_halves() {
         acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
         let mut trailing = String::new();
-        (command, reader.read_line(&mut trailing).unwrap())
+        (
+            [command, shutdown],
+            reader.read_line(&mut trailing).unwrap(),
+        )
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(30)).unwrap();
@@ -203,8 +228,8 @@ fn timeout_closes_both_connection_halves() {
         connection.client.set_vacuum(true),
         Err(HwError::ReplyTimeout)
     ));
-    let (command, bytes_after_retirement) = board_thread.join().unwrap();
-    assert_eq!(command, "VACUUM ON\n");
+    let (commands, bytes_after_retirement) = board_thread.join().unwrap();
+    assert_eq!(commands, ["VACUUM ON\n", "ALL OFF\n"]);
     assert_eq!(bytes_after_retirement, 0);
 }
 
@@ -212,13 +237,17 @@ fn timeout_closes_both_connection_halves() {
 fn observed_disconnect_is_forwarded_after_timeout_fault() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
+    let (release_board, wait_for_timeout) = mpsc::channel();
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_for_timeout.recv().unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
+        [command, shutdown]
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
@@ -235,6 +264,7 @@ fn observed_disconnect_is_forwarded_after_timeout_fault() {
             .kind,
         MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)
     );
+    release_board.send(()).unwrap();
     assert_eq!(
         connection
             .events
@@ -243,22 +273,25 @@ fn observed_disconnect_is_forwarded_after_timeout_fault() {
             .kind,
         MonospaceEventKind::Disconnected
     );
-    board_thread.join().unwrap();
+    assert_eq!(board_thread.join().unwrap(), ["VACUUM ON\n", "ALL OFF\n"]);
 }
 
 #[test]
 fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
     let (host, board) = UnixStream::pair().unwrap();
     let host_reader = host.try_clone().unwrap();
+    let (release_board, wait_for_timeout) = mpsc::channel();
     let board_thread = thread::spawn(move || {
         let mut reader = BufReader::new(board.try_clone().unwrap());
         let mut writer = board;
         acknowledge_readiness(&mut reader, &mut writer);
         let mut command = String::new();
         reader.read_line(&mut command).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        wait_for_timeout.recv().unwrap();
+        let mut shutdown = String::new();
+        reader.read_line(&mut shutdown).unwrap();
         writer.write_all(b"EVENT BUTTON PRESSED\n").unwrap();
-        thread::sleep(Duration::from_millis(20));
+        [command, shutdown]
     });
     let mut connection =
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
@@ -275,7 +308,8 @@ fn event_arriving_after_retirement_is_logged_but_not_forwarded() {
             .kind,
         MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)
     );
-    board_thread.join().unwrap();
+    release_board.send(()).unwrap();
+    assert_eq!(board_thread.join().unwrap(), ["VACUUM ON\n", "ALL OFF\n"]);
     assert!(matches!(
         connection.events.try_recv(),
         Err(TryRecvError::Empty | TryRecvError::Disconnected)
@@ -433,6 +467,10 @@ fn disconnect_is_forwarded_and_poisons_the_connection() {
     assert_eq!(event.kind, MonospaceEventKind::Disconnected);
     assert!(!connection.client.is_usable());
     board_thread.join().unwrap();
+    assert_eq!(
+        connection.events.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Disconnected)
+    );
 }
 
 #[test]
