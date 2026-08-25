@@ -57,8 +57,9 @@ pub struct LigatureClient<W> {
 impl<W: LigatureWire> LigatureClient<W> {
     /// Create a client from a wire whose open query already returned `query`.
     pub fn from_query(mut wire: W, query: &str) -> Result<Self, LigatureTransportError> {
-        let session = LigatureSession::from_query(query)?;
+        let mut session = LigatureSession::from_query(query)?;
         wire.set_epoch(ConnectionEpoch(1));
+        stop_orphaned_firmware_work(&mut session, &mut wire)?;
         Ok(Self { session, wire })
     }
 
@@ -85,6 +86,7 @@ impl<W: LigatureWire> LigatureClient<W> {
     ) -> Result<super::LigatureReconnect, LigatureTransportError> {
         let reconnect = self.session.reconnect(query)?;
         wire.set_epoch(reconnect.epoch);
+        stop_orphaned_firmware_work(&mut self.session, &mut wire)?;
         self.wire = wire;
         Ok(reconnect)
     }
@@ -106,6 +108,17 @@ impl<W: LigatureWire> LigatureClient<W> {
         }
         Ok(Some(event))
     }
+}
+
+fn stop_orphaned_firmware_work(
+    session: &mut LigatureSession,
+    wire: &mut impl LigatureWire,
+) -> Result<(), LigatureTransportError> {
+    if session.has_orphaned_active() {
+        let stop = session.begin(LigatureCommand::Stop)?;
+        wire.send(&stop)?;
+    }
+    Ok(())
 }
 
 enum WireMessage {

@@ -300,6 +300,7 @@ pub struct LigatureSession {
     status: LigatureStatus,
     commissioned: bool,
     active: Option<PendingRequest>,
+    orphaned_active: Option<LigatureCommandToken>,
     urgent: Vec<PendingRequest>,
 }
 
@@ -310,12 +311,14 @@ impl LigatureSession {
             return Err(LigatureSessionError::QueryDidNotReturnState);
         };
         let commissioned = status.state != LigatureState::CommissioningOnly;
+        let orphaned_active = status.active.clone();
         Ok(Self {
             epoch: ConnectionEpoch(1),
             next_operation_id: 1,
             status,
             commissioned,
             active: None,
+            orphaned_active,
             urgent: Vec::new(),
         })
     }
@@ -345,7 +348,9 @@ impl LigatureSession {
         }
         let priority = command.priority();
         match priority {
-            RequestPriority::Ordinary if self.active.is_some() => {
+            RequestPriority::Ordinary
+                if self.active.is_some() || self.orphaned_active.is_some() =>
+            {
                 return Err(LigatureSessionError::Busy)
             }
             RequestPriority::Urgent
@@ -399,11 +404,16 @@ impl LigatureSession {
         );
         self.epoch = ConnectionEpoch(self.epoch.0 + 1);
         self.commissioned = status.state != LigatureState::CommissioningOnly;
+        self.orphaned_active = status.active.clone();
         self.status = status;
         Ok(LigatureReconnect {
             epoch: self.epoch,
             retired,
         })
+    }
+
+    pub(super) fn has_orphaned_active(&self) -> bool {
+        self.orphaned_active.is_some()
     }
 
     /// Route a line tagged by the reader's connection epoch.
@@ -554,7 +564,11 @@ impl LigatureSession {
         let urgent_command = self.urgent[urgent_index].request.command_type;
         urgent_command.validate_done(&terminal)?;
         let cancelled = terminal.cancelled_command()?;
-        let expected = self.active.as_ref().map(|active| &active.request.command);
+        let expected = self
+            .active
+            .as_ref()
+            .map(|active| &active.request.command)
+            .or(self.orphaned_active.as_ref());
         if cancelled.as_ref() != expected {
             return Err(LigatureSessionError::ContradictoryTerminal {
                 expected: format!(
@@ -577,6 +591,7 @@ impl LigatureSession {
                 terminal,
             });
         }
+        self.orphaned_active = None;
         Ok(LigatureEvent::Completed {
             operation_id: by,
             terminal,
@@ -584,7 +599,11 @@ impl LigatureSession {
     }
 
     fn hard_fault(&mut self, fault: LigatureFault) -> Result<LigatureEvent, LigatureSessionError> {
-        let expected = self.active.as_ref().map(|active| &active.request.command);
+        let expected = self
+            .active
+            .as_ref()
+            .map(|active| &active.request.command)
+            .or(self.orphaned_active.as_ref());
         if fault.cancelled.as_ref() != expected {
             return Err(LigatureSessionError::ContradictoryTerminal {
                 expected: format!(
@@ -604,6 +623,7 @@ impl LigatureSession {
         if let Some(active) = self.active.take() {
             retired.push(active.request.operation_id);
         }
+        self.orphaned_active = None;
         retired.extend(
             self.urgent
                 .drain(..)

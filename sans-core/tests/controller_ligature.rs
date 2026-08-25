@@ -18,6 +18,9 @@ const READY: &str = "state STATE:READY TRUST:1 Z:-2.000 VEL:0.000 IQ:0.000 \
 const UNCOMMISSIONED: &str = "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0.000 \
                              IQ:0.000 PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE \
                              FAULT:NONE RUNTIME_MODIFIED:0";
+const HOMING: &str = "state STATE:HOMING TRUST:0 Z:? VEL:-1.000 IQ:0.400 \
+                      PRESS:? ENDSTOP:0 PWM:ACTIVE ACTIVE:G28 FAULT:NONE \
+                      RUNTIME_MODIFIED:0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Write {
@@ -324,6 +327,88 @@ fn reconnect_tags_new_wire_with_the_new_connection_epoch() {
         Some(LigatureEvent::Accepted(operation_id)) if operation_id == current.operation_id
     ));
     drop(first_sender);
+}
+
+#[test]
+fn opening_on_active_firmware_issues_priority_stop() {
+    let (_incoming_sender, incoming_receiver) = mpsc::channel();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+
+    let client = LigatureClient::from_query(
+        FakeWire {
+            writes: Arc::clone(&writes),
+            incoming: incoming_receiver,
+            epoch: ConnectionEpoch(1),
+        },
+        HOMING,
+    )
+    .unwrap();
+
+    assert_eq!(client.session().status().state, LigatureState::Homing);
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![Write {
+            priority: RequestPriority::Urgent,
+            line: "M112".into(),
+        }]
+    );
+}
+
+#[test]
+fn reconnect_stops_firmware_work_orphaned_by_the_old_epoch() {
+    let (_first_sender, first_receiver) = mpsc::channel();
+    let mut client = LigatureClient::from_query(
+        FakeWire {
+            writes: Arc::new(Mutex::new(Vec::new())),
+            incoming: first_receiver,
+            epoch: ConnectionEpoch(1),
+        },
+        READY,
+    )
+    .unwrap();
+    let (second_sender, second_receiver) = mpsc::channel();
+    let second_writes = Arc::new(Mutex::new(Vec::new()));
+
+    let reconnect = client
+        .reconnect(
+            FakeWire {
+                writes: Arc::clone(&second_writes),
+                incoming: second_receiver,
+                epoch: ConnectionEpoch(1),
+            },
+            HOMING,
+        )
+        .unwrap();
+    assert_eq!(reconnect.epoch, ConnectionEpoch(2));
+    assert_eq!(
+        *second_writes.lock().unwrap(),
+        vec![Write {
+            priority: RequestPriority::Urgent,
+            line: "M112".into(),
+        }]
+    );
+
+    second_sender
+        .send("done M112 CANCELLED:G28 Z:? STATE:FAULT TRUST:0".into())
+        .unwrap();
+    assert!(matches!(
+        client.try_event().unwrap(),
+        Some(LigatureEvent::Completed { terminal, .. })
+            if terminal.command.as_str() == "M112"
+    ));
+    assert_eq!(
+        *second_writes.lock().unwrap(),
+        vec![
+            Write {
+                priority: RequestPriority::Urgent,
+                line: "M112".into(),
+            },
+            Write {
+                priority: RequestPriority::Ordinary,
+                line: "?".into(),
+            },
+        ]
+    );
 }
 
 #[test]
