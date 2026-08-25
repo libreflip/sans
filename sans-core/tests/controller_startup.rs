@@ -6,7 +6,7 @@ use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use sans_core::{
-    bootstrap, CapturePair, CapturePairError, ControllerClosed, ControllerIntent,
+    bootstrap, CapturePair, CapturePairError, ControllerClosed, ControllerHandle, ControllerIntent,
     ControllerMachine, MachineFactory, MachineScreen, PreparedMachineProfile, SetupBlocker,
     SetupDiagnostic, SetupState,
 };
@@ -143,6 +143,50 @@ impl MachineFactory for PollingFactory {
     }
 }
 
+fn bootstrap_polling_controller(
+    profile_path: &Path,
+    epoch: u64,
+) -> (
+    mpsc::Sender<SetupBlocker>,
+    ControllerHandle,
+    Vec<SetupDiagnostic>,
+) {
+    let (fault_sender, fault_receiver) = mpsc::channel();
+    let controller = bootstrap(
+        Some(profile_path),
+        PollingFactory {
+            faults: fault_receiver,
+            epoch,
+        },
+    )
+    .unwrap();
+    let ready = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    let diagnostics = match ready.screen {
+        MachineScreen::Setup(SetupState::Ready { diagnostics }) => diagnostics,
+        other => panic!("expected ready Setup snapshot, got {other:?}"),
+    };
+    (fault_sender, controller, diagnostics)
+}
+
+fn assert_polling_controller_blocks(
+    fault_sender: &mpsc::Sender<SetupBlocker>,
+    controller: &ControllerHandle,
+    failure: &str,
+) {
+    fault_sender.send(SetupBlocker::new(failure)).unwrap();
+    let blocked = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert_eq!(
+        blocked.screen,
+        MachineScreen::Setup(SetupState::Blocked {
+            reasons: vec![SetupBlocker::new(failure)]
+        })
+    );
+}
+
 impl MachineFactory for PanickingFactory {
     type Machine = NoCaptureMachine;
 
@@ -268,40 +312,12 @@ fn live_connection_fault_replaces_ready_setup_snapshot() {
     let temp = tempfile::tempdir().unwrap();
     let profile_path = temp.path().join("sans.toml");
     fs::write(&profile_path, VALID_PROFILE).unwrap();
-    let (fault_sender, fault_receiver) = mpsc::channel();
-    let controller = bootstrap(
-        Some(&profile_path),
-        PollingFactory {
-            faults: fault_receiver,
-            epoch: 12,
-        },
-    )
-    .unwrap();
+    let (fault_sender, controller, _diagnostics) = bootstrap_polling_controller(&profile_path, 12);
 
-    let ready = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    assert!(matches!(
-        ready.screen,
-        MachineScreen::Setup(SetupState::Ready { .. })
-    ));
-
-    fault_sender
-        .send(SetupBlocker::new(
-            "Monospace reply timeout poisoned connection epoch 12",
-        ))
-        .unwrap();
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-
-    assert_eq!(
-        blocked.screen,
-        MachineScreen::Setup(SetupState::Blocked {
-            reasons: vec![SetupBlocker::new(
-                "Monospace reply timeout poisoned connection epoch 12"
-            )]
-        })
+    assert_polling_controller_blocks(
+        &fault_sender,
+        &controller,
+        "Monospace reply timeout poisoned connection epoch 12",
     );
     controller.send(ControllerIntent::Exit).unwrap();
 }
@@ -321,34 +337,9 @@ fn controller_setup_snapshots_preserve_monospace_failure_categories() {
     ];
 
     for failure in failures {
-        let (fault_sender, fault_receiver) = mpsc::channel();
-        let controller = bootstrap(
-            Some(&profile_path),
-            PollingFactory {
-                faults: fault_receiver,
-                epoch: 21,
-            },
-        )
-        .unwrap();
-        let ready = controller
-            .recv_snapshot_timeout(Duration::from_secs(1))
-            .unwrap();
-        assert!(matches!(
-            ready.screen,
-            MachineScreen::Setup(SetupState::Ready { .. })
-        ));
-
-        fault_sender.send(SetupBlocker::new(failure)).unwrap();
-        let blocked = controller
-            .recv_snapshot_timeout(Duration::from_secs(1))
-            .unwrap();
-
-        assert_eq!(
-            blocked.screen,
-            MachineScreen::Setup(SetupState::Blocked {
-                reasons: vec![SetupBlocker::new(failure)]
-            })
-        );
+        let (fault_sender, controller, _diagnostics) =
+            bootstrap_polling_controller(&profile_path, 21);
+        assert_polling_controller_blocks(&fault_sender, &controller, failure);
         controller.send(ControllerIntent::Exit).unwrap();
     }
 }
@@ -360,25 +351,10 @@ fn controller_setup_snapshot_uses_the_reconnected_epoch() {
     fs::write(&profile_path, VALID_PROFILE).unwrap();
 
     let ready_summary = |epoch| {
-        let (_fault_sender, fault_receiver) = mpsc::channel();
-        let controller = bootstrap(
-            Some(&profile_path),
-            PollingFactory {
-                faults: fault_receiver,
-                epoch,
-            },
-        )
-        .unwrap();
-        let snapshot = controller
-            .recv_snapshot_timeout(Duration::from_secs(1))
-            .unwrap();
+        let (_fault_sender, controller, diagnostics) =
+            bootstrap_polling_controller(&profile_path, epoch);
         controller.send(ControllerIntent::Exit).unwrap();
-        match snapshot.screen {
-            MachineScreen::Setup(SetupState::Ready { diagnostics }) => {
-                diagnostics[0].summary.clone()
-            }
-            other => panic!("expected ready Setup snapshot, got {other:?}"),
-        }
+        diagnostics[0].summary.clone()
     };
 
     assert_eq!(ready_summary(30), "Ready on connection epoch 30");

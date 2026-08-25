@@ -58,9 +58,11 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         let cameras = self.cameras.open(profile);
         let path = &profile.profile().boards.monospace_path;
+        let open_timeout = Duration::from_millis(profile.profile().timeouts.device_open_ms);
         let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
-        let monospace = MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, reply_timeout)
-            .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
+        let monospace =
+            MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
+                .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
 
         match (cameras, monospace) {
             (Ok((cameras, mut diagnostics)), Ok(monospace)) => {
@@ -239,10 +241,7 @@ fn render_controller(
     textures: Option<&PreviewTextures>,
 ) {
     let screen = snapshot.map(|snapshot| &snapshot.screen);
-    if matches!(
-        screen,
-        Some(MachineScreen::Setup(SetupState::Ready { .. }) | MachineScreen::CapturePreview(_))
-    ) {
+    if screen_needs_polling(screen) {
         context.request_repaint_after(Duration::from_millis(16));
     }
 
@@ -309,6 +308,15 @@ fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
     ui.add_sized([240.0, 56.0], egui::Button::new(label))
 }
 
+fn screen_needs_polling(screen: Option<&MachineScreen>) -> bool {
+    matches!(
+        screen,
+        None | Some(
+            MachineScreen::Setup(SetupState::Ready { .. }) | MachineScreen::CapturePreview(_)
+        )
+    )
+}
+
 fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(requested_at) >= EXIT_FALLBACK_TIMEOUT
 }
@@ -352,11 +360,11 @@ fn main() -> eframe::Result {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use sans_core::{MonospaceEventKind, MonospaceFault};
+    use sans_core::{MachineScreen, MonospaceEventKind, MonospaceFault, SetupState};
 
     use super::{
         exit_fallback_elapsed, monospace_fault_summary, monospace_setup_blocker,
-        EXIT_FALLBACK_TIMEOUT,
+        screen_needs_polling, EXIT_FALLBACK_TIMEOUT,
     };
 
     #[test]
@@ -413,5 +421,27 @@ mod tests {
                 .summary,
             "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
         );
+    }
+
+    #[test]
+    fn live_machine_screens_keep_polling_for_connection_faults() {
+        let ready = MachineScreen::Setup(SetupState::Ready {
+            diagnostics: Vec::new(),
+        });
+        let blocked = MachineScreen::Setup(SetupState::Blocked {
+            reasons: Vec::new(),
+        });
+
+        assert!(screen_needs_polling(None));
+        assert!(screen_needs_polling(Some(&ready)));
+        assert!(screen_needs_polling(Some(&MachineScreen::CapturePreview(
+            sans_core::CapturePreview {
+                status: sans_core::CaptureStatus::Ready,
+                latest_complete_pair: None,
+                preview_warning: None,
+            }
+        ))));
+        assert!(!screen_needs_polling(Some(&blocked)));
+        assert!(!screen_needs_polling(Some(&MachineScreen::Exited)));
     }
 }

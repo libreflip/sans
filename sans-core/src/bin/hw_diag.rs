@@ -27,6 +27,7 @@ struct Args {
 }
 
 const BOOT_DELAY: Duration = Duration::from_millis(2500);
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 fn main() {
     let args = Args::parse();
@@ -36,7 +37,7 @@ fn main() {
         Arc::new(Mutex::new(Writer::from_writer(file)))
     });
 
-    let connection = MonospaceClient::connect(&args.port, BOOT_DELAY, REPLY_TIMEOUT)
+    let connection = MonospaceClient::connect(&args.port, BOOT_DELAY, OPEN_TIMEOUT, REPLY_TIMEOUT)
         .expect("failed Monospace readiness gate");
     let mut client = connection.client;
     let events = connection.events;
@@ -56,7 +57,7 @@ fn main() {
                     println!("[{timestamp}] EVENT BUTTON PRESSED");
                 }
                 MonospaceEventKind::UnknownEvent(payload) => {
-                    println!("[{timestamp}] UNKNOWN EVENT {payload}");
+                    println!("[{timestamp}] UNKNOWN EVENT {payload:?}");
                 }
                 MonospaceEventKind::Disconnected => {
                     eprintln!("[{timestamp}] DISCONNECTED");

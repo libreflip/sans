@@ -16,6 +16,7 @@ pub const MONOSPACE_BAUD_RATE: u32 = 115_200;
 
 const ALL_OFF_COMMAND: &str = "ALL OFF";
 static NEXT_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
+type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ConnectionStatus {
@@ -29,6 +30,30 @@ struct ConnectionState(Mutex<ConnectionStateData>);
 struct ConnectionStateData {
     status: ConnectionStatus,
     pending_response: bool,
+}
+
+struct EventSink(Mutex<Option<Sender<MonospaceEvent>>>);
+
+impl EventSink {
+    fn new(sender: Sender<MonospaceEvent>) -> Self {
+        Self(Mutex::new(Some(sender)))
+    }
+
+    fn send(&self, event: MonospaceEvent) -> bool {
+        self.lock()
+            .as_ref()
+            .is_some_and(|sender| sender.send(event).is_ok())
+    }
+
+    fn close(&self) {
+        self.lock().take();
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Sender<MonospaceEvent>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 enum ResponseDisposition {
@@ -253,6 +278,9 @@ pub enum HwError {
     /// The serial device or its reader thread could not be opened.
     #[error("Monospace device error: {0}")]
     Device(String),
+    /// The configured live-device opening deadline elapsed before readiness.
+    #[error("Monospace did not become ready before the device-open deadline")]
+    DeviceOpenTimeout,
     /// Outbound data was not one uppercase command line.
     #[error("invalid Monospace command: {0}")]
     InvalidCommand(String),
@@ -294,9 +322,9 @@ enum ReaderReply {
 
 /// Command-capable client for one ready Monospace connection.
 pub struct MonospaceClient {
-    write_half: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
+    write_half: SharedWriter,
     responses: Receiver<ReaderReply>,
-    event_sender: Sender<MonospaceEvent>,
+    events: Arc<EventSink>,
     state: Arc<ConnectionState>,
     reply_timeout: Duration,
     epoch: ConnectionEpoch,
@@ -308,8 +336,8 @@ pub struct MonospaceClient {
 /// the connection immediately so its acknowledgement cannot satisfy later work.
 #[derive(Clone)]
 pub struct MonospaceUrgentWriter {
-    write_half: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-    event_sender: Sender<MonospaceEvent>,
+    write_half: SharedWriter,
+    events: Arc<EventSink>,
     state: Arc<ConnectionState>,
     epoch: ConnectionEpoch,
 }
@@ -322,35 +350,52 @@ impl MonospaceClient {
     pub fn connect(
         path: &str,
         boot_delay: Duration,
+        open_timeout: Duration,
         reply_timeout: Duration,
     ) -> Result<MonospaceConnection, HwError> {
+        let deadline = Instant::now()
+            .checked_add(open_timeout)
+            .ok_or(HwError::DeviceOpenTimeout)?;
         let port = serialport::new(path, MONOSPACE_BAUD_RATE)
             .timeout(Duration::from_millis(100))
             .open()
             .map_err(|error| HwError::Device(error.to_string()))?;
-        thread::sleep(boot_delay);
+        wait_for_boot(deadline, boot_delay)?;
         port.clear(serialport::ClearBuffer::Input)
             .map_err(|error| HwError::Device(error.to_string()))?;
         let read_half = port
             .try_clone()
             .map_err(|error| HwError::Device(error.to_string()))?;
 
-        Self::connect_streams(read_half, port, reply_timeout)
+        Self::connect_streams_before(read_half, port, reply_timeout, Some(deadline))
     }
 
+    #[cfg(test)]
     fn connect_streams(
         read_half: impl Read + Send + 'static,
         write_half: impl Write + Send + 'static,
         reply_timeout: Duration,
     ) -> Result<MonospaceConnection, HwError> {
+        Self::connect_streams_before(read_half, write_half, reply_timeout, None)
+    }
+
+    fn connect_streams_before(
+        read_half: impl Read + Send + 'static,
+        write_half: impl Write + Send + 'static,
+        reply_timeout: Duration,
+        gate_deadline: Option<Instant>,
+    ) -> Result<MonospaceConnection, HwError> {
         let epoch = ConnectionEpoch(NEXT_CONNECTION_EPOCH.fetch_add(1, Ordering::Relaxed));
         let state = Arc::new(ConnectionState::active());
         let (response_sender, responses) = mpsc::channel();
         let (event_sender, reliable_events) = mpsc::channel();
+        let events = Arc::new(EventSink::new(event_sender));
+        let write_half: SharedWriter = Arc::new(Mutex::new(Some(Box::new(write_half))));
         let latest_pressure = Arc::new(Mutex::new(None));
         let (reader_ready_sender, reader_ready_receiver) = mpsc::sync_channel(0);
         let reader_state = Arc::clone(&state);
-        let reader_event_sender = event_sender.clone();
+        let reader_events = Arc::clone(&events);
+        let reader_writer = Arc::clone(&write_half);
         let reader_pressure = Arc::clone(&latest_pressure);
 
         thread::Builder::new()
@@ -362,9 +407,11 @@ impl MonospaceClient {
                     epoch,
                     &reader_state,
                     &response_sender,
-                    &reader_event_sender,
+                    &reader_events,
+                    &reader_writer,
                     &reader_pressure,
                 );
+                reader_events.close();
             })
             .map_err(|error| HwError::Device(error.to_string()))?;
         reader_ready_receiver
@@ -372,15 +419,14 @@ impl MonospaceClient {
             .map_err(|_| HwError::Device("reader thread failed during startup".into()))?;
 
         let mut client = Self {
-            write_half: Arc::new(Mutex::new(Some(Box::new(write_half)))),
+            write_half,
             responses,
-            event_sender,
+            events,
             state,
             reply_timeout,
             epoch,
         };
-        client.all_off()?;
-        client.stop_press_stream()?;
+        client.complete_readiness_gate(gate_deadline)?;
 
         Ok(MonospaceConnection {
             client,
@@ -389,6 +435,23 @@ impl MonospaceClient {
                 latest_pressure,
             },
         })
+    }
+
+    fn complete_readiness_gate(&mut self, deadline: Option<Instant>) -> Result<(), HwError> {
+        for command in [ALL_OFF_COMMAND, "PRESS STOP"] {
+            let timeout = deadline
+                .map(|deadline| {
+                    deadline
+                        .checked_duration_since(Instant::now())
+                        .filter(|remaining| !remaining.is_zero())
+                        .ok_or(HwError::DeviceOpenTimeout)
+                        .map(|remaining| remaining.min(self.reply_timeout))
+                })
+                .transpose()?
+                .unwrap_or(self.reply_timeout);
+            self.expect_ok_with_timeout(command, timeout)?;
+        }
+        Ok(())
     }
 
     /// Epoch assigned to this connection.
@@ -405,7 +468,7 @@ impl MonospaceClient {
     pub fn urgent_writer(&self) -> MonospaceUrgentWriter {
         MonospaceUrgentWriter {
             write_half: Arc::clone(&self.write_half),
-            event_sender: self.event_sender.clone(),
+            events: Arc::clone(&self.events),
             state: Arc::clone(&self.state),
             epoch: self.epoch,
         }
@@ -413,10 +476,15 @@ impl MonospaceClient {
 
     /// Send one uppercase diagnostic command and return its raw reply.
     pub fn send_raw(&mut self, line: &str) -> Result<String, HwError> {
+        self.send_raw_with_timeout(line, self.reply_timeout)
+    }
+
+    fn send_raw_with_timeout(&mut self, line: &str, timeout: Duration) -> Result<String, HwError> {
         validate_command_line(line).map_err(|reason| {
             let reason = match reason {
                 InvalidCommandLine::ControlByte => "embedded CR, LF, or NUL",
                 InvalidCommandLine::Lowercase => "lowercase wire data",
+                InvalidCommandLine::TooLong => "more than 39 bytes",
             };
             HwError::InvalidCommand(reason.into())
         })?;
@@ -429,22 +497,22 @@ impl MonospaceClient {
             }
         }
 
-        self.write_and_receive(line)
+        self.write_and_receive(line, timeout)
     }
 
-    fn write_and_receive(&mut self, line: &str) -> Result<String, HwError> {
+    fn write_and_receive(&mut self, line: &str, timeout: Duration) -> Result<String, HwError> {
         if let Err(error) = self.write_command(line) {
             self.poison(MonospaceFault::SerialIo(error.to_string()));
             return Err(error);
         }
-        match self.responses.recv_timeout(self.reply_timeout) {
+        match self.responses.recv_timeout(timeout) {
             Ok(ReaderReply::Line(reply)) => Ok(reply),
             Ok(ReaderReply::Malformed(frame)) => {
-                self.close_writer();
+                best_effort_all_off_and_close(&self.write_half);
                 Err(HwError::MalformedFrame(frame))
             }
             Ok(ReaderReply::Unexpected(reply)) => {
-                self.close_writer();
+                best_effort_all_off_and_close(&self.write_half);
                 Err(HwError::UnexpectedReply(reply))
             }
             Ok(ReaderReply::Disconnected) => {
@@ -493,16 +561,20 @@ impl MonospaceClient {
 
     fn poison(&self, fault: MonospaceFault) {
         if self.state.poison() {
-            let _ = self.event_sender.send(MonospaceEvent {
+            self.events.send(MonospaceEvent {
                 epoch: self.epoch,
                 kind: MonospaceEventKind::Fault(fault),
             });
         }
-        self.close_writer();
+        best_effort_all_off_and_close(&self.write_half);
     }
 
     fn expect_ok(&mut self, command: &str) -> Result<(), HwError> {
-        match self.send_raw(command)?.as_str() {
+        self.expect_ok_with_timeout(command, self.reply_timeout)
+    }
+
+    fn expect_ok_with_timeout(&mut self, command: &str, timeout: Duration) -> Result<(), HwError> {
+        match self.send_raw_with_timeout(command, timeout)?.as_str() {
             "OK" => Ok(()),
             reply if reply.starts_with("ERR ") => Err(HwError::Firmware(reply[4..].to_string())),
             reply => {
@@ -573,7 +645,7 @@ impl MonospaceUrgentWriter {
             return Err(HwError::Poisoned(self.epoch.get()));
         }
         if self.state.poison() {
-            let _ = self.event_sender.send(MonospaceEvent {
+            self.events.send(MonospaceEvent {
                 epoch: self.epoch,
                 kind: MonospaceEventKind::Fault(MonospaceFault::AmbiguousUrgentWrite),
             });
@@ -604,6 +676,26 @@ impl Drop for MonospaceClient {
     }
 }
 
+fn wait_for_boot(deadline: Instant, boot_delay: Duration) -> Result<(), HwError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining <= boot_delay {
+        thread::sleep(remaining);
+        return Err(HwError::DeviceOpenTimeout);
+    }
+    thread::sleep(boot_delay);
+    Ok(())
+}
+
+fn best_effort_all_off_and_close(write_half: &SharedWriter) {
+    let mut writer = write_half
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(writer) = writer.as_mut() {
+        let _ = write_line(writer.as_mut(), ALL_OFF_COMMAND);
+    }
+    writer.take();
+}
+
 fn write_line(writer: &mut dyn Write, command: &str) -> io::Result<()> {
     writer.write_all(command.as_bytes())?;
     writer.write_all(b"\n")?;
@@ -615,7 +707,8 @@ fn read_lines(
     epoch: ConnectionEpoch,
     state: &ConnectionState,
     responses: &mpsc::Sender<ReaderReply>,
-    events: &Sender<MonospaceEvent>,
+    events: &EventSink,
+    write_half: &SharedWriter,
     latest_pressure: &Mutex<Option<MonospaceEvent>>,
 ) {
     let mut reader = BufReader::new(read_half);
@@ -634,7 +727,7 @@ fn read_lines(
                 line.clear();
                 if !state.is_active() {
                     eprintln!(
-                        "ignored stale Monospace frame for retired connection epoch {}: {}",
+                        "ignored stale Monospace frame for retired connection epoch {}: {:?}",
                         epoch.get(),
                         frame
                     );
@@ -651,39 +744,34 @@ fn read_lines(
                             });
                     }
                     LineKind::Event(EventKind::ButtonPressed) => {
-                        if events
-                            .send(MonospaceEvent {
-                                epoch,
-                                kind: MonospaceEventKind::ButtonPressed,
-                            })
-                            .is_err()
-                        {
+                        if !events.send(MonospaceEvent {
+                            epoch,
+                            kind: MonospaceEventKind::ButtonPressed,
+                        }) {
                             return;
                         }
                     }
                     LineKind::Event(EventKind::Unknown(payload)) => {
-                        if events
-                            .send(MonospaceEvent {
-                                epoch,
-                                kind: MonospaceEventKind::UnknownEvent(payload),
-                            })
-                            .is_err()
-                        {
+                        if !events.send(MonospaceEvent {
+                            epoch,
+                            kind: MonospaceEventKind::UnknownEvent(payload),
+                        }) {
                             return;
                         }
                     }
                     LineKind::Malformed(_) => {
                         if state.poison() {
-                            let _ = events.send(MonospaceEvent {
+                            events.send(MonospaceEvent {
                                 epoch,
                                 kind: MonospaceEventKind::Fault(MonospaceFault::MalformedFrame(
                                     frame.clone(),
                                 )),
                             });
+                            best_effort_all_off_and_close(write_half);
                             let _ = responses.send(ReaderReply::Malformed(frame));
                         } else {
                             eprintln!(
-                                "ignored stale malformed Monospace frame for retired connection epoch {}: {}",
+                                "ignored stale malformed Monospace frame for retired connection epoch {}: {:?}",
                                 epoch.get(),
                                 frame
                             );
@@ -701,18 +789,19 @@ fn read_lines(
                                 }
                             }
                             ResponseDisposition::Unsolicited => {
-                                let _ = events.send(MonospaceEvent {
+                                events.send(MonospaceEvent {
                                     epoch,
                                     kind: MonospaceEventKind::Fault(
                                         MonospaceFault::UnexpectedReply(frame.clone()),
                                     ),
                                 });
+                                best_effort_all_off_and_close(write_half);
                                 let _ = responses.send(ReaderReply::Unexpected(frame));
                                 return;
                             }
                             ResponseDisposition::Retired => {
                                 eprintln!(
-                                    "ignored stale Monospace response for retired connection epoch {}: {}",
+                                    "ignored stale Monospace response for retired connection epoch {}: {:?}",
                                     epoch.get(),
                                     frame
                                 );
@@ -741,14 +830,15 @@ fn read_lines(
                     return;
                 }
                 if previous == ConnectionStatus::Active {
-                    let _ = events.send(MonospaceEvent {
+                    events.send(MonospaceEvent {
                         epoch,
                         kind: MonospaceEventKind::Fault(MonospaceFault::SerialIo(
                             error.to_string(),
                         )),
                     });
+                    best_effort_all_off_and_close(write_half);
                 }
-                let _ = events.send(MonospaceEvent {
+                events.send(MonospaceEvent {
                     epoch,
                     kind: MonospaceEventKind::Disconnected,
                 });
@@ -763,10 +853,10 @@ fn report_disconnect(
     epoch: ConnectionEpoch,
     state: &ConnectionState,
     responses: &mpsc::Sender<ReaderReply>,
-    events: &Sender<MonospaceEvent>,
+    events: &EventSink,
 ) {
     if state.poison_and_get_previous() != ConnectionStatus::Retired {
-        let _ = events.send(MonospaceEvent {
+        events.send(MonospaceEvent {
             epoch,
             kind: MonospaceEventKind::Disconnected,
         });
