@@ -434,6 +434,9 @@ pub enum CameraPairSetupError {
 /// A complete-pair acquisition failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CapturePairError {
+    /// The selected Machine adapter does not provide Camera capture.
+    #[error("complete Capture pair is unavailable")]
+    Unavailable,
     /// One role failed, including its permitted retry when applicable.
     #[error("complete Capture pair rejected: {0}")]
     Camera(#[from] CameraCaptureError),

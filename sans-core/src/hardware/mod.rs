@@ -1,6 +1,7 @@
 //! Hardware abstraction module — typed client for the `monospace` text
 //! protocol (see `monospace.md` §4-§6 for the wire format this implements).
 
+pub mod ligature;
 mod protocol;
 
 use protocol::{classify_line, LineKind};
