@@ -28,9 +28,9 @@ pub use crate::controller::{
 #[cfg(target_os = "linux")]
 pub use crate::controller::{SansMachine, SansMachineFactory};
 pub use crate::hardware::ligature::{
-    parse_ligature_line, ConnectionEpoch, LigatureCaptureSample, LigatureClient, LigatureCommand,
-    LigatureCommandToken, LigatureEvent, LigatureFault, LigatureLine, LigaturePosition,
-    LigatureProtocolError, LigatureReconnect, LigatureRequest, LigatureSession,
+    parse_ligature_line, ConnectionEpoch, LigatureBoot, LigatureCaptureSample, LigatureClient,
+    LigatureCommand, LigatureCommandToken, LigatureEvent, LigatureFault, LigatureLine,
+    LigaturePosition, LigatureProtocolError, LigatureReconnect, LigatureRequest, LigatureSession,
     LigatureSessionError, LigatureState, LigatureStatus, LigatureTransportError, LigatureWire,
     OperationId, PositionTrust, ProtocolErrorTerminal, ProtocolTerminal, RequestPriority,
     SerialLigatureWire, LIGATURE_BAUD,

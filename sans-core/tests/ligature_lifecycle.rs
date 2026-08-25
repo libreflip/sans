@@ -17,6 +17,12 @@ const IDLE: &str = "state STATE:IDLE TRUST:0 Z:? VEL:0.000 IQ:0.000 \
 const UNCOMMISSIONED: &str = "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0.000 \
                              IQ:0.000 PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE \
                              FAULT:NONE RUNTIME_MODIFIED:0";
+const HOMING: &str = "state STATE:HOMING TRUST:0 Z:? VEL:-1.000 IQ:0.400 \
+                     PRESS:? ENDSTOP:0 PWM:ACTIVE ACTIVE:G28 FAULT:NONE \
+                     RUNTIME_MODIFIED:0";
+const ALIGNING: &str = "state STATE:ALIGNING TRUST:0 Z:? VEL:0.000 IQ:0.400 \
+                       PRESS:? ENDSTOP:0 PWM:ACTIVE ACTIVE:M40 FAULT:NONE \
+                       RUNTIME_MODIFIED:0";
 
 #[test]
 fn exclusive_operation_routes_status_between_acceptance_and_one_terminal() {
@@ -177,6 +183,38 @@ fn late_urgent_terminal_after_hard_fault_is_ignored_once() {
 }
 
 #[test]
+fn orphan_stop_accepts_none_when_the_queried_operation_finished_first() {
+    let mut session = LigatureSession::from_query(HOMING).unwrap();
+    let stop = session.begin(LigatureCommand::Stop).unwrap();
+
+    assert!(matches!(
+        session
+            .receive(
+                ConnectionEpoch(1),
+                "done M112 CANCELLED:NONE Z:? STATE:FAULT TRUST:0"
+            )
+            .unwrap(),
+        LigatureEvent::Completed { operation_id, .. } if operation_id == stop.operation_id
+    ));
+}
+
+#[test]
+fn hard_fault_with_none_retires_an_immediate_command() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+    let arm = session.begin(LigatureCommand::Arm).unwrap();
+
+    assert!(matches!(
+        session
+            .receive(
+                ConnectionEpoch(1),
+                "fault CURRENT_LIMIT CANCELLED:NONE STATE:FAULT TRUST:0 Z:?"
+            )
+            .unwrap(),
+        LigatureEvent::HardFault { ref retired, .. } if retired == &vec![arm.operation_id]
+    ));
+}
+
+#[test]
 fn stop_is_not_blocked_by_an_outstanding_routine_cancel() {
     let mut session = LigatureSession::from_query(READY).unwrap();
     session.begin(LigatureCommand::Home).unwrap();
@@ -237,6 +275,17 @@ fn fault_state_does_not_claim_that_the_board_is_commissioned() {
 }
 
 #[test]
+fn ambiguous_alignment_state_does_not_establish_commissioning() {
+    let mut session = LigatureSession::from_query(ALIGNING).unwrap();
+
+    assert!(!session.scan_enabled());
+    assert_eq!(
+        session.begin(LigatureCommand::Home),
+        Err(LigatureSessionError::CommissioningOnly)
+    );
+}
+
+#[test]
 fn reconnect_in_fault_state_remains_fail_closed() {
     let mut session = LigatureSession::from_query(READY).unwrap();
 
@@ -266,6 +315,36 @@ fn uncommissioned_marker_survives_fault_clear_to_idle() {
         session.begin(LigatureCommand::Home),
         Err(LigatureSessionError::CommissioningOnly)
     );
+}
+
+#[test]
+fn clear_fault_must_leave_the_fault_state() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+    session
+        .receive(
+            ConnectionEpoch(1),
+            "fault CURRENT_LIMIT CANCELLED:NONE STATE:FAULT TRUST:0 Z:?",
+        )
+        .unwrap();
+    let clear = session.begin(LigatureCommand::ClearFault).unwrap();
+
+    assert!(matches!(
+        session.receive(ConnectionEpoch(1), "done M999 STATE:FAULT TRUST:0"),
+        Err(LigatureSessionError::Protocol(_))
+    ));
+    assert_eq!(clear.operation_id, OperationId(1));
+}
+
+#[test]
+fn capture_readiness_requires_a_stationary_lifecycle() {
+    let mut session = LigatureSession::from_query(READY).unwrap();
+    assert!(session.capture_ready());
+
+    session.begin(LigatureCommand::Home).unwrap();
+    assert!(!session.capture_ready());
+
+    let moving = LigatureSession::from_query(HOMING).unwrap();
+    assert!(!moving.capture_ready());
 }
 
 #[test]

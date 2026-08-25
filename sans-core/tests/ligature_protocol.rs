@@ -88,6 +88,32 @@ fn parses_status_acceptance_terminals_and_hard_faults() {
 }
 
 #[test]
+fn parses_boot_commissioning_evidence_in_the_protocol_layer() {
+    for (line, expected_commissioned) in [
+        (
+            "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:1 DRIVER_INIT:1 \
+             CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+            true,
+        ),
+        (
+            "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:0 \
+             DRIVER_INIT:1 CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+            false,
+        ),
+        (
+            "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:1 \
+             DRIVER_INIT:1 CURRENT_SENSE_INIT:0 ENDSTOP_CONFIGURED:1",
+            true,
+        ),
+    ] {
+        let LigatureLine::Boot(boot) = parse_ligature_line(line).unwrap() else {
+            panic!("expected production boot frame");
+        };
+        assert_eq!(boot.commissioned, expected_commissioned);
+    }
+}
+
+#[test]
 fn rejects_incomplete_or_unknown_frames() {
     assert!(parse_ligature_line("state STATE:READY TRUST:1").is_err());
     assert!(parse_ligature_line(
@@ -101,6 +127,11 @@ fn rejects_incomplete_or_unknown_frames() {
     )
     .is_err());
     assert!(parse_ligature_line("wat G28").is_err());
+    assert!(parse_ligature_line(
+        "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:0 DRIVER_INIT:1 \
+         CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1"
+    )
+    .is_err());
 }
 
 #[test]

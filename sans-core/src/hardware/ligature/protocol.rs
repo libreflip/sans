@@ -154,6 +154,21 @@ pub struct LigatureStatus {
     pub runtime_modified: Option<bool>,
 }
 
+/// Production boot evidence emitted before the first readiness query response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LigatureBoot {
+    /// Public state selected after firmware initialization.
+    pub state: LigatureState,
+    /// Whether the compiled firmware configuration is commissioned.
+    pub commissioned: bool,
+    /// Whether the motor driver initialized successfully.
+    pub driver_initialized: bool,
+    /// Whether current sensing initialized successfully.
+    pub current_sense_initialized: bool,
+    /// Whether the production endstop input is configured.
+    pub endstop_configured: bool,
+}
+
 /// Fields carried by a `done` or `error` terminal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProtocolTerminal {
@@ -261,6 +276,8 @@ pub struct LigatureCaptureSample {
 /// One classified Ligature response line.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LigatureLine {
+    /// Production boot evidence emitted before command responses.
+    Boot(LigatureBoot),
     /// Full response to the `?` query.
     State(LigatureStatus),
     /// Unsolicited public-status heartbeat.
@@ -313,8 +330,9 @@ pub fn parse_ligature_line(line: &str) -> Result<LigatureLine, LigatureProtocolE
     let mut words = line.trim_end_matches('\r').split_whitespace();
     let kind = words.next().ok_or(LigatureProtocolError::Empty)?;
     match kind {
-        "state" => parse_status(words, true).map(LigatureLine::State),
-        "status" => parse_status(words, false).map(LigatureLine::Status),
+        "boot" => parse_boot(words).map(LigatureLine::Boot),
+        "state" => parse_state(words).map(LigatureLine::State),
+        "status" => parse_heartbeat(words).map(LigatureLine::Status),
         "ok" => parse_acceptance(words),
         "done" => parse_done(words).map(LigatureLine::Done),
         "error" => parse_error(words).map(LigatureLine::Error),
@@ -322,6 +340,63 @@ pub fn parse_ligature_line(line: &str) -> Result<LigatureLine, LigatureProtocolE
         "capture" => parse_capture(words).map(LigatureLine::Capture),
         other => Err(LigatureProtocolError::UnknownKind(other.into())),
     }
+}
+
+fn parse_boot<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> Result<LigatureBoot, LigatureProtocolError> {
+    let fields = parse_fields(words)?;
+    let required = |name| {
+        fields
+            .get(name)
+            .map(String::as_str)
+            .ok_or(LigatureProtocolError::MissingField(name))
+    };
+    if fields.len() != 7 {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "boot",
+            value: "unexpected field set".into(),
+        });
+    }
+    if required("APP")? != "production" {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "APP",
+            value: required("APP")?.into(),
+        });
+    }
+    let state = LigatureState::parse(required("STATE")?)?;
+    if !matches!(
+        state,
+        LigatureState::CommissioningOnly | LigatureState::Idle
+    ) {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "STATE",
+            value: required("STATE")?.into(),
+        });
+    }
+    if required("PWM")? != "OFF" {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "PWM",
+            value: required("PWM")?.into(),
+        });
+    }
+    let commissioned = parse_bool("COMMISSIONED", required("COMMISSIONED")?)?;
+    if state == LigatureState::Idle && !commissioned {
+        return Err(LigatureProtocolError::InvalidField {
+            field: "COMMISSIONED",
+            value: "0".into(),
+        });
+    }
+    Ok(LigatureBoot {
+        state,
+        commissioned,
+        driver_initialized: parse_bool("DRIVER_INIT", required("DRIVER_INIT")?)?,
+        current_sense_initialized: parse_bool(
+            "CURRENT_SENSE_INIT",
+            required("CURRENT_SENSE_INIT")?,
+        )?,
+        endstop_configured: parse_bool("ENDSTOP_CONFIGURED", required("ENDSTOP_CONFIGURED")?)?,
+    })
 }
 
 fn parse_acceptance<'a>(
@@ -362,11 +437,28 @@ fn parse_capture<'a>(
     })
 }
 
-fn parse_status<'a>(
+fn parse_state<'a>(
     words: impl Iterator<Item = &'a str>,
-    is_query: bool,
 ) -> Result<LigatureStatus, LigatureProtocolError> {
     let fields = parse_fields(words)?;
+    for name in ["ENDSTOP", "PWM", "RUNTIME_MODIFIED"] {
+        if !fields.contains_key(name) {
+            return Err(LigatureProtocolError::MissingField(name));
+        }
+    }
+    parse_status_fields(&fields)
+}
+
+fn parse_heartbeat<'a>(
+    words: impl Iterator<Item = &'a str>,
+) -> Result<LigatureStatus, LigatureProtocolError> {
+    let fields = parse_fields(words)?;
+    parse_status_fields(&fields)
+}
+
+fn parse_status_fields(
+    fields: &BTreeMap<String, String>,
+) -> Result<LigatureStatus, LigatureProtocolError> {
     let required = |name| {
         fields
             .get(name)
@@ -391,7 +483,7 @@ fn parse_status<'a>(
     let active = parse_optional_command("ACTIVE", required("ACTIVE")?)?;
     let fault = parse_optional_token("FAULT", required("FAULT")?)?;
 
-    let endstop_active = parse_optional_bool(&fields, "ENDSTOP")?;
+    let endstop_active = parse_optional_bool(fields, "ENDSTOP")?;
     let pwm_active = match fields.get("PWM").map(String::as_str) {
         Some("ACTIVE") => Some(true),
         Some("OFF") => Some(false),
@@ -403,15 +495,7 @@ fn parse_status<'a>(
         }
         None => None,
     };
-    let runtime_modified = parse_optional_bool(&fields, "RUNTIME_MODIFIED")?;
-    if is_query {
-        for name in ["ENDSTOP", "PWM", "RUNTIME_MODIFIED"] {
-            if !fields.contains_key(name) {
-                return Err(LigatureProtocolError::MissingField(name));
-            }
-        }
-    }
-
+    let runtime_modified = parse_optional_bool(fields, "RUNTIME_MODIFIED")?;
     Ok(LigatureStatus {
         state,
         position_trust,

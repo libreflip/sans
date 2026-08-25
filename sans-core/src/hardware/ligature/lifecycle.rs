@@ -114,7 +114,9 @@ impl LigatureCommand {
                     LigatureState::CommissioningOnly | LigatureState::Idle
                 ) && trust == PositionTrust::Untrusted
             }
-            Self::ClearFault => state_and_trust_are_consistent(state, trust),
+            Self::ClearFault => {
+                state != LigatureState::Fault && state_and_trust_are_consistent(state, trust)
+            }
             Self::Cancel => matches!(
                 (state, trust),
                 (LigatureState::CommissioningOnly, PositionTrust::Untrusted)
@@ -192,6 +194,13 @@ struct PendingRequest {
     request: LigatureRequest,
     expects_acceptance: bool,
     accepted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalOwner {
+    Active,
+    Urgent(usize),
+    RetiredUrgent(usize),
 }
 
 /// A reconnect result, including all work retired with the old link.
@@ -300,7 +309,7 @@ pub struct LigatureSession {
     epoch: ConnectionEpoch,
     next_operation_id: u64,
     status: LigatureStatus,
-    commissioned: bool,
+    commissioned: Option<bool>,
     active: Option<PendingRequest>,
     orphaned_active: Option<LigatureCommandToken>,
     urgent: Vec<PendingRequest>,
@@ -310,10 +319,19 @@ pub struct LigatureSession {
 impl LigatureSession {
     /// Start a session from the required parseable `?` response.
     pub fn from_query(line: &str) -> Result<Self, LigatureSessionError> {
+        Self::from_query_with_commissioning(line, None)
+    }
+
+    pub(super) fn from_query_with_commissioning(
+        line: &str,
+        commissioned_configuration: Option<bool>,
+    ) -> Result<Self, LigatureSessionError> {
         let LigatureLine::State(status) = parse_ligature_line(line)? else {
             return Err(LigatureSessionError::QueryDidNotReturnState);
         };
-        let commissioned = state_proves_commissioned(status.state);
+        let commissioned = commissioned_configuration
+            .map(Some)
+            .unwrap_or_else(|| commissioning_from_state(status.state));
         let orphaned_active = status.active.clone();
         Ok(Self {
             epoch: ConnectionEpoch(1),
@@ -334,7 +352,27 @@ impl LigatureSession {
 
     /// Whether production motion may pass the commissioning gate.
     pub fn scan_enabled(&self) -> bool {
-        self.commissioned && self.status.state != LigatureState::Fault
+        self.commissioned == Some(true)
+            && !matches!(
+                self.status.state,
+                LigatureState::CommissioningOnly | LigatureState::Fault
+            )
+    }
+
+    /// Whether the current lifecycle permits stationary Camera acquisition.
+    pub fn capture_ready(&self) -> bool {
+        self.scan_enabled()
+            && self.active.is_none()
+            && self.orphaned_active.is_none()
+            && self.urgent.is_empty()
+            && matches!(
+                self.status.state,
+                LigatureState::Idle
+                    | LigatureState::Armed
+                    | LigatureState::OverridePending
+                    | LigatureState::Ready
+                    | LigatureState::Holding
+            )
     }
 
     /// Current public status from the query or latest heartbeat.
@@ -347,7 +385,7 @@ impl LigatureSession {
         &mut self,
         command: LigatureCommand,
     ) -> Result<LigatureRequest, LigatureSessionError> {
-        if command.requires_commissioning() && !self.commissioned {
+        if command.requires_commissioning() && !self.scan_enabled() {
             return Err(LigatureSessionError::CommissioningOnly);
         }
         let priority = command.priority();
@@ -395,6 +433,14 @@ impl LigatureSession {
 
     /// Retire the old epoch and install the new connection's query response.
     pub fn reconnect(&mut self, query: &str) -> Result<LigatureReconnect, LigatureSessionError> {
+        self.reconnect_with_commissioning(query, None)
+    }
+
+    pub(super) fn reconnect_with_commissioning(
+        &mut self,
+        query: &str,
+        commissioned_configuration: Option<bool>,
+    ) -> Result<LigatureReconnect, LigatureSessionError> {
         let LigatureLine::State(status) = parse_ligature_line(query)? else {
             return Err(LigatureSessionError::QueryDidNotReturnState);
         };
@@ -409,7 +455,7 @@ impl LigatureSession {
         );
         self.retired_urgent.clear();
         self.epoch = ConnectionEpoch(self.epoch.0 + 1);
-        self.preserve_commission_marker(status.state);
+        self.update_commissioning(status.state, commissioned_configuration);
         self.orphaned_active = status.active.clone();
         self.status = status;
         Ok(LigatureReconnect {
@@ -439,10 +485,15 @@ impl LigatureSession {
         }
         match parse_ligature_line(line)? {
             LigatureLine::State(status) | LigatureLine::Status(status) => {
-                self.preserve_commission_marker(status.state);
+                self.update_commissioning(status.state, None);
                 self.status = status.clone();
                 Ok(LigatureEvent::Status(status))
             }
+            LigatureLine::Boot(_) => Err(LigatureProtocolError::InvalidField {
+                field: "frame",
+                value: "boot after readiness query".into(),
+            }
+            .into()),
             LigatureLine::Accepted { command } => self.accept(command),
             LigatureLine::Done(terminal) => self.complete_done(terminal),
             LigatureLine::Error(terminal) => self.complete_error(terminal),
@@ -480,110 +531,75 @@ impl LigatureSession {
         &mut self,
         terminal: ProtocolTerminal,
     ) -> Result<LigatureEvent, LigatureSessionError> {
-        if self
-            .urgent
-            .iter()
-            .any(|pending| pending.request.command == terminal.command)
-        {
-            return self.complete_urgent(terminal);
+        match self.terminal_owner(&terminal.command)? {
+            TerminalOwner::Urgent(index) => self.complete_urgent(index, terminal),
+            TerminalOwner::RetiredUrgent(index) => {
+                self.retired_urgent[index]
+                    .request
+                    .command_type
+                    .validate_done(&terminal)?;
+                let operation_id = self.retired_urgent.remove(index).request.operation_id;
+                Ok(LigatureEvent::RetiredIgnored(operation_id))
+            }
+            TerminalOwner::Active => {
+                let active = self.active.as_ref().expect("terminal owner checked");
+                active.request.command_type.validate_done(&terminal)?;
+                if active.expects_acceptance && !active.accepted {
+                    return Err(LigatureSessionError::ContradictoryTerminal {
+                        expected: format!("ok {}", active.request.line),
+                        received: format!("done {}", terminal.command),
+                    });
+                }
+                let active = self.active.take().expect("terminal owner checked");
+                Ok(LigatureEvent::Completed {
+                    operation_id: active.request.operation_id,
+                    terminal,
+                })
+            }
         }
-        if let Some(index) = self.retired_urgent_index(&terminal.command) {
-            self.retired_urgent[index]
-                .request
-                .command_type
-                .validate_done(&terminal)?;
-            let operation_id = self.retired_urgent.remove(index).request.operation_id;
-            return Ok(LigatureEvent::RetiredIgnored(operation_id));
-        }
-        let Some(active) = self.active.as_ref() else {
-            return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.to_string(),
-            });
-        };
-        if active.request.command != terminal.command {
-            return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: active.request.command.to_string(),
-                received: terminal.command.to_string(),
-            });
-        }
-        active.request.command_type.validate_done(&terminal)?;
-        if active.expects_acceptance && !active.accepted {
-            return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: format!("ok {}", active.request.line),
-                received: format!("done {}", terminal.command),
-            });
-        }
-        let Some(active) = self.active.take() else {
-            return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.to_string(),
-            });
-        };
-        let operation_id = active.request.operation_id;
-        Ok(LigatureEvent::Completed {
-            operation_id,
-            terminal,
-        })
     }
 
     fn complete_error(
         &mut self,
         terminal: ProtocolErrorTerminal,
     ) -> Result<LigatureEvent, LigatureSessionError> {
-        if let Some(index) = self
-            .urgent
-            .iter()
-            .position(|pending| pending.request.command == terminal.command)
-        {
-            let operation_id = self.urgent.remove(index).request.operation_id;
-            return Ok(LigatureEvent::Failed {
-                operation_id,
-                terminal,
-            });
+        match self.terminal_owner(&terminal.command)? {
+            TerminalOwner::Urgent(index) => {
+                let operation_id = self.urgent.remove(index).request.operation_id;
+                Ok(LigatureEvent::Failed {
+                    operation_id,
+                    terminal,
+                })
+            }
+            TerminalOwner::RetiredUrgent(index) => {
+                let operation_id = self.retired_urgent.remove(index).request.operation_id;
+                Ok(LigatureEvent::RetiredIgnored(operation_id))
+            }
+            TerminalOwner::Active => {
+                let active = self.active.take().expect("terminal owner checked");
+                Ok(LigatureEvent::Failed {
+                    operation_id: active.request.operation_id,
+                    terminal,
+                })
+            }
         }
-        if let Some(index) = self.retired_urgent_index(&terminal.command) {
-            let operation_id = self.retired_urgent.remove(index).request.operation_id;
-            return Ok(LigatureEvent::RetiredIgnored(operation_id));
-        }
-        let Some(active) = self.active.as_ref() else {
-            return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.to_string(),
-            });
-        };
-        if active.request.command != terminal.command {
-            return Err(LigatureSessionError::ContradictoryTerminal {
-                expected: active.request.command.to_string(),
-                received: terminal.command.to_string(),
-            });
-        }
-        let Some(active) = self.active.take() else {
-            return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.to_string(),
-            });
-        };
-        let operation_id = active.request.operation_id;
-        Ok(LigatureEvent::Failed {
-            operation_id,
-            terminal,
-        })
     }
 
     fn complete_urgent(
         &mut self,
+        urgent_index: usize,
         terminal: ProtocolTerminal,
     ) -> Result<LigatureEvent, LigatureSessionError> {
-        let Some(urgent_index) = self
-            .urgent
-            .iter()
-            .position(|pending| pending.request.command == terminal.command)
-        else {
-            return Err(LigatureSessionError::UnmatchedTerminal {
-                command: terminal.command.to_string(),
-            });
-        };
         let urgent_command = self.urgent[urgent_index].request.command_type;
         urgent_command.validate_done(&terminal)?;
         let cancelled = terminal.cancelled_command()?;
-        self.validate_cancelled(cancelled.as_ref())?;
+        let expected = self
+            .active
+            .as_ref()
+            .map(|active| &active.request.command)
+            .or(self.orphaned_active.as_ref());
+        let allow_completed_orphan = self.active.is_none() && self.orphaned_active.is_some();
+        validate_cancelled(cancelled.as_ref(), expected, allow_completed_orphan)?;
         let by = self.urgent.remove(urgent_index).request.operation_id;
         if let Some(active) = self.active.take() {
             return Ok(LigatureEvent::Cancelled {
@@ -600,7 +616,18 @@ impl LigatureSession {
     }
 
     fn hard_fault(&mut self, fault: LigatureFault) -> Result<LigatureEvent, LigatureSessionError> {
-        self.validate_cancelled(fault.cancelled.as_ref())?;
+        let expected = self
+            .active
+            .as_ref()
+            .filter(|active| active.expects_acceptance)
+            .map(|active| &active.request.command)
+            .or(self.orphaned_active.as_ref());
+        let allow_completed_orphan = self
+            .active
+            .as_ref()
+            .is_none_or(|active| !active.expects_acceptance)
+            && self.orphaned_active.is_some();
+        validate_cancelled(fault.cancelled.as_ref(), expected, allow_completed_orphan)?;
         let mut retired = Vec::new();
         if let Some(active) = self.active.take() {
             retired.push(active.request.operation_id);
@@ -616,39 +643,49 @@ impl LigatureSession {
         Ok(LigatureEvent::HardFault { fault, retired })
     }
 
-    fn validate_cancelled(
-        &self,
-        received: Option<&LigatureCommandToken>,
-    ) -> Result<(), LigatureSessionError> {
-        let expected = self
-            .active
-            .as_ref()
-            .map(|active| &active.request.command)
-            .or(self.orphaned_active.as_ref());
-        if received == expected {
-            return Ok(());
-        }
-        Err(LigatureSessionError::ContradictoryTerminal {
-            expected: format!(
-                "CANCELLED:{}",
-                expected.map_or("NONE", LigatureCommandToken::as_str)
-            ),
-            received: format!(
-                "CANCELLED:{}",
-                received.map_or("NONE", LigatureCommandToken::as_str)
-            ),
-        })
-    }
-
     fn retired_urgent_index(&self, command: &LigatureCommandToken) -> Option<usize> {
         self.retired_urgent
             .iter()
             .position(|pending| pending.request.command == *command)
     }
 
-    fn preserve_commission_marker(&mut self, state: LigatureState) {
-        if state == LigatureState::CommissioningOnly {
-            self.commissioned = false;
+    fn terminal_owner(
+        &self,
+        command: &LigatureCommandToken,
+    ) -> Result<TerminalOwner, LigatureSessionError> {
+        if let Some(index) = self
+            .urgent
+            .iter()
+            .position(|pending| pending.request.command == *command)
+        {
+            return Ok(TerminalOwner::Urgent(index));
+        }
+        if let Some(index) = self.retired_urgent_index(command) {
+            return Ok(TerminalOwner::RetiredUrgent(index));
+        }
+        let Some(active) = self.active.as_ref() else {
+            return Err(LigatureSessionError::UnmatchedTerminal {
+                command: command.to_string(),
+            });
+        };
+        if active.request.command != *command {
+            return Err(LigatureSessionError::ContradictoryTerminal {
+                expected: active.request.command.to_string(),
+                received: command.to_string(),
+            });
+        }
+        Ok(TerminalOwner::Active)
+    }
+
+    fn update_commissioning(
+        &mut self,
+        state: LigatureState,
+        commissioned_configuration: Option<bool>,
+    ) {
+        if let Some(commissioned) = commissioned_configuration {
+            self.commissioned = Some(commissioned);
+        } else if self.commissioned.is_none() {
+            self.commissioned = commissioning_from_state(state);
         }
     }
 
@@ -674,9 +711,71 @@ impl LigatureSession {
     }
 }
 
-fn state_proves_commissioned(state: LigatureState) -> bool {
-    !matches!(
-        state,
-        LigatureState::CommissioningOnly | LigatureState::Fault
-    )
+fn validate_cancelled(
+    received: Option<&LigatureCommandToken>,
+    expected: Option<&LigatureCommandToken>,
+    allow_completed_orphan: bool,
+) -> Result<(), LigatureSessionError> {
+    if received == expected || (allow_completed_orphan && received.is_none()) {
+        return Ok(());
+    }
+    Err(LigatureSessionError::ContradictoryTerminal {
+        expected: format!(
+            "CANCELLED:{}",
+            expected.map_or("NONE", LigatureCommandToken::as_str)
+        ),
+        received: format!(
+            "CANCELLED:{}",
+            received.map_or("NONE", LigatureCommandToken::as_str)
+        ),
+    })
+}
+
+fn commissioning_from_state(state: LigatureState) -> Option<bool> {
+    match state {
+        LigatureState::CommissioningOnly => Some(false),
+        LigatureState::Aligning | LigatureState::Fault => None,
+        _ => Some(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConnectionEpoch, LigatureCommand, LigatureSession, LigatureSessionError};
+
+    const FAULT: &str = "state STATE:FAULT TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ENDSTOP:0 \
+                         PWM:OFF ACTIVE:NONE FAULT:CURRENT_LIMIT RUNTIME_MODIFIED:0";
+    const IDLE: &str = "state STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ENDSTOP:0 \
+                        PWM:OFF ACTIVE:NONE FAULT:NONE RUNTIME_MODIFIED:0";
+    const COMMISSIONING_ONLY: &str = "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0 \
+                                      IQ:0 PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE \
+                                      FAULT:NONE RUNTIME_MODIFIED:0";
+
+    #[test]
+    fn explicit_commissioning_evidence_survives_fault_recovery() {
+        let mut session =
+            LigatureSession::from_query_with_commissioning(FAULT, Some(true)).unwrap();
+        assert!(!session.scan_enabled());
+
+        session.begin(LigatureCommand::ClearFault).unwrap();
+        session
+            .receive(ConnectionEpoch(1), "done M999 STATE:IDLE TRUST:0")
+            .unwrap();
+        session.receive(ConnectionEpoch(1), IDLE).unwrap();
+
+        assert!(session.scan_enabled());
+        assert!(session.begin(LigatureCommand::Home).is_ok());
+    }
+
+    #[test]
+    fn commissioned_configuration_still_cannot_scan_in_commissioning_only() {
+        let mut session =
+            LigatureSession::from_query_with_commissioning(COMMISSIONING_ONLY, Some(true)).unwrap();
+
+        assert!(!session.scan_enabled());
+        assert_eq!(
+            session.begin(LigatureCommand::Home),
+            Err(LigatureSessionError::CommissioningOnly)
+        );
+    }
 }

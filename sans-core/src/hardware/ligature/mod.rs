@@ -13,9 +13,9 @@ pub use lifecycle::{
 };
 
 pub use protocol::{
-    parse_ligature_line, LigatureCaptureSample, LigatureCommandToken, LigatureFault, LigatureLine,
-    LigaturePosition, LigatureProtocolError, LigatureState, LigatureStatus, PositionTrust,
-    ProtocolErrorTerminal, ProtocolTerminal,
+    parse_ligature_line, LigatureBoot, LigatureCaptureSample, LigatureCommandToken, LigatureFault,
+    LigatureLine, LigaturePosition, LigatureProtocolError, LigatureState, LigatureStatus,
+    PositionTrust, ProtocolErrorTerminal, ProtocolTerminal,
 };
 
 /// Fixed baud rate implemented by Ligature's production firmware.

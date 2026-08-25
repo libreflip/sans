@@ -1,15 +1,17 @@
 //! Fake-wire tests for Ligature behavior at the controller intent and snapshot boundary.
 
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use sans_core::{
-    bootstrap, ConnectionEpoch, ControllerEvent, ControllerIntent, LigatureClient, LigatureCommand,
-    LigatureEvent, LigatureMachine, LigaturePosition, LigatureRequest, LigatureState,
-    LigatureTransportError, LigatureWire, MachineFactory, MachineScreen, PositionTrust,
-    PreparedMachineProfile, RequestPriority, SetupState,
+    bootstrap, parse_ligature_line, CapturePair, CapturePairError, ConnectionEpoch,
+    ControllerEvent, ControllerIntent, ControllerMachine, LigatureClient, LigatureCommand,
+    LigatureEvent, LigatureLine, LigatureMachine, LigaturePosition, LigatureRequest, LigatureState,
+    LigatureStatus, LigatureTransportError, LigatureWire, MachineFactory, MachineScreen,
+    PositionTrust, PreparedMachineProfile, RequestPriority, SetupBlocker, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -22,6 +24,9 @@ const UNCOMMISSIONED: &str = "state STATE:COMMISSIONING_ONLY TRUST:0 Z:? VEL:0.0
 const HOMING: &str = "state STATE:HOMING TRUST:0 Z:? VEL:-1.000 IQ:0.400 \
                       PRESS:? ENDSTOP:0 PWM:ACTIVE ACTIVE:G28 FAULT:NONE \
                       RUNTIME_MODIFIED:0";
+const FAULT: &str = "state STATE:FAULT TRUST:0 Z:? VEL:0.000 IQ:0.000 \
+                     PRESS:? ENDSTOP:0 PWM:OFF ACTIVE:NONE FAULT:CURRENT_LIMIT \
+                     RUNTIME_MODIFIED:0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FakeAction {
@@ -83,6 +88,47 @@ struct ReconnectFactory {
     replacement: Option<FakeWire>,
 }
 
+struct MovingCaptureMachine {
+    captures: Arc<AtomicUsize>,
+    status: LigatureStatus,
+}
+
+struct MovingCaptureFactory {
+    captures: Arc<AtomicUsize>,
+}
+
+impl ControllerMachine for MovingCaptureMachine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        self.captures.fetch_add(1, Ordering::SeqCst);
+        Err(CapturePairError::Unavailable)
+    }
+
+    fn capture_ready(&self) -> bool {
+        false
+    }
+
+    fn ligature_status(&self) -> Option<LigatureStatus> {
+        Some(self.status.clone())
+    }
+}
+
+impl MachineFactory for MovingCaptureFactory {
+    type Machine = MovingCaptureMachine;
+
+    fn open(
+        &mut self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<Self::Machine, Vec<SetupBlocker>> {
+        let LigatureLine::State(status) = parse_ligature_line(HOMING).unwrap() else {
+            panic!("expected Homing state fixture");
+        };
+        Ok(MovingCaptureMachine {
+            captures: Arc::clone(&self.captures),
+            status,
+        })
+    }
+}
+
 impl MachineFactory for FakeFactory {
     type Machine = LigatureMachine<FakeWire>;
 
@@ -120,13 +166,9 @@ fn controller(
     mpsc::Sender<String>,
     Arc<Mutex<Vec<FakeAction>>>,
 ) {
-    let temp = tempfile::tempdir().unwrap();
-    let profile_path = temp.path().join("sans.toml");
-    fs::write(&profile_path, VALID_PROFILE).unwrap();
     let (incoming_sender, incoming_receiver) = mpsc::channel();
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let handle = bootstrap(
-        Some(&profile_path),
+    let (handle, writes) = controller_with_factory(
         FakeFactory {
             wire: Some(FakeWire {
                 writes: Arc::clone(&writes),
@@ -135,9 +177,20 @@ fn controller(
             }),
             query,
         },
-    )
-    .unwrap();
+        writes,
+    );
     (handle, incoming_sender, writes)
+}
+
+fn controller_with_factory(
+    factory: impl MachineFactory,
+    writes: Arc<Mutex<Vec<FakeAction>>>,
+) -> (sans_core::ControllerHandle, Arc<Mutex<Vec<FakeAction>>>) {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VALID_PROFILE).unwrap();
+    let handle = bootstrap(Some(&profile_path), factory).unwrap();
+    (handle, writes)
 }
 
 fn wait_for_sent(
@@ -266,6 +319,40 @@ fn controller_exposes_uncommissioned_as_connected_and_scan_disabled() {
             .unwrap(),
         ControllerEvent::LigatureRejected(sans_core::LigatureSessionError::CommissioningOnly)
     );
+    controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
+fn controller_projects_a_connected_firmware_fault_as_blocked() {
+    let (controller, incoming, writes) = controller(READY);
+    controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    incoming
+        .send("fault CURRENT_LIMIT CANCELLED:NONE STATE:FAULT TRUST:0 Z:?".into())
+        .unwrap();
+    assert!(matches!(
+        controller
+            .recv_event_timeout(Duration::from_secs(1))
+            .unwrap(),
+        ControllerEvent::Ligature(LigatureEvent::HardFault { .. })
+    ));
+    wait_for_sent(&writes, RequestPriority::Ordinary, "?", 1);
+    incoming.send(FAULT.into()).unwrap();
+    controller
+        .recv_event_timeout(Duration::from_secs(1))
+        .unwrap();
+    let faulted = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    assert!(matches!(
+        faulted.screen,
+        MachineScreen::Setup(SetupState::Blocked { ref reasons })
+            if reasons.len() == 1 && reasons[0].summary == "Ligature fault: CURRENT_LIMIT"
+    ));
+    assert_eq!(faulted.ligature.unwrap().state, LigatureState::Fault);
     controller.send(ControllerIntent::Exit).unwrap();
 }
 
@@ -467,14 +554,10 @@ fn reconnect_stops_firmware_work_orphaned_by_the_old_epoch() {
 
 #[test]
 fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
-    let temp = tempfile::tempdir().unwrap();
-    let profile_path = temp.path().join("sans.toml");
-    fs::write(&profile_path, VALID_PROFILE).unwrap();
     let (first_sender, first_receiver) = mpsc::channel();
     let (second_sender, second_receiver) = mpsc::channel();
     let writes = Arc::new(Mutex::new(Vec::new()));
-    let controller = bootstrap(
-        Some(&profile_path),
+    let (controller, writes) = controller_with_factory(
         ReconnectFactory {
             wire: Some(FakeWire {
                 writes: Arc::clone(&writes),
@@ -487,8 +570,8 @@ fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
                 epoch: ConnectionEpoch(1),
             }),
         },
-    )
-    .unwrap();
+        writes,
+    );
     controller
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
@@ -533,4 +616,31 @@ fn controller_recovers_from_transport_fault_with_a_fresh_connection() {
         ControllerEvent::Ligature(LigatureEvent::Accepted(_))
     ));
     controller.send(ControllerIntent::Exit).unwrap();
+}
+
+#[test]
+fn controller_rejects_capture_while_ligature_reports_motion() {
+    let captures = Arc::new(AtomicUsize::new(0));
+    let (controller, _) = controller_with_factory(
+        MovingCaptureFactory {
+            captures: Arc::clone(&captures),
+        },
+        Arc::new(Mutex::new(Vec::new())),
+    );
+    let initial = controller
+        .recv_snapshot_timeout(Duration::from_secs(1))
+        .unwrap();
+    assert!(matches!(initial.screen, MachineScreen::CapturePreview(_)));
+    assert_eq!(initial.ligature.unwrap().state, LigatureState::Homing);
+
+    controller.send(ControllerIntent::CapturePair).unwrap();
+    controller.send(ControllerIntent::Exit).unwrap();
+    assert_eq!(
+        controller
+            .recv_snapshot_timeout(Duration::from_secs(1))
+            .unwrap()
+            .screen,
+        MachineScreen::Exited
+    );
+    assert_eq!(captures.load(Ordering::SeqCst), 0);
 }

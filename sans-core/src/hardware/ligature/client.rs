@@ -42,6 +42,10 @@ pub enum LigatureTransportError {
 pub trait LigatureWire: 'static {
     /// Tag subsequent responses with the connection epoch that opened this wire.
     fn set_epoch(&mut self, epoch: ConnectionEpoch);
+    /// Return commissioning evidence captured from this connection's boot preamble.
+    fn commissioned_configuration(&self) -> Option<bool> {
+        None
+    }
     /// Write one already-correlated request through its selected priority path.
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError>;
     /// Request a fresh public-state frame after an asynchronous lifecycle change.
@@ -66,7 +70,10 @@ pub struct LigatureClient<W> {
 impl<W: LigatureWire> LigatureClient<W> {
     /// Create a client from a wire whose open query already returned `query`.
     pub fn from_query(mut wire: W, query: &str) -> Result<Self, LigatureTransportError> {
-        let mut session = LigatureSession::from_query(query)?;
+        let mut session = LigatureSession::from_query_with_commissioning(
+            query,
+            wire.commissioned_configuration(),
+        )?;
         wire.set_epoch(ConnectionEpoch(1));
         stop_orphaned_firmware_work(&mut session, &mut wire)?;
         Ok(Self {
@@ -102,7 +109,9 @@ impl<W: LigatureWire> LigatureClient<W> {
             wire.shutdown()?;
         }
         let (mut wire, query) = open()?;
-        let reconnect = self.session.reconnect(&query)?;
+        let reconnect = self
+            .session
+            .reconnect_with_commissioning(&query, wire.commissioned_configuration())?;
         wire.set_epoch(reconnect.epoch);
         stop_orphaned_firmware_work(&mut self.session, &mut wire)?;
         self.wire = Some(wire);
@@ -158,6 +167,7 @@ pub struct SerialLigatureWire {
     urgent: Sender<String>,
     incoming: Receiver<WireMessage>,
     epoch: ConnectionEpoch,
+    commissioned_configuration: Option<bool>,
     shutdown: Arc<AtomicBool>,
     workers: Vec<JoinHandle<()>>,
 }
@@ -196,11 +206,12 @@ impl SerialLigatureWire {
             }
         };
 
-        let wire = Self {
+        let mut wire = Self {
             ordinary: ordinary_sender,
             urgent: urgent_sender,
             incoming: incoming_receiver,
             epoch: ConnectionEpoch(1),
+            commissioned_configuration: None,
             shutdown,
             workers: vec![reader, writer],
         };
@@ -215,11 +226,13 @@ impl SerialLigatureWire {
                 return Err(LigatureTransportError::QueryTimeout);
             }
             match wire.incoming.recv_timeout(remaining) {
-                Ok(WireMessage::Line(line)) => {
-                    if query_line_is_state(&line)? {
-                        return Ok((wire, line));
+                Ok(WireMessage::Line(line)) => match classify_query_line(&line)? {
+                    QueryLine::State => return Ok((wire, line)),
+                    QueryLine::Boot { commissioned } => {
+                        wire.commissioned_configuration = Some(commissioned);
                     }
-                }
+                    QueryLine::Lifecycle => {}
+                },
                 Ok(WireMessage::Failed(error)) => {
                     return Err(LigatureTransportError::Io(error));
                 }
@@ -229,48 +242,31 @@ impl SerialLigatureWire {
     }
 }
 
-fn query_line_is_state(line: &str) -> Result<bool, LigatureTransportError> {
-    if is_production_boot_preamble(line) {
-        return Ok(false);
-    }
-    match parse_ligature_line(line) {
-        Ok(LigatureLine::State(_)) => Ok(true),
-        Ok(_) => Ok(false),
-        Err(error) => Err(LigatureTransportError::QueryInvalid(error.to_string())),
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueryLine {
+    State,
+    Boot { commissioned: bool },
+    Lifecycle,
 }
 
-fn is_production_boot_preamble(line: &str) -> bool {
-    let mut words = line.split_ascii_whitespace();
-    if words.next() != Some("boot") || words.next() != Some("APP:production") {
-        return false;
+fn classify_query_line(line: &str) -> Result<QueryLine, LigatureTransportError> {
+    match parse_ligature_line(line) {
+        Ok(LigatureLine::State(_)) => Ok(QueryLine::State),
+        Ok(LigatureLine::Boot(boot)) => Ok(QueryLine::Boot {
+            commissioned: boot.commissioned,
+        }),
+        Ok(_) => Ok(QueryLine::Lifecycle),
+        Err(error) => Err(LigatureTransportError::QueryInvalid(error.to_string())),
     }
-    let state = words.next();
-    if words.next() != Some("PWM:OFF") {
-        return false;
-    }
-    let commissioned = words.next();
-    let state_matches_commissioning = matches!(
-        (state, commissioned),
-        (Some("STATE:IDLE"), Some("COMMISSIONED:1"))
-            | (Some("STATE:COMMISSIONING_ONLY"), Some("COMMISSIONED:0"))
-    );
-    state_matches_commissioning
-        && matches!(words.next(), Some("DRIVER_INIT:0" | "DRIVER_INIT:1"))
-        && matches!(
-            words.next(),
-            Some("CURRENT_SENSE_INIT:0" | "CURRENT_SENSE_INIT:1")
-        )
-        && matches!(
-            words.next(),
-            Some("ENDSTOP_CONFIGURED:0" | "ENDSTOP_CONFIGURED:1")
-        )
-        && words.next().is_none()
 }
 
 impl LigatureWire for SerialLigatureWire {
     fn set_epoch(&mut self, epoch: ConnectionEpoch) {
         self.epoch = epoch;
+    }
+
+    fn commissioned_configuration(&self) -> Option<bool> {
+        self.commissioned_configuration
     }
 
     fn send(&mut self, request: &LigatureRequest) -> Result<(), LigatureTransportError> {
@@ -393,33 +389,51 @@ fn write_line(port: &mut Box<dyn SerialPort>, line: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{query_line_is_state, LigatureTransportError};
+    use super::{classify_query_line, LigatureTransportError, QueryLine};
 
     #[test]
     fn readiness_query_ignores_the_production_boot_preamble() {
-        for line in [
-            "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:1 DRIVER_INIT:1 \
-             CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
-            "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:0 \
-             DRIVER_INIT:0 CURRENT_SENSE_INIT:0 ENDSTOP_CONFIGURED:0",
+        for (line, commissioned) in [
+            (
+                "boot APP:production STATE:IDLE PWM:OFF COMMISSIONED:1 DRIVER_INIT:1 \
+                 CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
+                true,
+            ),
+            (
+                "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:0 \
+                 DRIVER_INIT:0 CURRENT_SENSE_INIT:0 ENDSTOP_CONFIGURED:0",
+                false,
+            ),
+            (
+                "boot APP:production STATE:COMMISSIONING_ONLY PWM:OFF COMMISSIONED:1 \
+                 DRIVER_INIT:1 CURRENT_SENSE_INIT:0 ENDSTOP_CONFIGURED:1",
+                true,
+            ),
         ] {
-            assert!(!query_line_is_state(line).unwrap());
+            assert_eq!(
+                classify_query_line(line).unwrap(),
+                QueryLine::Boot { commissioned }
+            );
         }
     }
 
     #[test]
     fn readiness_query_ignores_valid_lifecycle_frames_until_state() {
-        assert!(!query_line_is_state("ok G28").unwrap());
-        assert!(!query_line_is_state("error M53 REASON:FAULTED").unwrap());
-        assert!(!query_line_is_state(
-            "status STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ACTIVE:NONE FAULT:NONE"
-        )
-        .unwrap());
-        assert!(query_line_is_state(
-            "state STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ENDSTOP:0 PWM:OFF \
-             ACTIVE:NONE FAULT:NONE RUNTIME_MODIFIED:0"
-        )
-        .unwrap());
+        for line in [
+            "ok G28",
+            "error M53 REASON:FAULTED",
+            "status STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ACTIVE:NONE FAULT:NONE",
+        ] {
+            assert_eq!(classify_query_line(line).unwrap(), QueryLine::Lifecycle);
+        }
+        assert_eq!(
+            classify_query_line(
+                "state STATE:IDLE TRUST:0 Z:? VEL:0 IQ:0 PRESS:? ENDSTOP:0 PWM:OFF \
+                 ACTIVE:NONE FAULT:NONE RUNTIME_MODIFIED:0"
+            )
+            .unwrap(),
+            QueryLine::State
+        );
     }
 
     #[test]
@@ -432,7 +446,7 @@ mod tests {
              CURRENT_SENSE_INIT:1 ENDSTOP_CONFIGURED:1",
         ] {
             assert!(matches!(
-                query_line_is_state(line),
+                classify_query_line(line),
                 Err(LigatureTransportError::QueryInvalid(_))
             ));
         }

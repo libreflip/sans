@@ -194,6 +194,7 @@ fn render_controller(
             );
         }
         Some(MachineScreen::CapturePreview(preview)) => {
+            render_ligature_status(ui, snapshot.and_then(|snapshot| snapshot.ligature.as_ref()));
             if render_capture_preview(ui, context, handle, preview, textures).is_err() {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;

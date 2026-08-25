@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::camera::{CapturePair, CapturePairError};
 use crate::{
     prepare_machine_profile, LigatureClient, LigatureCommand, LigatureEvent, LigatureReconnect,
-    LigatureRequest, LigatureSessionError, LigatureStatus, LigatureTransportError, LigatureWire,
-    PreparedMachineProfile, SerialLigatureWire, StartupError,
+    LigatureRequest, LigatureSessionError, LigatureState, LigatureStatus, LigatureTransportError,
+    LigatureWire, PreparedMachineProfile, SerialLigatureWire, StartupError,
 };
 #[cfg(target_os = "linux")]
 use crate::{CapturePairMachine, V4lCameraMachineFactory};
@@ -149,6 +149,10 @@ pub trait ControllerMachine: 'static {
     fn capture_available(&self) -> bool {
         true
     }
+    /// Whether current Machine state permits stationary Camera acquisition.
+    fn capture_ready(&self) -> bool {
+        self.setup_state() == SetupState::Ready
+    }
     /// Report the Setup projection derived from controller-owned state.
     fn setup_state(&self) -> SetupState {
         SetupState::Ready
@@ -210,8 +214,20 @@ impl<W: LigatureWire> ControllerMachine for LigatureMachine<W> {
         false
     }
 
+    fn capture_ready(&self) -> bool {
+        self.client.session().capture_ready()
+    }
+
     fn setup_state(&self) -> SetupState {
-        if self.client.session().scan_enabled() {
+        let status = self.client.session().status();
+        if status.state == LigatureState::Fault {
+            SetupState::Blocked {
+                reasons: vec![SetupBlocker::new(format!(
+                    "Ligature fault: {}",
+                    status.fault.as_deref().unwrap_or("unknown")
+                ))],
+            }
+        } else if self.client.session().scan_enabled() {
             SetupState::Ready
         } else {
             SetupState::Uncommissioned
@@ -286,6 +302,10 @@ impl ControllerMachine for SansMachine {
 
     fn setup_state(&self) -> SetupState {
         self.ligature.setup_state()
+    }
+
+    fn capture_ready(&self) -> bool {
+        self.ligature.capture_ready()
     }
 
     fn ligature_status(&self) -> Option<LigatureStatus> {
@@ -488,8 +508,7 @@ fn spawn_controller(
                     Ok(ControllerIntent::CapturePair)
                         if !ligature_transport_faulted
                             && machine.as_ref().is_some_and(|machine| {
-                                machine.capture_available()
-                                    && machine.setup_state() == SetupState::Ready
+                                machine.capture_available() && machine.capture_ready()
                             }) =>
                     {
                         let Some(current) = machine.as_mut() else {
@@ -586,18 +605,13 @@ fn spawn_controller(
                                 let Some(current) = machine.as_ref() else {
                                     continue;
                                 };
-                                if snapshot_sender
-                                    .send(ControllerSnapshot {
-                                        revision,
-                                        screen: project_screen(
-                                            current,
-                                            &capture_status,
-                                            latest_complete_pair.clone(),
-                                        ),
-                                        ligature: current.ligature_status(),
-                                    })
-                                    .is_err()
-                                {
+                                if !publish_machine_snapshot(
+                                    &snapshot_sender,
+                                    revision,
+                                    current,
+                                    &capture_status,
+                                    latest_complete_pair.clone(),
+                                ) {
                                     return;
                                 }
                             }
@@ -638,18 +652,13 @@ fn spawn_controller(
                                 }
                                 if status_changed {
                                     revision += 1;
-                                    if snapshot_sender
-                                        .send(ControllerSnapshot {
-                                            revision,
-                                            screen: project_screen(
-                                                current,
-                                                &capture_status,
-                                                latest_complete_pair.clone(),
-                                            ),
-                                            ligature: current.ligature_status(),
-                                        })
-                                        .is_err()
-                                    {
+                                    if !publish_machine_snapshot(
+                                        &snapshot_sender,
+                                        revision,
+                                        current,
+                                        &capture_status,
+                                        latest_complete_pair.clone(),
+                                    ) {
                                         return;
                                     }
                                 }
@@ -697,6 +706,22 @@ fn report_ligature_transport_fault(
         }),
         ligature: None,
     });
+}
+
+fn publish_machine_snapshot(
+    snapshots: &Sender<ControllerSnapshot>,
+    revision: u64,
+    machine: &impl ControllerMachine,
+    capture_status: &CaptureStatus,
+    latest_complete_pair: Option<Arc<CapturePair>>,
+) -> bool {
+    snapshots
+        .send(ControllerSnapshot {
+            revision,
+            screen: project_screen(machine, capture_status, latest_complete_pair),
+            ligature: machine.ligature_status(),
+        })
+        .is_ok()
 }
 
 fn setup_failure(reasons: Vec<SetupBlocker>) -> SetupState {
