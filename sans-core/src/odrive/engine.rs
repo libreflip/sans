@@ -29,7 +29,8 @@ use crate::MachineProfile;
 
 /// Largest descriptor the engine accepts before blocking the link.
 const MAX_DESCRIPTOR_BYTES: usize = 256 * 1024;
-/// Ordinary commands that may wait for the link; a fifth is rejected.
+/// Ordinary commands that may wait for the link. A fifth is rejected, except
+/// Disarm, which retires the queue before it is added.
 const ORDINARY_QUEUE_CAPACITY: usize = 4;
 /// Count-only status changes (ignored replies) publish at most this often.
 const COUNT_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
@@ -90,7 +91,9 @@ pub enum LinkCommand {
     /// Write `requested_state` idle; confirmed when `current_state` reads idle,
     /// otherwise the link faults. Accepted whenever endpoints are resolved,
     /// including on a faulted link. Accepting it revokes every arm, Home or
-    /// move write that has not left the host yet.
+    /// move write that has not left the host yet. An ordinary Disarm also
+    /// retires all queued ordinary commands, including ClearErrors, as
+    /// `Retired { transmitted: false }` before it is queued.
     Disarm,
     /// Write `requested_state` closed-loop control; confirmed when
     /// `current_state` reads closed-loop control.
