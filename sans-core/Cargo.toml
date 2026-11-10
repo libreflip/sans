@@ -12,6 +12,7 @@ toml = "0.9"
 thiserror = "2"
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+zune-jpeg = "0.5"
 
 # Hardware bindings
 serialport = { version = "4", default-features = false }

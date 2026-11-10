@@ -1,8 +1,8 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
 use std::path::Path;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -138,10 +138,78 @@ pub trait MachineFactory: Send + 'static {
     }
 }
 
-/// An intent channel that also exposes the latest controller projections.
+#[derive(Default)]
+struct SnapshotState {
+    pending: Option<ControllerSnapshot>,
+    closed: bool,
+}
+
+/// A single pending projection. Publishing replaces and releases its predecessor.
+#[derive(Default)]
+struct LatestSnapshot {
+    state: Mutex<SnapshotState>,
+    changed: Condvar,
+}
+
+impl LatestSnapshot {
+    fn send(&self, snapshot: ControllerSnapshot) -> Result<(), ControllerClosed> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(ControllerClosed);
+        }
+        let previous = state.pending.replace(snapshot);
+        drop(state);
+        self.changed.notify_one();
+        drop(previous);
+        Ok(())
+    }
+
+    fn try_recv(&self) -> Result<ControllerSnapshot, TryRecvError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.take().ok_or(if state.closed {
+            TryRecvError::Disconnected
+        } else {
+            TryRecvError::Empty
+        })
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Result<ControllerSnapshot, RecvTimeoutError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.pending.is_none() && !state.closed
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending.take().ok_or(if state.closed {
+            RecvTimeoutError::Disconnected
+        } else {
+            RecvTimeoutError::Timeout
+        })
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+        self.changed.notify_all();
+    }
+}
+
+/// An intent channel that also exposes the latest controller projection.
 pub struct ControllerHandle {
     intents: Sender<ControllerIntent>,
-    snapshots: Receiver<ControllerSnapshot>,
+    snapshots: Arc<LatestSnapshot>,
     accepting_intents: Arc<Mutex<bool>>,
     controller_thread: Option<JoinHandle<()>>,
 }
@@ -165,12 +233,14 @@ impl ControllerHandle {
         })
     }
 
-    /// Poll a snapshot without blocking a render loop.
+    /// Take the latest pending snapshot without blocking a render loop.
+    ///
+    /// Intermediate projections are replaced when the consumer falls behind.
     pub fn try_snapshot(&self) -> Result<ControllerSnapshot, TryRecvError> {
         self.snapshots.try_recv()
     }
 
-    /// Wait for a projection with a bounded deadline.
+    /// Wait for the latest pending projection with a bounded deadline.
     ///
     /// This is intended for deterministic tests and non-rendering callers.
     pub fn recv_snapshot_timeout(
@@ -184,6 +254,7 @@ impl ControllerHandle {
 impl Drop for ControllerHandle {
     fn drop(&mut self) {
         let _ = self.send(ControllerIntent::Exit);
+        self.snapshots.close();
         if self
             .controller_thread
             .as_ref()
@@ -215,13 +286,14 @@ fn spawn_controller<Factory: MachineFactory>(
     factory: Factory,
 ) -> Result<ControllerHandle, StartupError> {
     let (intent_sender, intent_receiver) = mpsc::channel();
-    let (snapshot_sender, snapshot_receiver) = mpsc::channel();
+    let snapshots = Arc::new(LatestSnapshot::default());
+    let snapshot_sender = Arc::clone(&snapshots);
     let accepting_intents = Arc::new(Mutex::new(true));
     let worker_accepting_intents = Arc::clone(&accepting_intents);
     let controller_thread = thread::Builder::new()
         .name("sans-controller".into())
         .spawn(move || {
-            struct MarkControllerClosed(Arc<Mutex<bool>>);
+            struct MarkControllerClosed(Arc<Mutex<bool>>, Arc<LatestSnapshot>);
 
             impl Drop for MarkControllerClosed {
                 fn drop(&mut self) {
@@ -229,10 +301,12 @@ fn spawn_controller<Factory: MachineFactory>(
                         .0
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+                    self.1.close();
                 }
             }
 
-            let _closed_on_return = MarkControllerClosed(worker_accepting_intents);
+            let _closed_on_return =
+                MarkControllerClosed(worker_accepting_intents, Arc::clone(&snapshot_sender));
             let (setup, mut active_machine) = match factory.open(&profile) {
                 Ok((machine, diagnostics)) => (SetupState::Ready { diagnostics }, Some(machine)),
                 Err(reasons) => (SetupState::Blocked { reasons }, None),
@@ -334,7 +408,7 @@ fn spawn_controller<Factory: MachineFactory>(
 
     Ok(ControllerHandle {
         intents: intent_sender,
-        snapshots: snapshot_receiver,
+        snapshots,
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
@@ -363,4 +437,88 @@ fn native_detail_preview_warning(pair: &CapturePair) -> Option<String> {
         failures.push(format!("Right 100% preview is unavailable: {error}"));
     }
     (!failures.is_empty()).then(|| failures.join("; "))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, SystemTime};
+
+    use super::{
+        capture_preview, CaptureStatus, ControllerClosed, ControllerSnapshot, LatestSnapshot,
+        MachineScreen, RecvTimeoutError, TryRecvError,
+    };
+    use crate::{CameraRole, CapturePair, CapturedFrame, CropGeometry};
+
+    fn pair(value: u8) -> Arc<CapturePair> {
+        let frame = |role| {
+            CapturedFrame::from_rgb8(
+                role,
+                1,
+                1,
+                vec![value; 3],
+                SystemTime::UNIX_EPOCH,
+                CropGeometry {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+            )
+            .unwrap()
+        };
+        Arc::new(CapturePair {
+            left: frame(CameraRole::Left),
+            right: frame(CameraRole::Right),
+        })
+    }
+
+    #[test]
+    fn slow_snapshot_consumer_gets_latest_pair_and_releases_superseded_frames() {
+        let snapshots = LatestSnapshot::default();
+        let first = pair(1);
+        let first_weak = Arc::downgrade(&first);
+        snapshots
+            .send(ControllerSnapshot {
+                revision: 1,
+                screen: capture_preview(CaptureStatus::Ready, Some(first)),
+            })
+            .unwrap();
+        let latest = pair(2);
+        let expected = ControllerSnapshot {
+            revision: 2,
+            screen: capture_preview(CaptureStatus::Ready, Some(latest)),
+        };
+        snapshots.send(expected.clone()).unwrap();
+
+        assert!(first_weak.upgrade().is_none());
+        assert_eq!(snapshots.try_recv(), Ok(expected));
+        assert_eq!(snapshots.try_recv(), Err(TryRecvError::Empty));
+        assert_eq!(
+            snapshots.recv_timeout(Duration::ZERO),
+            Err(RecvTimeoutError::Timeout)
+        );
+    }
+
+    #[test]
+    fn closing_wakes_waiters_and_preserves_the_final_snapshot() {
+        let snapshots = Arc::new(LatestSnapshot::default());
+        let receiver = Arc::clone(&snapshots);
+        let waiter = thread::spawn(move || receiver.recv_timeout(Duration::from_secs(1)));
+        let exited = ControllerSnapshot {
+            revision: 3,
+            screen: MachineScreen::Exited,
+        };
+        snapshots.send(exited.clone()).unwrap();
+        snapshots.close();
+
+        assert_eq!(waiter.join().unwrap(), Ok(exited.clone()));
+        assert_eq!(snapshots.try_recv(), Err(TryRecvError::Disconnected));
+        assert_eq!(
+            snapshots.recv_timeout(Duration::from_secs(1)),
+            Err(RecvTimeoutError::Disconnected)
+        );
+        assert_eq!(snapshots.send(exited), Err(ControllerClosed));
+    }
 }

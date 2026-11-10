@@ -1,13 +1,13 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use sans_core::{
     bootstrap, CameraCaptureError, CameraRole, CapturePairMachine, CaptureStatus, CapturedFrame,
-    ControllerIntent, CropGeometry, MachineFactory, MachineScreen, PreparedMachineProfile,
-    RoleCamera, SetupBlocker, SetupDiagnostic, SetupState,
+    ControllerIntent, ControllerMachine, CropGeometry, MachineFactory, MachineScreen,
+    PreparedMachineProfile, RoleCamera, SetupBlocker, SetupDiagnostic, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -33,17 +33,38 @@ impl RoleCamera for ScriptedCamera {
 struct FixtureFactory {
     left: ScriptedCamera,
     right: ScriptedCamera,
+    release: mpsc::Receiver<()>,
+}
+
+struct FixtureMachine {
+    cameras: CapturePairMachine,
+    release: mpsc::Receiver<()>,
+}
+
+impl ControllerMachine for FixtureMachine {
+    fn capture_pair(&mut self) -> Result<sans_core::CapturePair, sans_core::CapturePairError> {
+        self.release.recv_timeout(Duration::from_secs(1)).unwrap();
+        self.cameras.capture_pair()
+    }
 }
 
 impl MachineFactory for FixtureFactory {
-    type Machine = CapturePairMachine;
+    type Machine = FixtureMachine;
 
     fn open(
         self,
         _profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         CapturePairMachine::new(Box::new(self.left), Box::new(self.right))
-            .map(|machine| (machine, Vec::new()))
+            .map(|cameras| {
+                (
+                    FixtureMachine {
+                        cameras,
+                        release: self.release,
+                    },
+                    Vec::new(),
+                )
+            })
             .map_err(|error| vec![SetupBlocker::new(error.to_string())])
     }
 }
@@ -97,7 +118,10 @@ fn scripted_camera(
     )
 }
 
-fn start_controller(left: ScriptedCamera, right: ScriptedCamera) -> sans_core::ControllerHandle {
+fn start_controller(
+    left: ScriptedCamera,
+    right: ScriptedCamera,
+) -> (sans_core::ControllerHandle, mpsc::Sender<()>) {
     let temp = tempfile::tempdir().unwrap();
     let profile_path = temp.path().join("sans.toml");
     let data_root = temp.path().join("scan-data");
@@ -109,11 +133,17 @@ fn start_controller(left: ScriptedCamera, right: ScriptedCamera) -> sans_core::C
         ),
     )
     .unwrap();
-    bootstrap(
+    let (release, wait_for_release) = mpsc::channel();
+    let controller = bootstrap(
         Some(Path::new(&profile_path)),
-        FixtureFactory { left, right },
+        FixtureFactory {
+            left,
+            right,
+            release: wait_for_release,
+        },
     )
-    .unwrap()
+    .unwrap();
+    (controller, release)
 }
 
 fn expect_ready(controller: &sans_core::ControllerHandle) {
@@ -128,6 +158,7 @@ fn expect_ready(controller: &sans_core::ControllerHandle) {
 
 fn capture_snapshots(
     controller: &sans_core::ControllerHandle,
+    release: &mpsc::Sender<()>,
 ) -> (sans_core::ControllerSnapshot, sans_core::ControllerSnapshot) {
     controller.send(ControllerIntent::CapturePair).unwrap();
     let capturing = controller
@@ -137,14 +168,18 @@ fn capture_snapshots(
         capturing.screen,
         MachineScreen::CapturePreview(ref preview) if preview.status == CaptureStatus::Capturing
     ));
+    release.send(()).unwrap();
     let captured = controller
         .recv_snapshot_timeout(Duration::from_secs(1))
         .unwrap();
     (capturing, captured)
 }
 
-fn capture(controller: &sans_core::ControllerHandle) -> Arc<sans_core::CapturePair> {
-    let (_, captured) = capture_snapshots(controller);
+fn capture(
+    controller: &sans_core::ControllerHandle,
+    release: &mpsc::Sender<()>,
+) -> Arc<sans_core::CapturePair> {
+    let (_, captured) = capture_snapshots(controller, release);
     match captured.screen {
         MachineScreen::CapturePreview(preview) => {
             assert_eq!(preview.status, CaptureStatus::Ready);
@@ -169,10 +204,10 @@ fn controller_retries_only_the_failed_camera_and_publishes_one_complete_pair() {
             Ok(right_frame.clone()),
         ],
     );
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
 
-    let pair = capture(&controller);
+    let pair = capture(&controller, &release);
 
     assert_eq!(pair.left, left_frame);
     assert_eq!(pair.right, right_frame);
@@ -202,11 +237,11 @@ fn exhausted_retry_blocks_capture_and_retains_the_previous_complete_pair() {
             )),
         ],
     );
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
-    let expected_pair = capture(&controller);
+    let expected_pair = capture(&controller, &release);
 
-    let (capturing, blocked) = capture_snapshots(&controller);
+    let (capturing, blocked) = capture_snapshots(&controller, &release);
     assert!(matches!(
         capturing.screen,
         MachineScreen::CapturePreview(ref preview)
@@ -247,10 +282,10 @@ fn controller_publishes_rotated_frames_with_crops_clamped_to_each_role() {
     );
     let (left, _) = scripted_camera(CameraRole::Left, vec![Ok(left_frame.clone())]);
     let (right, _) = scripted_camera(CameraRole::Right, vec![Ok(right_frame.clone())]);
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
 
-    let pair = capture(&controller);
+    let pair = capture(&controller, &release);
 
     assert_eq!(pair.left, left_frame);
     assert_eq!((pair.left.crop.width, pair.left.crop.height), (1, 2));
@@ -286,10 +321,10 @@ fn frame_tagged_for_the_wrong_camera_role_blocks_the_entire_pair() {
         CameraRole::Right,
         vec![Ok(captured_frame(CameraRole::Right, 20))],
     );
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
 
-    let (_, blocked) = capture_snapshots(&controller);
+    let (_, blocked) = capture_snapshots(&controller, &release);
 
     assert!(matches!(
         blocked.screen,
@@ -309,10 +344,10 @@ fn missing_native_detail_preview_warns_without_rejecting_the_complete_pair() {
     let right_frame = captured_frame(CameraRole::Right, 20);
     let (left, _) = scripted_camera(CameraRole::Left, vec![Ok(left_frame)]);
     let (right, _) = scripted_camera(CameraRole::Right, vec![Ok(right_frame)]);
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
 
-    let (_, captured) = capture_snapshots(&controller);
+    let (_, captured) = capture_snapshots(&controller, &release);
 
     assert!(matches!(
         captured.screen,
@@ -352,10 +387,10 @@ fn empty_post_rotation_crop_blocks_the_entire_pair() {
         CameraRole::Right,
         vec![Ok(captured_frame(CameraRole::Right, 20))],
     );
-    let controller = start_controller(left, right);
+    let (controller, release) = start_controller(left, right);
     expect_ready(&controller);
 
-    let (_, blocked) = capture_snapshots(&controller);
+    let (_, blocked) = capture_snapshots(&controller, &release);
 
     assert!(matches!(
         blocked.screen,
