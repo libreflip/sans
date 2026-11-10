@@ -29,6 +29,6 @@ fn requests_a_maximized_decorated_window_that_is_not_fullscreen() {
     let request = sans::window_request();
 
     assert_eq!(request.maximized, Some(true));
-    assert_ne!(request.decorations, Some(false));
+    assert_eq!(request.decorations, Some(true));
     assert_ne!(request.fullscreen, Some(true));
 }
