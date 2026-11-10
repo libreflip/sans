@@ -5,8 +5,9 @@ mod support;
 use std::collections::BTreeSet;
 
 use eframe::egui;
-use support::cameras::Step;
+use support::cameras::{Gate, Step};
 use support::fixtures::portrait_full_frame;
+use support::pixels::{renderer, rgb};
 use support::session::{Session, SCROLLING};
 
 /// Every label and view of the four-view composition, top to bottom.
@@ -183,5 +184,106 @@ fn the_body_settles_after_a_drag_ends() {
         let settled = session.labelled_rects();
         session.harness.run();
         assert_eq!(session.labelled_rects(), settled);
+    }
+}
+
+/// A point on the scroll bar track, beside the top of the body viewport.
+fn scroll_bar_top(session: &Session) -> egui::Pos2 {
+    let body = session.body();
+    let track = body.max.x..session.window().max.x;
+    assert!(
+        track.end - track.start >= 6.0,
+        "no room for a solid scroll bar beside the body at {}",
+        session.viewport.name
+    );
+    egui::pos2((track.start + track.end) / 2.0, body.min.y + 4.0)
+}
+
+#[test]
+fn dragging_the_scroll_bar_down_scrolls_toward_the_end() {
+    for viewport in SCROLLING {
+        let mut session = Session::with_pair(portrait_full_frame(), viewport);
+        let before = session.rect("Left 100%").top();
+        let from = scroll_bar_top(&session);
+
+        // A body drag downward at the top does nothing; only the bar scrolls this way.
+        session.drag(from, from + egui::vec2(0.0, 200.0), false);
+
+        assert!(
+            session.rect("Left 100%").top() < before - 5.0,
+            "dragging the scroll bar did not scroll at {}",
+            viewport.name
+        );
+    }
+}
+
+#[test]
+fn the_body_keeps_its_scroll_position_through_a_capture() {
+    for viewport in SCROLLING {
+        let (left, right) = portrait_full_frame();
+        let gate = Gate::default();
+        let mut session = Session::cameras(
+            vec![
+                Step::Frame(left.frame.clone()),
+                Step::Gated(left.frame, gate.clone()),
+            ],
+            vec![Step::Frame(right.frame)],
+            viewport,
+        );
+        session.capture_pair();
+        session.wheel(100_000.0);
+        session.wheel(-3.5);
+        let scrolled = session.rect("Right 100% preview");
+
+        session.tap_label("Capture pair");
+        session.wait_for_label("Capturing...");
+        assert_eq!(
+            session.rect("Right 100% preview"),
+            scrolled,
+            "the body jumped when capture started at {}",
+            viewport.name
+        );
+
+        gate.open();
+        // Capturing was already shown, so the next Ready belongs to the new pair.
+        session.wait_for_label("Cameras ready");
+        assert_eq!(
+            session.rect("Right 100% preview"),
+            scrolled,
+            "the body jumped when the new pair arrived at {}",
+            viewport.name
+        );
+    }
+}
+
+#[test]
+fn a_solid_scroll_bar_is_drawn_beside_an_overflowing_body() {
+    for viewport in SCROLLING {
+        let Some(renderer) = renderer("visible scroll bar") else {
+            return;
+        };
+        let mut session =
+            Session::with_pair_rendered(portrait_full_frame(), viewport, Some(renderer));
+
+        let image = session.render();
+
+        let pixels_per_point = viewport.pixels_per_point;
+        let body = session.body();
+        let background = rgb(
+            &image,
+            (session.window().max.x * pixels_per_point) as u32 - 1,
+            (body.center().y * pixels_per_point) as u32,
+        );
+        let track = (body.max.x * pixels_per_point).ceil() as u32
+            ..(session.window().max.x * pixels_per_point) as u32 - 1;
+        let drawn_rows = ((body.min.y * pixels_per_point).ceil() as u32
+            ..(body.max.y * pixels_per_point) as u32)
+            .filter(|&y| track.clone().any(|x| rgb(&image, x, y) != background))
+            .count();
+        assert!(
+            drawn_rows as f32 >= body.height() * pixels_per_point / 2.0,
+            "the scroll bar is drawn on {drawn_rows} rows beside the body at {}",
+            viewport.name
+        );
     }
 }
