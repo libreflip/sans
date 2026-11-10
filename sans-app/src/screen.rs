@@ -113,14 +113,15 @@ fn show_header(ui: &mut egui::Ui, header: &Header<'_>) {
         if header.busy {
             ui.spinner();
         }
-        if let Some(tag) = header.warning_tag {
-            ui.add(egui::Label::new(
-                egui::RichText::new(tag).color(egui::Color32::YELLOW),
-            ));
-        }
+        // The status comes first so a narrow window truncates the tag, not the status.
         ui.add(
             egui::Label::new(egui::RichText::new(header.status).color(header.colour)).truncate(),
         );
+        if let Some(tag) = header.warning_tag {
+            ui.add(
+                egui::Label::new(egui::RichText::new(tag).color(egui::Color32::YELLOW)).truncate(),
+            );
+        }
     });
 }
 

@@ -8,7 +8,7 @@ mod support;
 
 use support::cameras::{Gate, Step};
 use support::fixtures::portrait_full_frame;
-use support::session::{Session, MATRIX_AND_MINIMUM};
+use support::session::{Session, MATRIX_AND_MINIMUM, MINIMUM, T1};
 
 /// Assert `actions` stay put, nothing overflows sideways, and the node whose
 /// label contains `last` can be scrolled until its bottom is in the body.
@@ -209,4 +209,22 @@ fn fatal_screen_scrolls_a_long_message_with_close_sans_fixed() {
 
         assert_usable(&mut session, &["Close Sans"], "Startup diagnostic line 60");
     }
+}
+
+#[test]
+fn the_status_reads_in_full_beside_a_warning_tag_at_the_minimum_window() {
+    let status_width = |viewport| {
+        let (left, right) = portrait_full_frame();
+        let left = left.without_native_detail("fixture detail allocation failed");
+        let session = Session::with_pair((left, right), viewport);
+        assert!(session.has("100% preview warning"));
+        session.rect("Cameras ready").width()
+    };
+
+    let (full, minimum) = (status_width(T1), status_width(MINIMUM));
+
+    assert_eq!(
+        minimum, full,
+        "the status is truncated at the minimum window"
+    );
 }
