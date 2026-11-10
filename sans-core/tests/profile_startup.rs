@@ -16,11 +16,18 @@ fn missing_profile_creates_parseable_template_and_stops_startup() {
         Err(StartupError::TemplateCreated { path }) if path == profile_path
     ));
     let template = fs::read_to_string(&profile_path).unwrap();
-    toml::from_str::<toml::Value>(&template).unwrap();
-    assert!(matches!(
-        prepare_machine_profile(Some(&profile_path)),
-        Err(StartupError::ProfileInvalid { .. })
-    ));
+    let parsed = toml::from_str::<toml::Value>(&template).unwrap();
+    assert_eq!(parsed["schema_version"].as_integer(), Some(2));
+    assert!(parsed["odrive"].get("lift_axis").is_none());
+    assert!(parsed["boards"].get("ligature_path").is_none());
+    let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
+    assert!(matches!(error, StartupError::ProfileInvalid { .. }));
+    let message = error.to_string();
+    assert!(message.contains("odrive.usb_serial"), "{message}");
+    assert!(
+        message.contains("odrive.api_fingerprint_sha256"),
+        "{message}"
+    );
 }
 
 #[test]
@@ -57,31 +64,125 @@ fn valid_profile_resolves_and_creates_relative_data_root() {
     assert_eq!(prepared.profile_path(), profile_path);
     assert_eq!(prepared.data_root(), temp.path().join("config/scan-data"));
     assert!(prepared.data_root().is_dir());
+    let odrive = &prepared.profile().odrive;
+    assert_eq!(odrive.usb_serial, "316536713335");
+    assert_eq!(odrive.axis, 0);
+    assert!(odrive.lift_axis.is_none());
 }
 
 #[test]
 fn structural_mistakes_are_reported_with_the_selected_profile_path() {
     let cases = [
-        ("schema_version = 1", "schema_version = 2", "schema_version"),
         (
-            "ligature_path = \"/dev/serial/by-id/ligature\"",
-            "ligature_path = \"\"",
-            "boards.ligature_path",
+            "schema_version = 2",
+            "schema_version = 3",
+            "unsupported schema_version 3",
         ),
         (
-            "ligature_path = \"/dev/serial/by-id/ligature\"",
-            "ligature_path = \"<set-stable-ligature-device-path>\"",
+            "schema_version = 2",
+            "schema_version = \"2\"",
+            "unsupported schema_version",
+        ),
+        (
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "monospace_path = \"\"",
+            "boards.monospace_path",
+        ),
+        (
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "monospace_path = \"<set-stable-monospace-device-path>\"",
             "directly under /dev/serial",
         ),
         (
-            "ligature_path = \"/dev/serial/by-id/ligature\"",
-            "ligature_path = \"/dev/serial/by-id/\"",
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "monospace_path = \"/dev/serial/by-id/\"",
             "directly under /dev/serial",
         ),
         (
-            "ligature_path = \"/dev/serial/by-id/ligature\"",
-            "ligature_path = \"/dev/serial/by-id/../ttyACM0\"",
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "monospace_path = \"/dev/serial/by-id/../ttyACM0\"",
             "directly under /dev/serial",
+        ),
+        (
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "ligature_path = \"/dev/serial/by-id/ligature\"\nmonospace_path = \"/dev/serial/by-id/monospace\"",
+            "ligature_path",
+        ),
+        (
+            "usb_serial = \"316536713335\"",
+            "usb_serial = \"\"",
+            "odrive.usb_serial must be 1 to 16 hex digits",
+        ),
+        (
+            "usb_serial = \"316536713335\"",
+            "usb_serial = \"<set-odrive-usb-serial-hex>\"",
+            "odrive.usb_serial must be 1 to 16 hex digits",
+        ),
+        (
+            "usb_serial = \"316536713335\"",
+            "usb_serial = \"31653671333531653\"",
+            "odrive.usb_serial must be 1 to 16 hex digits",
+        ),
+        ("axis = 0", "axis = 2", "odrive.axis must be 0 or 1"),
+        (
+            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
+            "api_fingerprint_sha256 = \"<set-commissioned-api-fingerprint-sha256>\"",
+            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
+        ),
+        (
+            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
+            "api_fingerprint_sha256 = \"A36D84437BD2BF5925C0119A1DF53D88DE8EBE1AA8DF0A338D2F6DD56FD5E52B\"",
+            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
+        ),
+        (
+            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
+            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88\"",
+            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
+        ),
+        (
+            "poll_interval_ms = 20",
+            "poll_interval_ms = 4",
+            "odrive.poll_interval_ms must be between 5 and 100 ms",
+        ),
+        (
+            "poll_interval_ms = 20",
+            "poll_interval_ms = 101",
+            "odrive.poll_interval_ms must be between 5 and 100 ms",
+        ),
+        (
+            "telemetry_max_age_ms = 100",
+            "telemetry_max_age_ms = 39",
+            "odrive.telemetry_max_age_ms must be at least twice odrive.poll_interval_ms",
+        ),
+        (
+            "telemetry_max_age_ms = 100",
+            "telemetry_max_age_ms = 251",
+            "odrive.telemetry_max_age_ms exceeds immutable 250 ms ceiling",
+        ),
+        (
+            "request_deadline_ms = 100",
+            "request_deadline_ms = 0",
+            "odrive.request_deadline_ms must be between 1 and 250 ms",
+        ),
+        (
+            "request_deadline_ms = 100",
+            "request_deadline_ms = 251",
+            "odrive.request_deadline_ms must be between 1 and 250 ms",
+        ),
+        (
+            "urgent_deadline_ms = 50",
+            "urgent_deadline_ms = 0",
+            "odrive.urgent_deadline_ms must be between 1 and 100 ms",
+        ),
+        (
+            "urgent_deadline_ms = 50",
+            "urgent_deadline_ms = 101",
+            "odrive.urgent_deadline_ms must be between 1 and 100 ms",
+        ),
+        (
+            "request_deadline_ms = 100",
+            "request_deadline_ms = 40",
+            "odrive.urgent_deadline_ms must not exceed odrive.request_deadline_ms",
         ),
         (
             "identity = \"/dev/v4l/by-id/left-camera\"",
@@ -225,7 +326,9 @@ fn complete_profile_save_truncates_old_content_and_propagates_open_errors() {
 
     let saved = fs::read_to_string(&profile_path).unwrap();
     assert!(!saved.contains("obsolete"));
-    prepare_machine_profile(Some(&profile_path)).unwrap();
+    assert!(!saved.contains("lift_axis"));
+    let reloaded = prepare_machine_profile(Some(&profile_path)).unwrap();
+    assert!(reloaded.profile().odrive.lift_axis.is_none());
 
     let directory_path = temp.path().join("not-a-file");
     fs::create_dir(&directory_path).unwrap();
@@ -238,8 +341,8 @@ fn legitimate_device_names_may_contain_angle_brackets() {
     let profile_path = temp.path().join("sans.toml");
     let profile = VALID_PROFILE
         .replacen(
-            "ligature_path = \"/dev/serial/by-id/ligature\"",
-            "ligature_path = \"/dev/serial/by-id/ligature<primary>\"",
+            "monospace_path = \"/dev/serial/by-id/monospace\"",
+            "monospace_path = \"/dev/serial/by-id/monospace<primary>\"",
             1,
         )
         .replacen(
@@ -250,4 +353,139 @@ fn legitimate_device_names_may_contain_angle_brackets() {
     fs::write(&profile_path, profile).unwrap();
 
     prepare_machine_profile(Some(&profile_path)).unwrap();
+}
+
+const VERSION_1_PROFILE: &str = r#"schema_version = 1
+data_root = "scan-data"
+
+[boards]
+ligature_path = "/dev/serial/by-id/ligature"
+monospace_path = "/dev/serial/by-id/monospace"
+"#;
+
+#[test]
+fn version_1_profile_is_rejected_with_odrive_migration_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, VERSION_1_PROFILE).unwrap();
+
+    let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
+
+    assert!(matches!(error, StartupError::ProfileVersionRetired { .. }));
+    let message = error.to_string();
+    assert!(message.contains(&profile_path.display().to_string()));
+    assert!(message.contains("boards.ligature_path"), "{message}");
+    assert!(message.contains("[odrive]"), "{message}");
+    assert!(message.contains("template"), "{message}");
+}
+
+const LIFT_AXIS_TABLE: &str = r#"
+[odrive.lift_axis]
+direction = "reversed"
+mm_per_turn = 8.0
+travel_minimum_mm = 0.0
+travel_maximum_mm = 300.0
+current_limit_a = 4.8
+velocity_limit_mm_s = 8.0
+acceleration_limit_mm_s2 = 8.0
+deceleration_limit_mm_s2 = 4.0
+"#;
+
+#[test]
+fn saved_commissioned_profile_round_trips_its_lift_axis_table() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, format!("{VALID_PROFILE}{LIFT_AXIS_TABLE}")).unwrap();
+    let prepared = prepare_machine_profile(Some(&profile_path)).unwrap();
+
+    prepared.profile().save(&profile_path).unwrap();
+
+    let reloaded = prepare_machine_profile(Some(&profile_path)).unwrap();
+    assert_eq!(
+        reloaded.profile().odrive.lift_axis,
+        prepared.profile().odrive.lift_axis
+    );
+}
+
+#[test]
+fn complete_lift_axis_table_prepares_as_commissioned() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(&profile_path, format!("{VALID_PROFILE}{LIFT_AXIS_TABLE}")).unwrap();
+
+    let prepared = prepare_machine_profile(Some(&profile_path)).unwrap();
+
+    let lift_axis = prepared.profile().odrive.lift_axis.as_ref().unwrap();
+    assert_eq!(lift_axis.direction, sans_core::LiftDirection::Reversed);
+    assert_eq!(lift_axis.mm_per_turn, 8.0);
+    assert_eq!(lift_axis.current_limit_a, 4.8);
+}
+
+#[test]
+fn lift_axis_limits_above_software_policy_caps_are_reported() {
+    let cases = [
+        (
+            "current_limit_a = 4.8",
+            "current_limit_a = 4.81",
+            "odrive.lift_axis.current_limit_a exceeds the 4.8 A software policy cap",
+        ),
+        (
+            "current_limit_a = 4.8",
+            "current_limit_a = 0.0",
+            "odrive.lift_axis.current_limit_a must be positive and finite",
+        ),
+        (
+            "velocity_limit_mm_s = 8.0",
+            "velocity_limit_mm_s = 8.1",
+            "odrive.lift_axis.velocity_limit_mm_s exceeds the 1 motor turn per second software policy cap",
+        ),
+        (
+            "acceleration_limit_mm_s2 = 8.0",
+            "acceleration_limit_mm_s2 = 8.1",
+            "odrive.lift_axis.acceleration_limit_mm_s2 exceeds the 1 motor turn per second squared software policy cap",
+        ),
+        (
+            "deceleration_limit_mm_s2 = 4.0",
+            "deceleration_limit_mm_s2 = 8.1",
+            "odrive.lift_axis.deceleration_limit_mm_s2 exceeds the 1 motor turn per second squared software policy cap",
+        ),
+        (
+            "travel_maximum_mm = 300.0",
+            "travel_maximum_mm = -1.0",
+            "odrive.lift_axis travel bounds must be finite and ordered",
+        ),
+        (
+            "mm_per_turn = 8.0",
+            "mm_per_turn = 0.0",
+            "odrive.lift_axis.mm_per_turn must be positive and finite",
+        ),
+        (
+            "direction = \"reversed\"",
+            "direction = \"sideways\"",
+            "direction",
+        ),
+        (
+            "deceleration_limit_mm_s2 = 4.0\n",
+            "",
+            "deceleration_limit_mm_s2",
+        ),
+    ];
+
+    for (index, (from, to, expected)) in cases.iter().copied().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join(format!("lift-axis-{index}.toml"));
+        let table = LIFT_AXIS_TABLE.replacen(from, to, 1);
+        assert_ne!(table, LIFT_AXIS_TABLE, "invalid test replacement: {from}");
+        fs::write(&profile_path, format!("{VALID_PROFILE}{table}")).unwrap();
+
+        let message = prepare_machine_profile(Some(&profile_path))
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains(&profile_path.display().to_string()));
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
 }

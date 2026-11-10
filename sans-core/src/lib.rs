@@ -16,9 +16,11 @@ pub use crate::camera::{
 };
 pub use crate::config::{
     prepare_machine_profile, resolve_machine_profile_path, BoardProfile, CameraProfiles,
-    CameraRoleProfile, CropGeometry, MachineProfile, MotionProfile, PageWidthProfile,
-    PickupProfile, PreparedMachineProfile, ProfileSaveError, StartupError, TimeoutProfile,
-    MACHINE_PROFILE_TEMPLATE,
+    CameraRoleProfile, CropGeometry, LiftAxisProfile, LiftDirection, MachineProfile, MotionProfile,
+    MotorLimits, OdriveProfile, PageWidthProfile, PickupProfile, PreparedMachineProfile,
+    ProfileSaveError, StartupError, TimeoutProfile, MACHINE_PROFILE_SCHEMA_VERSION,
+    MACHINE_PROFILE_TEMPLATE, ODRIVE_ACCELERATION_CAP_TURNS_PER_S2, ODRIVE_CURRENT_LIMIT_CAP_A,
+    ODRIVE_VELOCITY_CAP_TURNS_PER_S,
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,

@@ -33,6 +33,8 @@ Use `cargo run -p sans -- --config /path/to/sans.toml` for an explicit developme
 
 On first start, Sans writes the parseable [sans.example.toml](sans.example.toml) template to the selected path and opens a fatal screen naming that path. Close Sans, fill every `<...>` placeholder, commission both zero page-width bounds, then restart. A relative `data_root` is resolved against the profile location and must be writable.
 
+The profile is schema version 2. A version 1 profile is rejected at startup: remove `boards.ligature_path`, add the `[odrive]` section and set `schema_version = 2`. Move the old file aside and restart Sans to compare against a freshly generated template. There is no rewrite tool, because the new values do not exist in a version 1 file.
+
 The active production workspace contains `sans-app/` and `sans-core/`. The old HTTP server, worker, remote CLI, shared-types crate, and processing stubs are not production workspace members.
 
 ## Run on a Raspberry Pi over SSH
@@ -64,6 +66,8 @@ Use the command only during supervised hardware testing. Stop any other Sans ins
 ## Machine profile limits
 
 The profile is a complete, versioned commissioning file; the scan workflow never edits it. Protocol baud rates and the 3840×2160 MJPEG camera profile stay fixed in code. Structural validation rejects unstable Camera identities, invalid crops or rotations, nonpositive or unordered fields, and commissioned actuation values above the resolved Issue #15 starting anchors. Those 50% Touchdown-press and seven Lift-percentage values are immutable software maxima; profile edits may only lower them. The separately decided Stop-terminal deadline has an immutable 500 ms maximum, and profiles may lower it. Saves are direct truncating complete-file writes and report errors; they make no atomic replacement or storage-synchronization claim.
+
+The `[odrive]` section names the lift-axis board by USB serial and its commissioned API fingerprint. Its polling interval, telemetry age and request deadlines are provisional, unmeasured values inside immutable bounds in code. The optional `[odrive.lift_axis]` table holds the mechanism values; while it is absent the lift axis stays blocked and Sans substitutes no default. Commissioned limits are bounded by software policy caps of 4.8 A, 1 motor turn per second, and 1 motor turn per second squared for acceleration and deceleration. **These caps are arbitrary conservative host policy, not physical safety qualification.** They are not derived from the mechanism or measured; the 4.8 A figure only matches the current limit observed on the board on 2026-11-10. #60 reviews all three. The caps are in motor units, so a wrong `mm_per_turn` cannot raise motor speed or current. Production scanning stays disabled whatever the profile says.
 
 ## Direct diagnostics
 
