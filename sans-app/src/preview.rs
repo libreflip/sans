@@ -229,6 +229,7 @@ fn render_full_page(
 ) {
     ui.vertical_centered(|ui| {
         ui.label(format!("{role} Full-page"));
+        ui.label(egui::RichText::new(crop_caption(frame)).small().weak());
         let image = frame.full_page_preview();
         let layout = full_page_layout(area, image);
         let (rect, response) = ui.allocate_exact_size(layout.draw_size, egui::Sense::hover());
@@ -242,6 +243,19 @@ fn render_full_page(
         ui.painter()
             .image(texture.id(), rect, layout.uv, egui::Color32::WHITE);
     });
+}
+
+/// Say whether the Full-page preview is the whole post-rotation frame or a commissioned crop.
+fn crop_caption(frame: &CapturedFrame) -> String {
+    let crop = frame.crop;
+    if crop.x == 0 && crop.y == 0 && crop.width == frame.width && crop.height == frame.height {
+        format!("Full frame, {}x{} px", frame.width, frame.height)
+    } else {
+        format!(
+            "Crop {}x{} px of {}x{} px frame",
+            crop.width, crop.height, frame.width, frame.height
+        )
+    }
 }
 
 fn render_detail(

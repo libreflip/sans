@@ -2,7 +2,10 @@
 
 mod support;
 
-use support::fixtures::portrait_full_frame;
+use support::fixtures::{
+    clamped_crop, landscape_full_frame, landscape_smaller_crop, portrait_full_frame,
+    portrait_smaller_crop, rotated_crop,
+};
 use support::session::{Session, T0, T1};
 
 const VIEWS: [&str; 8] = [
@@ -40,4 +43,33 @@ fn full_page_previews_grow_with_the_available_height() {
     let (t0, t1) = (height_at(T0), height_at(T1));
 
     assert!(t0 > t1, "Full-page preview is {t0} at T0 and {t1} at T1");
+}
+
+#[test]
+fn captions_say_full_frame_or_crop_with_dimensions() {
+    let cases = [
+        (portrait_full_frame(), "Full frame, 360x640 px"),
+        (landscape_full_frame(), "Full frame, 640x360 px"),
+        (
+            portrait_smaller_crop(),
+            "Crop 301x521 px of 400x700 px frame",
+        ),
+        (
+            landscape_smaller_crop(),
+            "Crop 523x297 px of 700x400 px frame",
+        ),
+        (rotated_crop(), "Crop 311x547 px of 360x640 px frame"),
+        (clamped_crop(), "Crop 319x557 px of 360x640 px frame"),
+    ];
+    for (pair, caption) in cases {
+        let session = Session::with_pair(pair, T1);
+
+        let shown = session
+            .labelled_rects()
+            .into_iter()
+            .filter(|(label, rect)| label == caption && session.contains(session.body(), *rect))
+            .count();
+
+        assert_eq!(shown, 2, "{caption:?} under both Full-page labels");
+    }
 }
