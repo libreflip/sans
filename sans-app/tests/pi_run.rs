@@ -23,6 +23,10 @@ const RECORDED_ENV: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_RUNTIME_DIR",
     "SANS_TEST_VALUE",
+    "HOME",
+    "count",
+    "app",
+    "socket",
 ];
 
 /// An isolated developer checkout, fake tool directory, and fake Pi.
@@ -34,6 +38,11 @@ struct Harness {
     remote_env: Vec<(String, String)>,
     /// Number of upload bytes the fake connection delivers before EOF.
     truncate_upload: Option<usize>,
+    /// Exit status of a fake upload connection that fails before running
+    /// anything remotely.
+    upload_ssh_status: Option<i32>,
+    /// Whether a successful fake `cross` writes the built binary.
+    cross_writes_binary: bool,
     /// Bytes the fake `cross` writes as the built `sans` binary.
     built_binary: Vec<u8>,
 }
@@ -46,6 +55,8 @@ impl Harness {
             cross_status: Some(0),
             remote_env: Vec::new(),
             truncate_upload: None,
+            upload_ssh_status: None,
+            cross_writes_binary: true,
             built_binary: fake_app(0),
         };
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/pi-run");
@@ -146,6 +157,10 @@ impl Harness {
         for (name, value) in &self.remote_env {
             remote_env.push_str(&format!(" {}", sh_quote(&format!("{name}={value}"))));
         }
+        let upload_failure = match self.upload_ssh_status {
+            Some(status) => format!("exit {status}"),
+            None => ":".to_owned(),
+        };
         let upload_filter = match self.truncate_upload {
             Some(bytes) => format!("head -c {bytes}"),
             None => "cat".to_owned(),
@@ -163,6 +178,7 @@ while [ $# -gt 0 ]; do
         --) shift; break ;;
         -T) tty=none ;;
         -tt) tty=forced ;;
+        -x) ;;
         *) echo "fake ssh: unexpected argument $1" >&2; exit 255 ;;
     esac
     shift
@@ -170,6 +186,7 @@ done
 [ "$1" = {host} ] || {{ echo "fake ssh: unexpected host $1" >&2; exit 255; }}
 shift
 if [ "$tty" = none ]; then
+    {upload_failure}
     {upload_filter} | env -i {remote_env} sh -c "$*"
 else
     env -i {remote_env} sh -c "$*"
@@ -194,9 +211,11 @@ printf '%s\0' "$@" > {log}/cross.argv
 pwd -P > {log}/cross.cwd
 [ {status} -eq 0 ] || exit {status}
 target=${{CARGO_TARGET_DIR:-target}}
+{writes} || exit 0
 mkdir -p "$target/aarch64-unknown-linux-gnu/release"
 cp {built} "$target/aarch64-unknown-linux-gnu/release/sans"
 "#,
+                        writes = self.cross_writes_binary,
                         log = sh_quote(log.to_str().unwrap()),
                         built = sh_quote(built.to_str().unwrap()),
                     ),
@@ -221,20 +240,30 @@ cp {built} "$target/aarch64-unknown-linux-gnu/release/sans"
     }
 
     fn app_argv(&self) -> Option<Vec<String>> {
-        let argv = fs::read(self.home().join("app.argv")).ok()?;
-        Some(split_nul(&argv))
+        app_argv_in(&self.home())
     }
 
-    /// Recorded application environment; unset variables map to `None`.
     fn app_env(&self) -> BTreeMap<String, Option<String>> {
-        split_nul(&fs::read(self.home().join("app.env")).unwrap())
-            .into_iter()
-            .map(|entry| match entry.split_once('=') {
-                Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
-                None => (entry, None),
-            })
-            .collect()
+        app_env_in(&self.home())
     }
+}
+
+/// Argv recorded by the fake app running with `HOME` set to `home`.
+fn app_argv_in(home: &Path) -> Option<Vec<String>> {
+    let argv = fs::read(home.join("app.argv")).ok()?;
+    Some(split_nul(&argv))
+}
+
+/// Environment recorded by the fake app running with `HOME` set to `home`;
+/// unset variables map to `None`.
+fn app_env_in(home: &Path) -> BTreeMap<String, Option<String>> {
+    split_nul(&fs::read(home.join("app.env")).unwrap())
+        .into_iter()
+        .map(|entry| match entry.split_once('=') {
+            Some((name, value)) => (name.to_owned(), Some(value.to_owned())),
+            None => (entry, None),
+        })
+        .collect()
 }
 
 /// A shell script standing in for the aarch64 `sans` binary. It records its
@@ -289,6 +318,7 @@ fn rejects_invalid_usage_before_calling_tools() {
         &["--env", "1BAD=x", HOST],
         &["--env", "BAD-NAME=x", HOST],
         &["--env", "=x", HOST],
+        &["--binary", "", HOST],
         &[HOST, "extra"],
         &["--", HOST],
     ];
@@ -436,7 +466,7 @@ fn upload_atomically_replaces_development_binary_byte_for_byte() {
     assert_eq!(fs::read(&old_link).unwrap(), b"previous sans-dev");
     assert_eq!(bin_dir_entries(&harness), ["old-link", "sans-dev"]);
     let upload = &harness.ssh_calls()[0];
-    assert_eq!(upload[..3], ["-T", "--", HOST]);
+    assert_eq!(upload[..4], ["-T", "-x", "--", HOST]);
 }
 
 #[test]
@@ -484,7 +514,7 @@ fn runs_development_binary_with_forced_tty_and_remote_machine_profile() {
     assert!(!local_config.exists());
     let calls = harness.ssh_calls();
     assert_eq!(calls.len(), 2);
-    assert_eq!(calls[1][..3], ["-tt", "--", HOST]);
+    assert_eq!(calls[1][..4], ["-tt", "-x", "--", HOST]);
 }
 
 #[test]
@@ -644,4 +674,68 @@ fn explicit_runtime_dir_is_applied_before_wayland_detection() {
         harness.app_env()["WAYLAND_DISPLAY"].as_deref(),
         Some("wayland-0")
     );
+}
+
+#[test]
+fn environment_values_cannot_redirect_the_runner() {
+    let harness = Harness::new().with_wayland_socket("wayland-1");
+    let other_home = harness.root.path().join("other-home");
+    fs::create_dir_all(&other_home).unwrap();
+    let home = format!("HOME={}", other_home.display());
+    let cli = [
+        "--env",
+        "count=100",
+        "--env",
+        "app=/bin/false",
+        "--env",
+        "socket=wayland-9",
+        "--env",
+        &home,
+        HOST,
+        "--",
+        "first",
+        "second",
+    ];
+
+    let output = harness.run(&cli);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(app_argv_in(&other_home).unwrap(), ["first", "second"]);
+    let env = app_env_in(&other_home);
+    assert_eq!(env["count"].as_deref(), Some("100"));
+    assert_eq!(env["app"].as_deref(), Some("/bin/false"));
+    assert_eq!(env["socket"].as_deref(), Some("wayland-9"));
+    assert_eq!(env["HOME"].as_deref(), other_home.to_str());
+    assert_eq!(env["WAYLAND_DISPLAY"].as_deref(), Some("wayland-1"));
+}
+
+#[test]
+fn build_without_output_fails_before_ssh() {
+    let mut harness = Harness::with_desktop();
+    harness.cross_writes_binary = false;
+
+    let output = harness.run(&[HOST]);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("did not produce"));
+    assert!(harness.ssh_calls().is_empty());
+}
+
+#[test]
+fn failed_upload_connection_keeps_previous_binary_and_skips_run() {
+    let mut harness = Harness::with_desktop();
+    harness.upload_ssh_status = Some(255);
+    fs::create_dir_all(harness.home().join(".local/bin")).unwrap();
+    fs::write(harness.remote_binary(), b"previous sans-dev").unwrap();
+
+    let output = harness.run(&[HOST]);
+
+    assert_eq!(output.status.code(), Some(255));
+    assert!(stderr(&output).contains("upload failed"));
+    assert_eq!(
+        fs::read(harness.remote_binary()).unwrap(),
+        b"previous sans-dev"
+    );
+    assert_eq!(harness.ssh_calls().len(), 1);
+    assert!(harness.app_argv().is_none());
 }

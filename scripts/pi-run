@@ -40,7 +40,7 @@ while [ $# -gt 0 ]; do
             exit 0
             ;;
         --binary)
-            [ $# -ge 2 ] || usage_error "--binary needs a path"
+            [ $# -ge 2 ] && [ -n "$2" ] || usage_error "--binary needs a path"
             binary=$2
             shift 2
             ;;
@@ -155,37 +155,42 @@ chmod 755 "$tmp"
 mv -f "$tmp" "$dir/sans-dev"'
 
 progress "uploading $binary ($size bytes) to $host:~/.local/bin/sans-dev"
-ssh -T -- "$host" "$(remote_command "$UPLOAD_SNIPPET" "$size")" <"$binary" ||
+ssh -T -x -- "$host" "$(remote_command "$UPLOAD_SNIPPET" "$size")" <"$binary" ||
     fail "$?" "upload failed; any previous sans-dev is unchanged"
 
-# Positional parameters: the --env count, the NAME=VALUE entries, then the
-# Sans arguments.
+# The remote login shell expands $HOME to locate sans-dev before `env`
+# applies the --env values, so they cannot move the executable. The snippet
+# receives that path as $1 and keeps no variables of its own: detection runs
+# in a command substitution, and everything else is "$@".
 readonly RUN_SNIPPET='set -eu
-count=$1
-shift
-while [ "$count" -gt 0 ]; do
-    export "$1"
-    shift
-    count=$((count - 1))
-done
 if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    WAYLAND_DISPLAY=$(
+        [ -n "${XDG_RUNTIME_DIR:-}" ] || exit 0
         for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
-            case $socket in *.lock) continue ;; esac
-            if [ -S "$socket" ]; then
-                WAYLAND_DISPLAY=${socket##*/}
-                export WAYLAND_DISPLAY
+            if [ "${socket%.lock}" = "$socket" ] && [ -S "$socket" ]; then
+                printf "%s" "${socket##*/}"
                 break
             fi
         done
-    fi
-    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    )
+    if [ -z "$WAYLAND_DISPLAY" ]; then
         echo "pi-run: no DISPLAY or WAYLAND_DISPLAY in the remote session and no wayland-* socket in XDG_RUNTIME_DIR (${XDG_RUNTIME_DIR:-unset})." >&2
         echo "pi-run: log in to the Pi desktop as this SSH user, or pass --env WAYLAND_DISPLAY=wayland-0 (with --env XDG_RUNTIME_DIR=/run/user/<uid> if unset) or --env DISPLAY=:0." >&2
         exit 1
     fi
+    export WAYLAND_DISPLAY
 fi
-exec "$HOME/.local/bin/sans-dev" "$@"'
+exec "$@"'
+
+run_command="env --"
+for pair in ${envs[@]+"${envs[@]}"}; do
+    run_command="$run_command $(sh_quote "$pair")"
+done
+run_command="$run_command $(remote_command "$RUN_SNIPPET")"
+run_command="$run_command \"\$HOME/.local/bin/sans-dev\""
+for word in "$@"; do
+    run_command="$run_command $(sh_quote "$word")"
+done
 
 progress "running sans-dev on $host (Ctrl-C ends the SSH session)"
-exec ssh -tt -- "$host" "$(remote_command "$RUN_SNIPPET" "${#envs[@]}" ${envs[@]+"${envs[@]}"} "$@")"
+exec ssh -tt -x -- "$host" "$run_command"
