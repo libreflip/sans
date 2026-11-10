@@ -51,8 +51,8 @@ pub enum LineKind {
     Err(String),
     /// Unsolicited `PRESS <mbar>` line during streaming
     Telemetry(f32),
-    /// Unsolicited `EVENT ...` line — carries the text after `EVENT `
-    /// (e.g. `BUTTON PRESSED`, §10). Like telemetry, never a command reply.
+    /// Unsolicited `EVENT ...` line carrying a classified `EventKind`.
+    /// `Unknown` retains the text after `EVENT `. Never a command reply.
     Event(EventKind),
     /// Anything that doesn't match one of the above shapes
     Malformed(String),

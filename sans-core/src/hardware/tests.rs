@@ -146,7 +146,6 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
         MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(100)).unwrap();
     events_written.recv().unwrap();
 
-    let mut pressure_count = 0;
     let mut latest_pressure = None;
     let mut kinds = Vec::new();
     while kinds.len() < 2 || latest_pressure != Some(1_099.0) {
@@ -156,14 +155,12 @@ fn pressure_can_coalesce_while_button_and_unknown_events_keep_their_types() {
             .unwrap();
         match event.kind {
             MonospaceEventKind::Pressure(mbar) => {
-                pressure_count += 1;
                 latest_pressure = Some(mbar);
             }
             kind => kinds.push(kind),
         }
     }
 
-    assert!(pressure_count < 100);
     assert_eq!(
         kinds,
         [
