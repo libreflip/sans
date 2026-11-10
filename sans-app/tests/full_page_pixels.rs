@@ -5,7 +5,8 @@ mod support;
 use image::RgbaImage;
 use sans_core::CameraRole;
 use support::fixtures::{
-    landscape_full_frame, palette, portrait_full_frame, Fixture, Marker, BAND, FORBIDDEN,
+    clamped_crop, landscape_full_frame, landscape_smaller_crop, palette, portrait_full_frame,
+    portrait_smaller_crop, rotated_crop, Fixture, Marker, BAND, FORBIDDEN,
 };
 use support::pixels::{count, find, renderer, PixelBox};
 use support::session::{Session, Viewport, T1, T3};
@@ -124,4 +125,24 @@ fn landscape_full_frame_shows_all_four_edges_of_both_cameras() {
     for viewport in [T1, T3] {
         prove_full_page("landscape full frame", landscape_full_frame(), viewport);
     }
+}
+
+#[test]
+fn smaller_portrait_crop_shows_exactly_that_rectangle() {
+    prove_full_page("portrait smaller crop", portrait_smaller_crop(), T1);
+}
+
+#[test]
+fn smaller_landscape_crop_shows_exactly_that_rectangle() {
+    prove_full_page("landscape smaller crop", landscape_smaller_crop(), T1);
+}
+
+#[test]
+fn crop_after_a_quarter_turn_shows_exactly_that_rectangle() {
+    prove_full_page("rotated crop", rotated_crop(), T1);
+}
+
+#[test]
+fn crop_past_the_frame_shows_the_clamped_rectangle() {
+    prove_full_page("clamped crop", clamped_crop(), T1);
 }
