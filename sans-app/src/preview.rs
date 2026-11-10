@@ -11,11 +11,14 @@ use sans_core::{
 
 use crate::screen::{self, Header};
 
-const FULL_PAGE_MAX_HEIGHT: f32 = 360.0;
+/// Smallest Full-page height before the body scrolls instead.
+const FULL_PAGE_MIN_HEIGHT: f32 = 240.0;
 /// Largest side of a 100% tile.
 const DETAIL_MAX_SIDE: f32 = 220.0;
 /// Gap between the Full-page row and the 100% row.
 const ROW_GAP: f32 = 8.0;
+/// Room for rounding so a composition that fits never overflows by a fraction.
+const LAYOUT_SLACK: f32 = 2.0;
 
 pub(crate) struct PreviewTextures {
     pair: Arc<CapturePair>,
@@ -162,10 +165,24 @@ fn show_capture_action(
 }
 
 /// Lay out both Full-page previews over both 100% previews.
-fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures, _viewport_height: f32) {
-    let column_width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+///
+/// The Full-page previews take whatever height the body viewport has left
+/// after the content above them, their labels and captions, and the 100% row,
+/// down to [`FULL_PAGE_MIN_HEIGHT`]. Below that floor the body scrolls instead.
+fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures, viewport_height: f32) {
+    let spacing = ui.spacing().item_spacing;
+    let column_width = (ui.available_width() - spacing.x) / 2.0;
     let detail_side = column_width.min(DETAIL_MAX_SIDE);
-    let full_page_height = FULL_PAGE_MAX_HEIGHT;
+    let label_height = ui.text_style_height(&egui::TextStyle::Body);
+    let caption_height = ui.text_style_height(&egui::TextStyle::Small);
+    let used_above = ui.cursor().top() - ui.min_rect().top();
+    let fixed_rows = 2.0 * label_height
+        + caption_height
+        + 4.0 * spacing.y
+        + ROW_GAP
+        + detail_side
+        + LAYOUT_SLACK;
+    let full_page_height = (viewport_height - used_above - fixed_rows).max(FULL_PAGE_MIN_HEIGHT);
     let full_page_area = egui::vec2(column_width, full_page_height);
 
     ui.columns(2, |columns| {

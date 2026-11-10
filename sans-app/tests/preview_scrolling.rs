@@ -107,16 +107,24 @@ fn pointer_drag_with_touch_events_brings_every_view_into_the_body() {
     }
 }
 
-/// Drag upward from the visible centre of `start_on` and report how far the body moved.
-fn drag_distance_from(session: &mut Session, start_on: egui::Rect) -> f32 {
-    let visible = start_on.intersect(session.body());
-    let from = visible.center();
+/// Drag 80 points upward from the visible centre of `start_on` and assert the body followed.
+///
+/// The body must move by 40 points, or by all the room it had left if that is less.
+fn assert_drag_scrolls(session: &mut Session, start_on: egui::Rect, what: &str) {
+    let from = start_on.intersect(session.body()).center();
     let probe = "Left 100%";
     let before = session.rect(probe).top();
 
     session.drag(from, from - egui::vec2(0.0, 80.0), false);
+    let moved = before - session.rect(probe).top();
+    session.wheel(100_000.0);
+    let room = before - session.rect(probe).top();
 
-    before - session.rect(probe).top()
+    assert!(
+        room > 5.0 && moved >= room.min(40.0) - 0.5,
+        "a drag starting on {what} moved the body {moved} of {room} points at {}",
+        session.viewport.name
+    );
 }
 
 #[test]
@@ -135,13 +143,7 @@ fn drags_that_start_on_images_or_text_scroll_the_body() {
             }
             let rect = session.rect(start_on);
 
-            let moved = drag_distance_from(&mut session, rect);
-
-            assert!(
-                moved > 40.0,
-                "a drag starting on {start_on} moved the body {moved} points at {}",
-                viewport.name
-            );
+            assert_drag_scrolls(&mut session, rect, start_on);
         }
     }
 }
@@ -161,13 +163,7 @@ fn a_drag_that_starts_on_blocked_reason_text_scrolls_the_body() {
         session.wait_for_label("Retry Capture");
         let reason_text = session.rect_containing("fixture timeout");
 
-        let moved = drag_distance_from(&mut session, reason_text);
-
-        assert!(
-            moved > 40.0,
-            "a drag starting on the blocked reason moved the body {moved} points at {}",
-            viewport.name
-        );
+        assert_drag_scrolls(&mut session, reason_text, "the blocked reason");
     }
 }
 
