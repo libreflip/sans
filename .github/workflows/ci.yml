@@ -57,7 +57,7 @@ jobs:
           rustflags: ""
 
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libv4l-dev mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install --yes libv4l-dev libvulkan1 mesa-vulkan-drivers
 
       - name: Test workspace
         env:

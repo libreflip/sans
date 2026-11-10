@@ -15,7 +15,7 @@ cargo test --workspace
 
 The repository pins Rust 1.98.0 in `rust-toolchain.toml`.
 
-The `sans` tests include rendered-pixel proofs that the previews keep every edge of the crop and stay one-to-one at 100%. They render through wgpu and need an adapter: Metal on macOS, or Mesa's lavapipe Vulkan driver on Linux (`sudo apt-get install mesa-vulkan-drivers`). Without an adapter each proof prints a `SKIPPED pixel proof` notice and passes. Set `SANS_REQUIRE_PIXEL_PROOF=1` to make a missing adapter fail instead, as CI does:
+The `sans` tests include rendered-pixel proofs that the previews keep every edge of the crop and stay one-to-one at 100%. They render through wgpu and need an adapter: Metal on macOS, or Mesa's lavapipe Vulkan driver on Linux (`sudo apt-get install libvulkan1 mesa-vulkan-drivers`). Without an adapter each proof prints a `SKIPPED pixel proof` notice and passes. Set `SANS_REQUIRE_PIXEL_PROOF=1` to make a missing adapter fail instead, as CI does:
 
 ```sh
 SANS_REQUIRE_PIXEL_PROOF=1 cargo test -p sans
