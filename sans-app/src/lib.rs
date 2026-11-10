@@ -4,6 +4,7 @@
 //! owns the application, its screens, and the startup window request so tests
 //! can drive the same application headlessly.
 
+mod lift_axis;
 mod preview;
 mod screen;
 
@@ -12,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use sans_core::{
-    CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, MachineScreen, SetupState,
-    StartupError,
+    CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, LinkPhase, MachineScreen,
+    SetupState, StartupError,
 };
 
+use crate::lift_axis::{reconnect_action, show_lift_axis};
 use crate::preview::{show_capture_preview, sync_preview_textures, PreviewTextures};
 use crate::screen::Header;
 
@@ -169,6 +171,22 @@ fn show_controller(
         // Keep draining snapshots so live connection faults reach the screen.
         context.request_repaint_after(Duration::from_millis(16));
     }
+    // The lift-axis status changes without operator input on every screen.
+    let lift_axis = snapshot.map(|snapshot| &snapshot.lift_axis);
+    if lift_axis.is_some_and(|status| status.phase == LinkPhase::Connecting) {
+        context.request_repaint_after(Duration::from_millis(100));
+    } else if lift_axis.is_some_and(|status| status.telemetry.is_some()) {
+        context.request_repaint_after(Duration::from_millis(250));
+    }
+    // Shown on the Setup screens only: the four preview views must fit and
+    // scroll as they are.
+    let show_lift = |ui: &mut egui::Ui| {
+        if let Some(snapshot) = snapshot {
+            ui.add_space(12.0);
+            show_lift_axis(ui, &snapshot.lift_axis, &snapshot.scan_readiness);
+        }
+    };
+    let mut closed = false;
     let mut exit = |ui: &mut egui::Ui| show_exit_action(ui, context, handle, exit_requested_at);
 
     match screen {
@@ -184,18 +202,24 @@ fn show_controller(
             screen::show(
                 ui,
                 Header::new("Setup blocked", egui::Color32::YELLOW),
-                exit,
+                |ui| {
+                    closed = reconnect_action(ui, handle).is_err();
+                    exit(ui);
+                },
                 |ui, _| {
                     ui.label("Scanning is disabled. Non-actuating diagnostics remain available.");
                     ui.add_space(12.0);
                     for reason in reasons {
                         ui.label(format!("• {}", reason.summary));
                     }
+                    show_lift(ui);
                 },
             );
+            if closed {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         Some(MachineScreen::Setup(SetupState::Ready { diagnostics })) => {
-            let mut closed = false;
             screen::show(
                 ui,
                 Header::new("Machine ready", egui::Color32::LIGHT_GREEN),
@@ -204,12 +228,14 @@ fn show_controller(
                         closed = handle.send(ControllerIntent::CapturePair).is_err();
                         context.request_repaint_after(Duration::from_millis(16));
                     }
+                    closed |= reconnect_action(ui, handle).is_err();
                     exit(ui);
                 },
                 |ui, _| {
                     for diagnostic in diagnostics {
                         ui.label(format!("{}: {}", diagnostic.component, diagnostic.summary));
                     }
+                    show_lift(ui);
                 },
             );
             if closed {

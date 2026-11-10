@@ -69,6 +69,18 @@ The profile is a complete, versioned commissioning file; the scan workflow never
 
 The `[odrive]` section names the lift-axis board by USB serial and its commissioned API fingerprint. Its polling interval, telemetry age and request deadlines are provisional, unmeasured values inside immutable bounds in code. The optional `[odrive.lift_axis]` table holds the mechanism values; while it is absent the lift axis stays blocked and Sans substitutes no default. Commissioned limits are bounded by software policy caps of 4.8 A, 1 motor turn per second, and 1 motor turn per second squared for acceleration and deceleration. **These caps are arbitrary conservative host policy, not physical safety qualification.** They are not derived from the mechanism or measured; the 4.8 A figure only matches the current limit observed on the board on 2026-11-10. #60 reviews all three. The caps are in motor units, so a wrong `mm_per_turn` cannot raise motor speed or current. Production scanning stays disabled whatever the profile says.
 
+## ODrive lift axis
+
+Sans talks to the MKS ODrive Mini over its native Fibre USB vendor interface (interface 2, bulk `0x03`/`0x83`) and leaves the CDC serial interfaces to the kernel. On each connection it identifies the board by USB serial, checks the endpoint descriptor and API fingerprint against the profile, commands the axis idle, and writes and reads back the commissioned limits. It never saves, erases, reboots or flashes the board, and never changes its control or input mode. Reconnection happens only from the touchscreen's reconnect button. The lift-axis panel shows the discovered identity, descriptor CRC and API fingerprint for commissioning notes.
+
+The Pi user running Sans needs access to the USB device. A udev rule such as the following, in `/etc/udev/rules.d/70-odrive.rules`, grants it to the `plugdev` group:
+
+```text
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0d32", MODE="0660", GROUP="plugdev"
+```
+
+Automated tests run the link against a fake Fibre device served from the captured schema. They show host behaviour against upstream `fw-v0.5.1` semantics, not what the vendor build does on real hardware; the first supervised board run belongs to #60.
+
 ## Direct diagnostics
 
 `sans-core` retains `hw_diag` and the Linux V4L2 `camcal` binary. Run them only during supervised hardware work while the `sans` application is stopped; they open devices directly, and `hw_diag` can energize relays.

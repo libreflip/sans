@@ -303,6 +303,12 @@ impl TelemetrySample {
         now.saturating_duration_since(self.taken_at)
     }
 
+    /// The values regardless of age, for presentation beside an explicit
+    /// freshness flag. Not public, so consumers cannot use stale values as evidence.
+    pub(crate) fn display_values(&self) -> &TelemetryValues {
+        &self.values
+    }
+
     /// The values, or `None` once older than the profile's maximum age.
     pub fn fresh_values(&self, now: Instant) -> Option<&TelemetryValues> {
         (self.age(now) <= self.max_age).then_some(&self.values)

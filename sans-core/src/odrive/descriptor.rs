@@ -427,7 +427,8 @@ pub(crate) fn check_capabilities(
             continue;
         }
         if let Some(access) = access {
-            let granted = entry.get("access").and_then(Value::as_str).unwrap_or("");
+            // `remote_object.py` `RemoteProperty`: `json_data.get("access", "r")`.
+            let granted = entry.get("access").and_then(Value::as_str).unwrap_or("r");
             if !access.satisfied_by(granted) {
                 problems.push(format!(
                     "endpoint {path} has access {granted}, Sans needs {}",
@@ -436,13 +437,13 @@ pub(crate) fn check_capabilities(
                 continue;
             }
         } else {
-            let no_arguments = |key: &str| {
-                entry
-                    .get(key)
-                    .and_then(Value::as_array)
-                    .is_some_and(Vec::is_empty)
+            // `remote_object.py` `RemoteFunction`: `arguments` (deprecated) or
+            // `inputs`, and `outputs`; an absent list is empty.
+            let no_arguments = |key: &str| match entry.get(key) {
+                None => true,
+                Some(list) => list.as_array().is_some_and(Vec::is_empty),
             };
-            if !(no_arguments("inputs") && no_arguments("outputs")) {
+            if !(no_arguments("arguments") && no_arguments("inputs") && no_arguments("outputs")) {
                 problems.push(format!(
                     "function {path} must have no inputs and no outputs"
                 ));

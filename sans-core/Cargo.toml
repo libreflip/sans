@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 csv = "1"
 chrono = "0.4"
 sha2 = "0.11"
+nusb = "0.2.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rscam = "0.5"

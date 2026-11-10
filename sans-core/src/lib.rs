@@ -25,8 +25,8 @@ pub use crate::config::{
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker,
-    SetupDiagnostic, SetupState,
+    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineFactory, MachineScreen,
+    ScanReadiness, SetupBlocker, SetupDiagnostic, SetupState, TelemetrySummary,
 };
 pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
@@ -34,7 +34,8 @@ pub use crate::hardware::{
     MONOSPACE_BAUD_RATE,
 };
 pub use crate::odrive::{
-    AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener, LinkCommand,
-    LinkConfig, LinkEngine, LinkEvent, LinkPhase, LinkStatus, OpenRequest, PacketReader,
-    PacketWriter, Priority, TelemetrySample, TelemetryValues, Ticket, Transmit,
+    spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,
+    LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkHandle, LinkPhase, LinkRunner, LinkStatus,
+    OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample, TelemetryValues, Ticket,
+    Transmit, UsbFibreOpener, ODRIVE_USB_PRODUCT_ID, ODRIVE_USB_VENDOR_ID,
 };

@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use sans_core::{
-    CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, MachineFactory,
-    PreparedMachineProfile, RoleCamera, SetupBlocker, SetupDiagnostic,
+    CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, FibreConnection,
+    FibreOpener, MachineFactory, OpenRequest, PreparedMachineProfile, RoleCamera, SetupBlocker,
+    SetupDiagnostic,
 };
 
 /// What one camera does on one capture call. The last step repeats.
@@ -141,8 +142,21 @@ impl FixtureFactory {
     }
 }
 
+/// These fixtures have no lift axis: every open reports no ODrive attached.
+struct NoOdrive;
+
+impl FibreOpener for NoOdrive {
+    fn open(&mut self, _request: &OpenRequest) -> Result<FibreConnection, String> {
+        Err("no ODrive in this fixture".into())
+    }
+}
+
 impl MachineFactory for FixtureFactory {
     type Machine = CapturePairMachine;
+
+    fn odrive_opener(&mut self) -> Box<dyn FibreOpener> {
+        Box::new(NoOdrive)
+    }
 
     fn open(
         self,
