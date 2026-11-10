@@ -13,6 +13,10 @@
 //! Contract for later screens: anything that must stay reachable goes in the
 //! action bar. Stop comes first of all. Body content may scroll out of view at
 //! any time, so it must never hold an action the operator depends on.
+//!
+//! The bar keeps actions on screen and still. It does not make them pressable
+//! while another finger holds a drag: egui treats one touch as the only
+//! pointer, so a second finger's tap is not a click until the first lifts.
 
 use eframe::egui;
 

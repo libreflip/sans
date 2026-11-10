@@ -2,6 +2,12 @@
 //!
 //! The scan screen and its Stop action do not exist yet, so a stand-in Stop
 //! sits in the action bar above a body several viewports tall.
+//!
+//! Stop is tapped after wheel scrolls and while the body coasts after a
+//! fling. During an active drag the test only checks that Stop does not move.
+//! egui forwards one touch as the single pointer, so a second finger cannot
+//! tap Stop while the first is still dragging. That case is not covered here
+//! and belongs with the physical Stop work in #25 and #26.
 
 use eframe::egui;
 use egui_kittest::kittest::Queryable;
