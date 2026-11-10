@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use sans_core::{
     CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, MachineFactory,
-    PreparedMachineProfile, RoleCamera, SetupBlocker,
+    PreparedMachineProfile, RoleCamera, SetupBlocker, SetupDiagnostic,
 };
 
 /// What one camera does on one capture call. The last step repeats.
@@ -122,7 +122,10 @@ impl FixtureFactory {
 impl MachineFactory for FixtureFactory {
     type Machine = CapturePairMachine;
 
-    fn open(self, _profile: &PreparedMachineProfile) -> Result<Self::Machine, Vec<SetupBlocker>> {
+    fn open(
+        self,
+        _profile: &PreparedMachineProfile,
+    ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         match self {
             Self::Cameras { left, right, calls } => CapturePairMachine::new(
                 Box::new(ScriptedCamera {
@@ -136,6 +139,11 @@ impl MachineFactory for FixtureFactory {
                     calls: calls.right,
                 }),
             )
+            .map(|machine| {
+                let ready = ["Left Camera", "Right Camera"]
+                    .map(|component| SetupDiagnostic::ready(component, "Ready at fixture"));
+                (machine, ready.into())
+            })
             .map_err(|error| vec![SetupBlocker::new(error.to_string())]),
             Self::Blocked(reasons) => Err(reasons.into_iter().map(SetupBlocker::new).collect()),
         }

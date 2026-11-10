@@ -45,7 +45,7 @@ fn assert_usable(session: &mut Session, actions: &[&str], last: &str) {
 }
 
 #[test]
-fn empty_state_shows_capture_pair_without_scrolling() {
+fn machine_ready_shows_capture_pair_and_diagnostics_without_scrolling() {
     for viewport in MATRIX {
         let (left, right) = portrait_full_frame();
         let mut session = Session::cameras(
@@ -55,11 +55,12 @@ fn empty_state_shows_capture_pair_without_scrolling() {
         );
 
         assert!(session.contains(session.window(), session.rect("Capture pair")));
-        assert!(session.in_body("No complete Capture pair yet."));
+        assert!(session.in_body("Left Camera: Ready at fixture"));
+        assert!(session.in_body("Right Camera: Ready at fixture"));
         assert_usable(
             &mut session,
             &["Capture pair", "Exit"],
-            "No complete Capture pair yet.",
+            "Right Camera: Ready at fixture",
         );
     }
 }

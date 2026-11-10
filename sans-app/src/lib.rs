@@ -165,11 +165,14 @@ fn show_controller(
         }
         context.request_repaint_after(Duration::from_millis(16));
     }
-    let exit = |ui: &mut egui::Ui| show_exit_action(ui, context, handle, exit_requested_at);
+    if screen_needs_polling(screen) {
+        // Keep draining snapshots so live connection faults reach the screen.
+        context.request_repaint_after(Duration::from_millis(16));
+    }
+    let mut exit = |ui: &mut egui::Ui| show_exit_action(ui, context, handle, exit_requested_at);
 
     match screen {
         None | Some(MachineScreen::Exited) => {
-            context.request_repaint_after(Duration::from_millis(16));
             screen::show(
                 ui,
                 Header::new("Checking Camera readiness...", egui::Color32::GRAY).busy(),
@@ -183,13 +186,35 @@ fn show_controller(
                 Header::new("Setup blocked", egui::Color32::YELLOW),
                 exit,
                 |ui, _| {
-                    ui.label("Scanning is disabled. Camera diagnostics remain available.");
+                    ui.label("Scanning is disabled. Non-actuating diagnostics remain available.");
                     ui.add_space(12.0);
                     for reason in reasons {
                         ui.label(format!("• {}", reason.summary));
                     }
                 },
             );
+        }
+        Some(MachineScreen::Setup(SetupState::Ready { diagnostics })) => {
+            let mut closed = false;
+            screen::show(
+                ui,
+                Header::new("Machine ready", egui::Color32::LIGHT_GREEN),
+                |ui| {
+                    if screen::action_button(ui, "Capture pair").clicked() {
+                        closed = handle.send(ControllerIntent::CapturePair).is_err();
+                        context.request_repaint_after(Duration::from_millis(16));
+                    }
+                    exit(ui);
+                },
+                |ui, _| {
+                    for diagnostic in diagnostics {
+                        ui.label(format!("{}: {}", diagnostic.component, diagnostic.summary));
+                    }
+                },
+            );
+            if closed {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         Some(MachineScreen::CapturePreview(preview)) => {
             if show_capture_preview(ui, context, handle, preview, textures, exit).is_err() {
@@ -217,6 +242,16 @@ fn show_exit_action(
     }
 }
 
+/// Whether the screen can change without operator input, so frames must keep running.
+fn screen_needs_polling(screen: Option<&MachineScreen>) -> bool {
+    matches!(
+        screen,
+        None | Some(
+            MachineScreen::Setup(SetupState::Ready { .. }) | MachineScreen::CapturePreview(_)
+        )
+    )
+}
+
 fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(requested_at) >= EXIT_FALLBACK_TIMEOUT
 }
@@ -225,7 +260,9 @@ fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{exit_fallback_elapsed, EXIT_FALLBACK_TIMEOUT};
+    use sans_core::{MachineScreen, SetupState};
+
+    use super::{exit_fallback_elapsed, screen_needs_polling, EXIT_FALLBACK_TIMEOUT};
 
     #[test]
     fn exit_fallback_closes_after_controller_deadline() {
@@ -239,5 +276,27 @@ mod tests {
             requested_at,
             requested_at + EXIT_FALLBACK_TIMEOUT
         ));
+    }
+
+    #[test]
+    fn live_machine_screens_keep_polling_for_connection_faults() {
+        let ready = MachineScreen::Setup(SetupState::Ready {
+            diagnostics: Vec::new(),
+        });
+        let blocked = MachineScreen::Setup(SetupState::Blocked {
+            reasons: Vec::new(),
+        });
+
+        assert!(screen_needs_polling(None));
+        assert!(screen_needs_polling(Some(&ready)));
+        assert!(screen_needs_polling(Some(&MachineScreen::CapturePreview(
+            sans_core::CapturePreview {
+                status: sans_core::CaptureStatus::Ready,
+                latest_complete_pair: None,
+                preview_warning: None,
+            }
+        ))));
+        assert!(!screen_needs_polling(Some(&blocked)));
+        assert!(!screen_needs_polling(Some(&MachineScreen::Exited)));
     }
 }

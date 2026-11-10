@@ -1,5 +1,5 @@
 [target.aarch64-unknown-linux-gnu]
-pre-build = [
-    "dpkg --add-architecture $CROSS_DEB_ARCH",
-    "apt-get update && apt-get --assume-yes install libv4l-dev:$CROSS_DEB_ARCH",
-]
+# Built locally from the Dockerfile and tagged with this name; see the
+# Dockerfile for why this replaces a `pre-build` list.
+image = "sans-cross:aarch64-unknown-linux-gnu"
+dockerfile = { file = "cross/aarch64-unknown-linux-gnu.Dockerfile", context = "cross" }

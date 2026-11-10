@@ -102,7 +102,7 @@ impl Session {
         session
     }
 
-    /// Start a controller with scripted cameras and wait until Cameras are ready.
+    /// Start a controller with scripted cameras and wait for the Machine ready screen.
     pub fn cameras(left: Vec<Step>, right: Vec<Step>, viewport: Viewport) -> Self {
         Self::cameras_with_renderer(left, right, viewport, None)
     }
@@ -116,7 +116,7 @@ impl Session {
     ) -> Self {
         let (factory, calls) = FixtureFactory::cameras(left, right);
         let mut session = Self::controller(factory, calls, viewport, renderer);
-        session.wait_for_label("Cameras ready");
+        session.wait_for_label("Machine ready");
         session
     }
 
@@ -178,7 +178,10 @@ impl Session {
         let mut builder = Harness::builder()
             .with_size(viewport.size)
             .with_pixels_per_point(viewport.pixels_per_point)
-            .with_max_steps(64);
+            // Frames shorter than the application's 16 ms snapshot polling, so a
+            // poll is a future repaint and an idle screen lets the run settle.
+            .with_step_dt(0.01)
+            .with_max_steps(600);
         if let Some(renderer) = renderer {
             builder = builder.renderer(renderer);
         }
