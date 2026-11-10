@@ -25,7 +25,7 @@ An aspect-preserving view of the configured page crop from the latest complete c
 _Avoid_: Live view, camera stream
 
 **100% preview**:
-A native-resolution detail view in which one image pixel maps to one display pixel.
+A native-resolution detail view in which one image pixel maps to one physical display pixel.
 _Avoid_: Zoomed image, live zoom
 
 **Scan session**:

@@ -57,9 +57,12 @@ jobs:
           rustflags: ""
 
       - name: Install native dependencies
-        run: sudo apt-get update && sudo apt-get install --yes libv4l-dev
+        run: sudo apt-get update && sudo apt-get install --yes libv4l-dev mesa-vulkan-drivers
 
       - name: Test workspace
+        env:
+          # Rendered-pixel proofs must run on lavapipe here, never skip.
+          SANS_REQUIRE_PIXEL_PROOF: "1"
         run: cargo test --workspace --locked
 
   aarch64:
