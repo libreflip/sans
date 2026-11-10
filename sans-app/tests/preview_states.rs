@@ -79,14 +79,36 @@ fn ready_state_with_a_pair_is_usable() {
 }
 
 #[test]
+fn a_held_capture_finishes_when_the_test_lets_go_of_it() {
+    let (left, right) = portrait_full_frame();
+    let (gate, release) = Gate::closed();
+    let mut session = Session::cameras(
+        vec![
+            Step::Frame(left.frame.clone()),
+            Step::Gated(left.frame, gate),
+        ],
+        vec![Step::Frame(right.frame)],
+        MINIMUM,
+    );
+    session.capture_pair();
+    session.tap_label("Capture pair");
+    session.wait_for_label("Capturing...");
+
+    // A panicking test drops its release the same way.
+    drop(release);
+
+    session.wait_for_label("Cameras ready");
+}
+
+#[test]
 fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
     for viewport in MATRIX_AND_MINIMUM {
         let (left, right) = portrait_full_frame();
-        let gate = Gate::default();
+        let (gate, release) = Gate::closed();
         let mut session = Session::cameras(
             vec![
                 Step::Frame(left.frame.clone()),
-                Step::Gated(left.frame, gate.clone()),
+                Step::Gated(left.frame, gate),
             ],
             vec![Step::Frame(right.frame)],
             viewport,
@@ -102,7 +124,7 @@ fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
             "Right 100% preview",
         );
 
-        gate.open();
+        release.open();
         session.wait_for_label("Cameras ready");
     }
 }

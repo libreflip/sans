@@ -2,8 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use sans_core::{
     CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, MachineFactory,
@@ -15,34 +14,57 @@ use sans_core::{
 pub enum Step {
     /// Return this frame immediately.
     Frame(CapturedFrame),
-    /// Wait for [`Gate::open`], then return this frame.
+    /// Wait until the gate opens, then return this frame.
     Gated(CapturedFrame, Gate),
     /// Fail with a retryable acquisition error.
     Fail(String),
 }
 
-/// A latch a test opens to let a gated capture finish.
-#[derive(Clone, Debug, Default)]
+/// A latch that holds gated captures until the test releases them.
+///
+/// There is no wall-clock deadline: a slow host, such as the emulated
+/// AArch64 job, must not release a capture the test still holds. The
+/// [`GateRelease`] opens the gate when the test calls it or drops it, so a
+/// failing test never leaves the controller thread waiting.
+#[derive(Clone, Debug)]
 pub struct Gate(Arc<(Mutex<bool>, Condvar)>);
 
+/// The test's handle on a [`Gate`]. Opens the gate when dropped.
+#[derive(Debug)]
+pub struct GateRelease(Gate);
+
 impl Gate {
-    /// Let every waiting and future gated capture finish.
-    pub fn open(&self) {
+    /// A closed gate and the handle that opens it.
+    pub fn closed() -> (Self, GateRelease) {
+        let gate = Self(Arc::default());
+        (gate.clone(), GateRelease(gate))
+    }
+
+    fn open(&self) {
         let (open, changed) = &*self.0;
-        *open.lock().unwrap() = true;
+        *open.lock().unwrap_or_else(PoisonError::into_inner) = true;
         changed.notify_all();
     }
 
     fn wait(&self) {
         let (open, changed) = &*self.0;
-        let guard = open.lock().unwrap();
-        let (guard, timeout) = changed
-            .wait_timeout_while(guard, Duration::from_secs(10), |open| !*open)
-            .unwrap();
-        assert!(
-            *guard && !timeout.timed_out(),
-            "gated capture never released"
+        let guard = open.lock().unwrap_or_else(PoisonError::into_inner);
+        drop(
+            changed
+                .wait_while(guard, |open| !*open)
+                .unwrap_or_else(PoisonError::into_inner),
         );
+    }
+}
+
+impl GateRelease {
+    /// Let every waiting and future gated capture finish.
+    pub fn open(self) {}
+}
+
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.0.open();
     }
 }
 

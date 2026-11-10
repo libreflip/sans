@@ -22,6 +22,10 @@ use super::fixtures::Fixture;
 
 const VALID_PROFILE: &str = include_str!("../../../sans-core/tests/fixtures/valid-sans.toml");
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
+/// Most frames [`Session::settle`] steps.
+const SETTLE_LIMIT: usize = 600;
+/// Unchanged frames after which [`Session::settle`] treats the screen as still.
+const STILL_FRAMES: usize = 5;
 
 /// Accessibility label of the scrolling body region.
 pub const BODY: &str = "Screen body";
@@ -208,7 +212,7 @@ impl Session {
         loop {
             self.harness.step();
             if condition(self) {
-                self.harness.run_ok();
+                self.settle();
                 return;
             }
             assert!(
@@ -217,6 +221,34 @@ impl Session {
                 self.viewport.name
             );
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Step until the screen stops changing.
+    ///
+    /// A spinner asks for a new frame forever, so waiting for repaints to stop
+    /// would spend the whole step limit after every action on a busy screen.
+    /// The screen counts as settled once the accessibility layout has stayed
+    /// the same for several frames with no wheel input left to apply, which
+    /// still lets scroll animations finish.
+    pub fn settle(&mut self) {
+        let mut previous = self.labelled_rects();
+        let mut still_frames = 0;
+        for _ in 0..SETTLE_LIMIT {
+            self.harness.step();
+            let current = self.labelled_rects();
+            // Wheel input is released over several frames. A turn past either
+            // end leaves input pending while the layout stays clamped.
+            let wheel_pending = self.harness.ctx.input(|input| input.is_scrolling());
+            if current == previous && !wheel_pending {
+                still_frames += 1;
+                if still_frames == STILL_FRAMES {
+                    return;
+                }
+            } else {
+                still_frames = 0;
+                previous = current;
+            }
         }
     }
 
@@ -244,7 +276,7 @@ impl Session {
             let cameras_called = self.calls.left() > left && self.calls.right() > right;
             self.harness.step();
             if cameras_called && self.has("Cameras ready") && self.has("Left Full-page preview") {
-                self.harness.run_ok();
+                self.settle();
                 return;
             }
             assert!(
@@ -338,7 +370,7 @@ impl Session {
             });
         }
         self.harness.step();
-        self.harness.run_ok();
+        self.settle();
     }
 
     /// Tap the centre of the node labelled `label`.
@@ -358,7 +390,7 @@ impl Session {
             modifiers: egui::Modifiers::NONE,
         });
         self.harness.step();
-        self.harness.run_ok();
+        self.settle();
     }
 
     /// Drag the primary pointer from `from` to `to`, optionally with matching touch events.
@@ -366,7 +398,7 @@ impl Session {
         self.drag_start(from, touch);
         self.drag_move(from, to, touch);
         self.drag_end(to, touch);
-        self.harness.run_ok();
+        self.settle();
     }
 
     /// Press at `at`, leaving the drag active.

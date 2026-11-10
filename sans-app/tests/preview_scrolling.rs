@@ -212,11 +212,11 @@ fn dragging_the_scroll_bar_down_scrolls_toward_the_end() {
 fn the_body_keeps_its_scroll_position_through_a_capture() {
     for viewport in SCROLLING {
         let (left, right) = portrait_full_frame();
-        let gate = Gate::default();
+        let (gate, release) = Gate::closed();
         let mut session = Session::cameras(
             vec![
                 Step::Frame(left.frame.clone()),
-                Step::Gated(left.frame, gate.clone()),
+                Step::Gated(left.frame, gate),
             ],
             vec![Step::Frame(right.frame)],
             viewport,
@@ -235,7 +235,7 @@ fn the_body_keeps_its_scroll_position_through_a_capture() {
             viewport.name
         );
 
-        gate.open();
+        release.open();
         // Capturing was already shown, so the next Ready belongs to the new pair.
         session.wait_for_label("Cameras ready");
         assert_eq!(

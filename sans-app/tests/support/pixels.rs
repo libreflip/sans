@@ -153,7 +153,7 @@ impl Session {
     pub fn render(&mut self) -> RgbaImage {
         self.harness.remove_cursor();
         self.harness.step();
-        self.harness.run_ok();
+        self.settle();
         self.harness.render().expect("render the application")
     }
 }
