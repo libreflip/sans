@@ -126,7 +126,7 @@ if [ -z "$binary" ]; then
     esac
     progress "building sans for $TARGET"
     (
-        cd "$repo_root"
+        cd "$repo_root" || exit "$?"
         CARGO_TARGET_DIR=$target_dir cross build --package sans --release --locked --target "$TARGET"
     ) || fail "$?" "cross build failed"
     binary=$target_dir/$TARGET/release/sans
@@ -192,5 +192,5 @@ for word in "$@"; do
     run_command="$run_command $(sh_quote "$word")"
 done
 
-progress "running sans-dev on $host (Ctrl-C ends the SSH session)"
+progress "running sans-dev on $host (Ctrl-C is sent to sans-dev on the Pi)"
 exec ssh -tt -x -- "$host" "$run_command"
