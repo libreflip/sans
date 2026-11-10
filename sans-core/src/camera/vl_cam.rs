@@ -3,11 +3,12 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use image::ImageFormat;
 use rscam::{Camera, Config, IntervalInfo, ResolutionInfo};
 use thiserror::Error;
 
 use super::{
+    acquisition::{capture_fresh_frame, CAPTURE_BUFFERS},
+    jpeg::decode_camera_jpeg,
     resolve_live_camera_identities, resolve_live_camera_identity, CameraCaptureError, CameraRole,
     CapturePairMachine, CapturedFrame, RoleCamera,
 };
@@ -122,20 +123,12 @@ impl V4lRoleCamera {
         })?;
         verify_fixed_profile(role, path, &backend)?;
         let interval = select_interval(role, path, &backend)?;
-        backend
-            .start(&Config {
-                interval,
-                resolution: (FRAME_WIDTH, FRAME_HEIGHT),
-                format: MJPEG,
-                ..Default::default()
-            })
-            .map_err(|error| {
-                SetupBlocker::new(format!(
-                    "{role} Camera device {} rejected 3840x2160 MJPEG: {error}",
-                    path.display()
-                ))
-            })?;
-
+        backend.start(&capture_config(interval)).map_err(|error| {
+            SetupBlocker::new(format!(
+                "{role} Camera device {} rejected 3840x2160 MJPEG: {error}",
+                path.display()
+            ))
+        })?;
         Ok(Self {
             role,
             backend,
@@ -151,9 +144,7 @@ impl RoleCamera for V4lRoleCamera {
     }
 
     fn capture(&mut self) -> Result<CapturedFrame, CameraCaptureError> {
-        let frame = self
-            .backend
-            .capture()
+        let frame = capture_fresh_frame(|| self.backend.capture())
             .map_err(|error| CameraCaptureError::acquisition(self.role, error.to_string()))?;
         let captured_at = SystemTime::now();
         if frame.resolution != (FRAME_WIDTH, FRAME_HEIGHT) || frame.format != *MJPEG {
@@ -165,9 +156,11 @@ impl RoleCamera for V4lRoleCamera {
                 ),
             });
         }
-        let decoded = image::load_from_memory_with_format(&frame, ImageFormat::Jpeg)
-            .map_err(|error| CameraCaptureError::decode(self.role, error.to_string()))?
-            .to_rgb8();
+        let jpeg = frame.to_vec();
+        drop(frame);
+
+        let decoded = decode_camera_jpeg(&jpeg)
+            .map_err(|error| CameraCaptureError::decode(self.role, error))?;
         if decoded.dimensions() != (FRAME_WIDTH, FRAME_HEIGHT) {
             return Err(CameraCaptureError::Profile {
                 role: self.role,
@@ -192,6 +185,16 @@ impl RoleCamera for V4lRoleCamera {
             role: self.role,
             detail: error.to_string(),
         })
+    }
+}
+
+fn capture_config(interval: (u32, u32)) -> Config<'static> {
+    Config {
+        interval,
+        resolution: (FRAME_WIDTH, FRAME_HEIGHT),
+        format: MJPEG,
+        nbuffers: CAPTURE_BUFFERS,
+        ..Default::default()
     }
 }
 
