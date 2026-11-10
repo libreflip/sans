@@ -22,6 +22,11 @@ pub use crate::config::{
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker, SetupState,
+    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker,
+    SetupDiagnostic, SetupState,
 };
-pub use crate::hardware::{HwClient, HwError, HwLine};
+pub use crate::hardware::{
+    ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
+    MonospaceEventKind, MonospaceEvents, MonospaceFault, MonospaceUrgentWriter,
+    MONOSPACE_BAUD_RATE,
+};
