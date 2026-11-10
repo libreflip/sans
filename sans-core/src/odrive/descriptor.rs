@@ -1,4 +1,4 @@
-//! Endpoint-0 descriptor parsing, flattening, API fingerprint and capability check.
+//! Endpoint-0 descriptor flattening and the capability check.
 //!
 //! The descriptor layout follows upstream ODrive `fw-v0.5.1`: a JSON root array
 //! whose members are objects (`name`, `type: "object"`, `members`), properties
@@ -7,73 +7,21 @@
 //! `Firmware/fibre/python/fibre/remote_object.py` at revision
 //! `7831d795235e5ef8535e4b46621a0721b458ec8f`.
 
-use std::fmt::Write as _;
-
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
-use super::protocol::{descriptor_crc16, ValueType};
+use super::protocol::ValueType;
 
-/// A downloaded endpoint descriptor that parsed as the upstream layout.
-#[derive(Clone, Debug)]
-pub(crate) struct Descriptor {
-    length: usize,
-    crc16: u16,
-    flattened: Map<String, Value>,
-    fingerprint: String,
-}
-
-impl Descriptor {
-    /// Parse raw endpoint-0 bytes, flatten them and compute CRC and fingerprint.
-    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
-        let root: Value = serde_json::from_slice(bytes)
-            .map_err(|error| format!("descriptor is not valid JSON: {error}"))?;
-        let Value::Array(members) = root else {
-            return Err("descriptor root is not a JSON array".into());
-        };
-        let mut flattened = Map::new();
-        flatten_members("", &members, &mut flattened)?;
-        let mut canonical = String::new();
-        write_canonical(&Value::Object(flattened.clone()), &mut canonical)?;
-        let digest = Sha256::digest(canonical.as_bytes());
-        let fingerprint = digest.iter().fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
-        Ok(Self {
-            length: bytes.len(),
-            crc16: descriptor_crc16(bytes),
-            flattened,
-            fingerprint,
-        })
-    }
-
-    /// Raw descriptor length in bytes.
-    pub(crate) fn length(&self) -> usize {
-        self.length
-    }
-
-    /// Descriptor CRC16, the trailer for every nonzero endpoint.
-    pub(crate) fn crc16(&self) -> u16 {
-        self.crc16
-    }
-
-    /// Map from dotted path to the descriptor entry, as the #57 capture stored it.
-    pub(crate) fn flattened(&self) -> &Map<String, Value> {
-        &self.flattened
-    }
-
-    /// Number of flattened endpoints, including endpoint 0.
-    pub(crate) fn endpoint_count(&self) -> usize {
-        self.flattened.len()
-    }
-
-    /// SHA-256 over the canonical flattened form: keys sorted at every level,
-    /// compact separators, ASCII with `\uXXXX` escapes. This reproduces the #57
-    /// capture's `json.dumps(sort_keys=True, separators=(",", ":"))`.
-    pub(crate) fn fingerprint(&self) -> &str {
-        &self.fingerprint
-    }
+/// Parse raw endpoint-0 bytes into a map from dotted path to descriptor entry,
+/// the form the #57 capture stored.
+pub(crate) fn flatten(bytes: &[u8]) -> Result<Map<String, Value>, String> {
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("descriptor is not valid JSON: {error}"))?;
+    let Value::Array(members) = root else {
+        return Err("descriptor root is not a JSON array".into());
+    };
+    let mut flattened = Map::new();
+    flatten_members("", &members, &mut flattened)?;
+    Ok(flattened)
 }
 
 /// Every endpoint Sans uses. IDs are always resolved from the live descriptor.
@@ -500,69 +448,6 @@ fn flatten_members(
     Ok(())
 }
 
-fn write_canonical(value: &Value, out: &mut String) -> Result<(), String> {
-    match value {
-        Value::Null => out.push_str("null"),
-        Value::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
-        Value::Number(number) => {
-            if !(number.is_i64() || number.is_u64()) {
-                return Err(format!("descriptor contains non-integer number {number}"));
-            }
-            let _ = write!(out, "{number}");
-        }
-        Value::String(text) => write_canonical_string(text, out),
-        Value::Array(items) => {
-            out.push('[');
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_canonical(item, out)?;
-            }
-            out.push(']');
-        }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            out.push('{');
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(',');
-                }
-                write_canonical_string(key, out);
-                out.push(':');
-                write_canonical(&map[key], out)?;
-            }
-            out.push('}');
-        }
-    }
-    Ok(())
-}
-
-/// Python `json.dumps(ensure_ascii=True)` string escaping.
-fn write_canonical_string(text: &str, out: &mut String) {
-    out.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ' '..='~' => out.push(character),
-            _ => {
-                let mut units = [0_u16; 2];
-                for unit in character.encode_utf16(&mut units) {
-                    let _ = write!(out, "\\u{unit:04x}");
-                }
-            }
-        }
-    }
-    out.push('"');
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,18 +459,11 @@ mod tests {
 
     #[test]
     fn flattening_the_reconstructed_descriptor_reproduces_the_captured_endpoint_file() {
-        let descriptor = Descriptor::parse(RECONSTRUCTED_DESCRIPTOR).unwrap();
+        let flattened = flatten(RECONSTRUCTED_DESCRIPTOR).unwrap();
         let captured: serde_json::Value = serde_json::from_str(CAPTURED_ENDPOINTS).unwrap();
 
-        assert_eq!(
-            serde_json::Value::Object(descriptor.flattened().clone()),
-            captured
-        );
-        assert_eq!(descriptor.endpoint_count(), 535);
-        assert_eq!(
-            descriptor.fingerprint(),
-            "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b"
-        );
+        assert_eq!(serde_json::Value::Object(flattened.clone()), captured);
+        assert_eq!(flattened.len(), 535);
     }
 
     fn captured() -> Map<String, Value> {

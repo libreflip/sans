@@ -143,8 +143,6 @@ pub struct OdriveProfile {
     pub usb_serial: String,
     /// Axis index on the board, 0 or 1.
     pub axis: u8,
-    /// Commissioned SHA-256 of the flattened endpoint schema, 64 lowercase hex digits.
-    pub api_fingerprint_sha256: String,
     /// Interval between telemetry cycle starts, 5 to 100 ms.
     pub poll_interval_ms: u64,
     /// Oldest usable telemetry sample, at least twice the poll interval and at most 250 ms.
@@ -604,14 +602,6 @@ pub(crate) fn odrive_profile_problems(odrive: &OdriveProfile) -> Vec<String> {
     }
     if odrive.axis > 1 {
         problems.push("odrive.axis must be 0 or 1".into());
-    }
-    let fingerprint = &odrive.api_fingerprint_sha256;
-    if fingerprint.len() != 64
-        || !fingerprint
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        problems.push("odrive.api_fingerprint_sha256 must be 64 lowercase hex digits".into());
     }
     validate_bounded_ms(
         "odrive.poll_interval_ms",

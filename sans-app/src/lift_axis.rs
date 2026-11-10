@@ -69,15 +69,6 @@ pub(crate) fn show_lift_axis(
                 text(discovery.descriptor_crc.map(|crc| crc.to_string())),
                 text(discovery.descriptor_length.map(|length| length.to_string())),
             ));
-            if let Some(fingerprint) = &discovery.api_fingerprint {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("API fingerprint");
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(fingerprint).monospace())
-                            .selectable(true),
-                    );
-                });
-            }
         }
         if let Some(telemetry) = &status.telemetry {
             let values = &telemetry.values;

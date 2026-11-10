@@ -17,9 +17,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::descriptor::{check_capabilities, value_type, Descriptor, Endpoint, ResolvedEndpoints};
+use super::descriptor::{check_capabilities, flatten, value_type, Endpoint, ResolvedEndpoints};
 use super::protocol::{
-    decode_reply, encode_descriptor_read, encode_request, WireValue,
+    decode_reply, descriptor_crc16, encode_descriptor_read, encode_request, WireValue,
     AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
     AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, DESCRIPTOR_CHUNK_REQUEST_LEN,
     INPUT_MODE_TRAP_TRAJ, SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
@@ -112,7 +112,7 @@ pub enum LinkCommand {
         position_mm: f32,
     },
     /// Call `clear_errors`; confirmed by the next telemetry sample. Accepted
-    /// only once this connection passed the capability, fingerprint and
+    /// only once this connection passed the capability and
     /// identity checks and read the axis back idle.
     ClearErrors,
 }
@@ -173,8 +173,6 @@ pub struct DiscoveryRecord {
     pub descriptor_crc: Option<u16>,
     /// Flattened endpoint count, including endpoint 0.
     pub endpoint_count: Option<usize>,
-    /// Discovered API fingerprint; copy into the profile to re-commission.
-    pub api_fingerprint: Option<String>,
     /// The board's `serial_number` endpoint.
     pub board_serial: Option<u64>,
     /// Hardware major, minor, variant. Recorded, never compared.
@@ -425,7 +423,6 @@ pub struct LinkConfig {
     usb_serial_text: String,
     usb_serial: u64,
     axis: u8,
-    api_fingerprint: String,
     poll_interval: Duration,
     max_age: Duration,
     request_deadline: Duration,
@@ -451,7 +448,6 @@ impl LinkConfig {
             usb_serial_text: odrive.usb_serial.clone(),
             usb_serial,
             axis: odrive.axis,
-            api_fingerprint: odrive.api_fingerprint_sha256.clone(),
             poll_interval: Duration::from_millis(odrive.poll_interval_ms),
             max_age: Duration::from_millis(odrive.telemetry_max_age_ms),
             request_deadline: Duration::from_millis(odrive.request_deadline_ms),
@@ -788,7 +784,7 @@ impl RawTelemetry {
 struct Connection {
     epoch: u64,
     opened: bool,
-    /// Capabilities, fingerprint and identity passed and idle was read back.
+    /// Capabilities and identity passed and idle was read back.
     idle_confirmed: bool,
     ended: bool,
     gate: Option<GateStep>,
@@ -2128,42 +2124,34 @@ impl LinkEngine {
     }
 
     fn finish_descriptor(&mut self, bytes: &[u8]) {
-        let descriptor = match Descriptor::parse(bytes) {
-            Ok(descriptor) => descriptor,
+        let flattened = match flatten(bytes) {
+            Ok(flattened) => flattened,
             Err(reason) => {
                 self.fail_gate(Some(reason));
                 return;
             }
         };
         let axis = self.config.axis;
-        let expected = self.config.api_fingerprint.clone();
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        connection.discovery.descriptor_length = Some(descriptor.length());
-        connection.discovery.descriptor_crc = Some(descriptor.crc16());
-        connection.discovery.endpoint_count = Some(descriptor.endpoint_count());
-        connection.discovery.api_fingerprint = Some(descriptor.fingerprint().to_owned());
-        connection.trailer = Some(descriptor.crc16());
-        let mut problems = Vec::new();
-        match check_capabilities(descriptor.flattened(), axis) {
-            Ok(endpoints) => connection.endpoints = Some(endpoints),
-            Err(found) => problems.extend(found),
-        }
-        if descriptor.fingerprint() != expected {
-            problems.push(format!(
-                "API fingerprint {} does not match commissioned odrive.api_fingerprint_sha256 {expected}",
-                descriptor.fingerprint()
-            ));
-        }
-        if problems.is_empty() {
-            connection.gate = Some(GateStep::Identity {
-                next: 0,
-                reads: IdentityReads::default(),
-            });
-        } else {
-            connection.gate = None;
-            connection.blockers.extend(problems);
+        let crc = descriptor_crc16(bytes);
+        connection.discovery.descriptor_length = Some(bytes.len());
+        connection.discovery.descriptor_crc = Some(crc);
+        connection.discovery.endpoint_count = Some(flattened.len());
+        connection.trailer = Some(crc);
+        match check_capabilities(&flattened, axis) {
+            Ok(endpoints) => {
+                connection.endpoints = Some(endpoints);
+                connection.gate = Some(GateStep::Identity {
+                    next: 0,
+                    reads: IdentityReads::default(),
+                });
+            }
+            Err(problems) => {
+                connection.gate = None;
+                connection.blockers.extend(problems);
+            }
         }
     }
 

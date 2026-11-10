@@ -24,10 +24,6 @@ fn missing_profile_creates_parseable_template_and_stops_startup() {
     assert!(matches!(error, StartupError::ProfileInvalid { .. }));
     let message = error.to_string();
     assert!(message.contains("odrive.usb_serial"), "{message}");
-    assert!(
-        message.contains("odrive.api_fingerprint_sha256"),
-        "{message}"
-    );
 }
 
 #[test]
@@ -124,21 +120,6 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "odrive.usb_serial must be 1 to 16 hex digits",
         ),
         ("axis = 0", "axis = 2", "odrive.axis must be 0 or 1"),
-        (
-            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
-            "api_fingerprint_sha256 = \"<set-commissioned-api-fingerprint-sha256>\"",
-            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
-        ),
-        (
-            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
-            "api_fingerprint_sha256 = \"A36D84437BD2BF5925C0119A1DF53D88DE8EBE1AA8DF0A338D2F6DD56FD5E52B\"",
-            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
-        ),
-        (
-            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b\"",
-            "api_fingerprint_sha256 = \"a36d84437bd2bf5925c0119a1df53d88\"",
-            "odrive.api_fingerprint_sha256 must be 64 lowercase hex digits",
-        ),
         (
             "poll_interval_ms = 20",
             "poll_interval_ms = 4",

@@ -14,9 +14,6 @@ monospace_path = "<set-stable-monospace-device-path>"
 # or on the Sans lift-axis panel after a connection attempt.
 usb_serial = "<set-odrive-usb-serial-hex>"
 axis = 0
-# Commissioned API fingerprint. Sans shows the discovered value on the
-# lift-axis panel; copy it here only after reviewing the board's endpoints.
-api_fingerprint_sha256 = "<set-commissioned-api-fingerprint-sha256>"
 # Provisional, unmeasured timing values inside immutable bounds; #60 reviews them.
 # poll 5-100 ms; max age >= 2x poll and <= 250 ms; request 1-250 ms;
 # urgent 1-100 ms and not above the request deadline.

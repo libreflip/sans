@@ -206,10 +206,6 @@ fn compatible_device_downloads_the_descriptor_in_chunks_then_uses_its_crc_traile
     let discovery = status.discovery.unwrap();
     assert_eq!(discovery.descriptor_crc, Some(39744));
     assert_eq!(discovery.endpoint_count, Some(535));
-    assert_eq!(
-        discovery.api_fingerprint.as_deref(),
-        Some("a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b")
-    );
     assert_ne!(status.phase, LinkPhase::Disconnected);
 }
 
@@ -248,22 +244,30 @@ fn identity_mismatch_between_profile_usb_string_and_board_endpoint_blocks() {
 }
 
 #[test]
-fn fingerprint_mismatch_blocks_with_the_discovered_value_in_the_reason() {
-    let profile = VALID_PROFILE.replace(
-        "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    );
-    let mut link = Harness::new(config_from(&profile), FakeFibre::compatible());
+fn descriptor_changes_outside_the_endpoints_sans_uses_do_not_block() {
+    // A different firmware build: an unused endpoint renamed and another retyped.
+    let descriptor = String::from_utf8(DESCRIPTOR.to_vec())
+        .unwrap()
+        .replacen(
+            r#"{"name":"ibus","id":2,"type":"float","access":"r"}"#,
+            r#"{"name":"ibus_filtered","id":2,"type":"float","access":"r"}"#,
+            1,
+        )
+        .replacen(
+            r#"{"name":"homing_speed","id":219,"type":"float","access":"rw"}"#,
+            r#"{"name":"homing_speed","id":219,"type":"int32","access":"rw"}"#,
+            1,
+        );
+    assert_ne!(descriptor.as_bytes(), DESCRIPTOR);
+    let board = FakeFibre::compatible().with_descriptor(descriptor.into_bytes());
+    let mut link = Harness::new(commissioned(), board);
 
     link.connect();
+    link.run_for(5);
 
     let status = link.engine.status();
-    assert_eq!(status.phase, LinkPhase::Blocked);
-    assert_eq!(status.blockers.len(), 1, "{status:?}");
-    assert!(status.blockers[0].contains(
-        "API fingerprint a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b"
-    ));
-    assert!(link.board.writes.is_empty());
+    assert_eq!(status.phase, LinkPhase::Verified, "{status:?}");
+    assert_ne!(status.discovery.unwrap().descriptor_crc, Some(39744));
 }
 
 #[test]
@@ -289,13 +293,12 @@ fn incompatible_descriptor_lists_every_problem_and_writes_nothing() {
     let status = link.engine.status();
     assert_eq!(status.phase, LinkPhase::Blocked);
     assert_eq!(
-        status.blockers[..2],
+        status.blockers,
         [
             "endpoint axis0.requested_state has access r, Sans needs write".to_string(),
             "endpoint axis0.motor.config.current_lim has type int32, Sans needs float".to_string(),
         ]
     );
-    assert!(status.blockers[2].starts_with("API fingerprint "));
     assert!(link.board.writes.is_empty());
 }
 
@@ -1388,39 +1391,30 @@ fn clear_errors_needs_a_compatible_board_whose_axis_read_back_idle() {
     ));
     assert!(waiting.board.writes_to(CLEAR_ERRORS).is_empty());
 
-    // Identity mismatch and fingerprint mismatch: endpoints are known, so
-    // Disarm is still accepted, but clear errors is not.
+    // Identity mismatch: endpoints are known, so Disarm is still accepted,
+    // but clear errors is not.
     let mut wrong_serial = FakeFibre::compatible();
     wrong_serial.set_u64(SERIAL_NUMBER, 1);
-    let fingerprint_profile = VALID_PROFILE.replace(
-        "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b",
-        "0000000000000000000000000000000000000000000000000000000000000000",
-    );
-    for (config, board) in [
-        (commissioned(), wrong_serial),
-        (config_from(&fingerprint_profile), FakeFibre::compatible()),
-    ] {
-        let mut blocked = Harness::new(config, board);
-        blocked.connect();
-        assert_eq!(blocked.engine.status().phase, LinkPhase::Blocked);
-        blocked.submit(1, LinkCommand::ClearErrors, Priority::Urgent);
-        blocked.submit(2, LinkCommand::ClearErrors, Priority::Ordinary);
-        blocked.submit(3, LinkCommand::Disarm, Priority::Urgent);
-        blocked.run_for(5);
-        assert!(matches!(
-            blocked.result(1),
-            Some(CommandResult::Rejected { .. })
-        ));
-        assert!(matches!(
-            blocked.result(2),
-            Some(CommandResult::Rejected { .. })
-        ));
-        assert!(!matches!(
-            blocked.result(3),
-            Some(CommandResult::Rejected { .. })
-        ));
-        assert!(blocked.board.writes_to(CLEAR_ERRORS).is_empty());
-    }
+    let mut blocked = Harness::new(commissioned(), wrong_serial);
+    blocked.connect();
+    assert_eq!(blocked.engine.status().phase, LinkPhase::Blocked);
+    blocked.submit(1, LinkCommand::ClearErrors, Priority::Urgent);
+    blocked.submit(2, LinkCommand::ClearErrors, Priority::Ordinary);
+    blocked.submit(3, LinkCommand::Disarm, Priority::Urgent);
+    blocked.run_for(5);
+    assert!(matches!(
+        blocked.result(1),
+        Some(CommandResult::Rejected { .. })
+    ));
+    assert!(matches!(
+        blocked.result(2),
+        Some(CommandResult::Rejected { .. })
+    ));
+    assert!(!matches!(
+        blocked.result(3),
+        Some(CommandResult::Rejected { .. })
+    ));
+    assert!(blocked.board.writes_to(CLEAR_ERRORS).is_empty());
 }
 
 #[test]

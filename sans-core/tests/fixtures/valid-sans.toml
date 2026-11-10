@@ -7,7 +7,6 @@ monospace_path = "/dev/serial/by-id/monospace"
 [odrive]
 usb_serial = "316536713335"
 axis = 0
-api_fingerprint_sha256 = "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b"
 poll_interval_ms = 20
 telemetry_max_age_ms = 100
 request_deadline_ms = 100
