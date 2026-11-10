@@ -125,9 +125,12 @@ if [ -z "$binary" ]; then
         *) target_dir=$PWD/$target_dir ;;
     esac
     progress "building sans for $TARGET"
+    # cross 0.2.5 publishes its Linux images for linux/amd64 only, so an
+    # arm64 Docker host (Apple Silicon, OrbStack) must pull and run them under
+    # amd64 emulation instead of looking for a missing arm64 manifest.
     (
         cd "$repo_root" || exit "$?"
-        CARGO_TARGET_DIR=$target_dir cross build --package sans --release --locked --target "$TARGET"
+        DOCKER_DEFAULT_PLATFORM=linux/amd64 CARGO_TARGET_DIR=$target_dir cross build --package sans --release --locked --target "$TARGET"
     ) || fail "$?" "cross build failed"
     binary=$target_dir/$TARGET/release/sans
     [ -f "$binary" ] && [ -r "$binary" ] ||

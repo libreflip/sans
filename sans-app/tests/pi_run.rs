@@ -209,6 +209,7 @@ fi
                         r#"#!/bin/sh
 printf '%s\0' "$@" > {log}/cross.argv
 pwd -P > {log}/cross.cwd
+printf '%s' "${{DOCKER_DEFAULT_PLATFORM-unset}}" > {log}/cross.platform
 [ {status} -eq 0 ] || exit {status}
 target=${{CARGO_TARGET_DIR:-target}}
 {writes} || exit 0
@@ -231,6 +232,11 @@ cp {built} "$target/aarch64-unknown-linux-gnu/release/sans"
             .take_while(|path| path.exists())
             .map(|path| split_nul(&fs::read(path).unwrap()))
             .collect()
+    }
+
+    /// `DOCKER_DEFAULT_PLATFORM` as seen by `cross`, or `unset`.
+    fn cross_platform(&self) -> String {
+        fs::read_to_string(self.log().join("cross.platform")).unwrap()
     }
 
     fn cross_call(&self) -> Option<(Vec<String>, PathBuf)> {
@@ -738,4 +744,22 @@ fn failed_upload_connection_keeps_previous_binary_and_skips_run() {
     );
     assert_eq!(harness.ssh_calls().len(), 1);
     assert!(harness.app_argv().is_none());
+}
+
+#[test]
+fn build_selects_amd64_cross_images_even_on_arm64_docker_hosts() {
+    // cross 0.2.5 publishes its Linux images for linux/amd64 only, so an
+    // arm64 Docker host (Apple Silicon, OrbStack) must emulate amd64.
+    for local in [None, Some("linux/arm64")] {
+        let harness = Harness::with_desktop();
+        let env: Vec<(&str, &str)> = local
+            .map(|platform| ("DOCKER_DEFAULT_PLATFORM", platform))
+            .into_iter()
+            .collect();
+
+        let output = harness.run_with(&harness.repo(), &env, &[HOST]);
+
+        assert!(output.status.success(), "{local:?}: {}", stderr(&output));
+        assert_eq!(harness.cross_platform(), "linux/amd64", "{local:?}");
+    }
 }
