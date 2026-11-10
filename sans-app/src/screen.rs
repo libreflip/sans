@@ -136,3 +136,6 @@ pub(crate) fn action_indicator(ui: &mut egui::Ui, label: &str) {
 fn action_size(ui: &egui::Ui) -> egui::Vec2 {
     egui::vec2(ui.available_width().min(ACTION_MAX_WIDTH), ACTION_HEIGHT)
 }
+
+#[cfg(test)]
+mod tests;
