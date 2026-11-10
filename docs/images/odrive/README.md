@@ -1,6 +1,6 @@
 # Fake-backed touchscreen evidence
 
-These screenshots show the native Setup screen using a fake Fibre device on macOS, with no live USB or camera access. They demonstrate presentation only.
+These screenshots render the real `sans` application's Setup screen using a fake Fibre device on macOS, with no live USB or camera access. They demonstrate presentation only.
 
 - `fake-uncommissioned.png`: absent lift-axis commissioning table keeps setup blocked.
 - `fake-verified.png`: verified adapter gate with the captured endstop error reproduced by the fake. Scanning remains disabled.
