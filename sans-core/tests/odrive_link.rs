@@ -81,6 +81,10 @@ impl Harness {
         for _ in 0..20_000 {
             let mut replies = Vec::new();
             while let Some(transmit) = self.engine.take_transmit() {
+                // The claim is the dispatch point, as in the runner's writer.
+                if !transmit.claim_for_send(self.now) {
+                    continue;
+                }
                 self.wire.push((transmit.urgent, transmit.packet.clone()));
                 self.trace
                     .push((true, decode_request(&transmit.packet).sequence));
@@ -105,6 +109,9 @@ impl Harness {
     fn transmit_only(&mut self) -> Vec<(bool, Received, Vec<u8>)> {
         let mut sent = Vec::new();
         while let Some(transmit) = self.engine.take_transmit() {
+            if !transmit.claim_for_send(self.now) {
+                continue;
+            }
             self.wire.push((transmit.urgent, transmit.packet.clone()));
             sent.push((
                 transmit.urgent,
@@ -114,6 +121,16 @@ impl Harness {
         }
         self.drain_events();
         sent
+    }
+
+    /// Take packets as a stuck writer would: queued for USB but not yet claimed.
+    fn take_unclaimed(&mut self) -> Vec<sans_core::Transmit> {
+        let mut taken = Vec::new();
+        while let Some(transmit) = self.engine.take_transmit() {
+            taken.push(transmit);
+        }
+        self.drain_events();
+        taken
     }
 
     /// Advance time in 1 ms steps, exchanging at each step.
@@ -1254,4 +1271,221 @@ fn home_is_confirmed_by_observing_homing_and_not_by_a_missed_or_skipped_entry() 
         unobserved.result(1)
     );
     assert!(!status_has_fault(&unobserved));
+}
+
+// ----- second review round ----------------------------------------------------
+
+#[test]
+fn command_packet_stuck_before_dispatch_expires_unsent_and_can_never_leave() {
+    let mut link = armed(commissioned());
+    link.engine.submit(
+        link.now,
+        Ticket(1),
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Ordinary,
+    );
+    let stuck = link.take_unclaimed();
+    assert_eq!(stuck.len(), 1);
+
+    link.now += Duration::from_millis(100);
+    link.engine.poll(link.now);
+    link.drain_events();
+
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(status_has_fault(&link));
+    assert!(
+        !stuck[0].claim_for_send(link.now),
+        "an expired packet must not leave"
+    );
+    // A new Disarm is still possible on the faulted link.
+    link.submit(2, LinkCommand::Disarm, Priority::Urgent);
+    link.run_for(5);
+    assert_eq!(link.result(2), Some(CommandResult::Completed));
+    assert!(link.board.writes_to(INPUT_POS).is_empty());
+}
+
+#[test]
+fn link_fault_revokes_an_undispatched_command_packet() {
+    let mut link = armed(commissioned());
+    let taken_at = link.engine.fresh_sample(link.now).unwrap().taken_at();
+    // Submit a few milliseconds after the sample, without letting a cycle start.
+    link.now = taken_at + Duration::from_millis(5);
+    link.engine.submit(
+        link.now,
+        Ticket(1),
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Ordinary,
+    );
+    let stuck = link.take_unclaimed();
+    assert_eq!(stuck.len(), 1);
+
+    // The sample goes stale before the move's own deadline: the link faults.
+    link.now = taken_at + Duration::from_millis(101);
+    link.engine.poll(link.now);
+    link.drain_events();
+
+    assert!(status_has_fault(&link));
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(!stuck[0].claim_for_send(link.now));
+}
+
+#[test]
+fn energizing_write_cannot_be_dispatched_after_its_sample_goes_stale() {
+    let mut link = armed(commissioned());
+    let taken_at = link.engine.fresh_sample(link.now).unwrap().taken_at();
+    link.now = taken_at + Duration::from_millis(5);
+    link.engine.submit(
+        link.now,
+        Ticket(1),
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Ordinary,
+    );
+    let stuck = link.take_unclaimed();
+
+    // No poll has run, but the writer itself refuses at the readiness horizon.
+    assert!(!stuck[0].claim_for_send(taken_at + Duration::from_millis(100)));
+    link.now = taken_at + Duration::from_millis(101);
+    link.engine.poll(link.now);
+    link.drain_events();
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+}
+
+#[test]
+fn clear_errors_needs_a_compatible_board_whose_axis_read_back_idle() {
+    // Still waiting for idle at the gate.
+    let mut board = FakeFibre::compatible();
+    board.set_i32(CURRENT_STATE, 8);
+    board.ignore_state_requests.push(1);
+    let mut waiting = Harness::new(commissioned(), board);
+    waiting.connect();
+    waiting.run_for(5);
+    assert_eq!(waiting.engine.status().phase, LinkPhase::Connecting);
+    waiting.submit(1, LinkCommand::ClearErrors, Priority::Urgent);
+    waiting.submit(2, LinkCommand::ClearErrors, Priority::Ordinary);
+    assert!(matches!(
+        waiting.result(1),
+        Some(CommandResult::Rejected { .. })
+    ));
+    // The ordinary one waits behind the gate and is refused when the gate ends.
+    waiting.run_for(5_000);
+    assert_eq!(waiting.engine.status().phase, LinkPhase::Blocked);
+    assert!(matches!(
+        waiting.result(1),
+        Some(CommandResult::Rejected { .. })
+    ));
+    assert!(matches!(
+        waiting.result(2),
+        Some(CommandResult::Rejected { .. })
+    ));
+    assert!(waiting.board.writes_to(CLEAR_ERRORS).is_empty());
+
+    // Identity mismatch and fingerprint mismatch: endpoints are known, so
+    // Disarm is still accepted, but clear errors is not.
+    let mut wrong_serial = FakeFibre::compatible();
+    wrong_serial.set_u64(SERIAL_NUMBER, 1);
+    let fingerprint_profile = VALID_PROFILE.replace(
+        "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    for (config, board) in [
+        (commissioned(), wrong_serial),
+        (config_from(&fingerprint_profile), FakeFibre::compatible()),
+    ] {
+        let mut blocked = Harness::new(config, board);
+        blocked.connect();
+        assert_eq!(blocked.engine.status().phase, LinkPhase::Blocked);
+        blocked.submit(1, LinkCommand::ClearErrors, Priority::Urgent);
+        blocked.submit(2, LinkCommand::ClearErrors, Priority::Ordinary);
+        blocked.submit(3, LinkCommand::Disarm, Priority::Urgent);
+        blocked.run_for(5);
+        assert!(matches!(
+            blocked.result(1),
+            Some(CommandResult::Rejected { .. })
+        ));
+        assert!(matches!(
+            blocked.result(2),
+            Some(CommandResult::Rejected { .. })
+        ));
+        assert!(!matches!(
+            blocked.result(3),
+            Some(CommandResult::Rejected { .. })
+        ));
+        assert!(blocked.board.writes_to(CLEAR_ERRORS).is_empty());
+    }
+}
+
+#[test]
+fn late_open_after_the_gate_deadline_sends_nothing() {
+    let mut link = Harness::new(uncommissioned(), FakeFibre::compatible());
+    link.engine.begin_attempt(link.now);
+    link.now += Duration::from_millis(5_001);
+
+    link.engine.transport_opened(link.now, "316536713335");
+
+    assert!(link.transmit_only().is_empty());
+    let status = link.engine.status();
+    assert_eq!(status.phase, LinkPhase::Blocked);
+    assert!(
+        status.blockers[0].contains("did not finish within 5000 ms"),
+        "{status:?}"
+    );
+}
+
+#[test]
+fn ignored_reply_count_changes_are_coalesced_but_phase_changes_are_not() {
+    let mut link = verified(commissioned(), FakeFibre::compatible());
+    let before = link.engine.status().unmatched_replies;
+    link.drain_events();
+    let statuses_before = link
+        .events
+        .iter()
+        .filter(|event| matches!(event, LinkEvent::Status(_)))
+        .count();
+
+    for _ in 0..50 {
+        link.engine.receive(link.now, &[0x00, 0x00]);
+    }
+    link.drain_events();
+    let statuses = |link: &Harness| {
+        link.events
+            .iter()
+            .filter(|event| matches!(event, LinkEvent::Status(_)))
+            .count()
+    };
+    assert!(
+        statuses(&link) - statuses_before <= 1,
+        "{}",
+        statuses(&link)
+    );
+
+    link.now += Duration::from_millis(250);
+    link.engine.poll(link.now);
+    link.drain_events();
+    let last = link
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            LinkEvent::Status(status) => Some(status.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last.unmatched_replies, before + 50);
+
+    // A phase change is never held back.
+    link.engine.transport_lost(link.now, "cut");
+    link.drain_events();
+    assert!(matches!(
+        link.events.last(),
+        Some(LinkEvent::Status(status)) if status.phase == LinkPhase::Disconnected
+    ));
 }

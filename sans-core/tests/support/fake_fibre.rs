@@ -347,6 +347,12 @@ pub struct FakeOpener {
     pub claimed: Arc<AtomicUsize>,
     /// Opens refused because the previous claim was still held.
     pub busy_refusals: Arc<AtomicUsize>,
+    /// How long each half's destructor takes to give up the claim, like an
+    /// endpoint whose release is slow.
+    pub claim_release_delay: Arc<Mutex<Duration>>,
+    /// When `true`, the next open claims the device and then waits here until
+    /// [`FakeOpener::release_open`], like an open that is still draining.
+    pub hold_open: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl FakeOpener {
@@ -358,14 +364,23 @@ impl FakeOpener {
         *self.write_gate.0.lock().unwrap() = false;
         self.write_gate.1.notify_all();
     }
+
+    pub fn release_open(&self) {
+        *self.hold_open.0.lock().unwrap() = false;
+        self.hold_open.1.notify_all();
+    }
 }
 
 /// Keeps the fake claim while either half is alive.
-struct Claim(Arc<AtomicUsize>);
+struct Claim {
+    claimed: Arc<AtomicUsize>,
+    release_delay: Duration,
+}
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        std::thread::sleep(self.release_delay);
+        self.claimed.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -380,6 +395,8 @@ impl FakeOpener {
             writes_held: Arc::new(AtomicUsize::new(0)),
             claimed: Arc::new(AtomicUsize::new(0)),
             busy_refusals: Arc::new(AtomicUsize::new(0)),
+            claim_release_delay: Arc::new(Mutex::new(Duration::ZERO)),
+            hold_open: Arc::new((Mutex::new(false), Condvar::new())),
         }
     }
 
@@ -417,6 +434,18 @@ impl FibreOpener for FakeOpener {
             return Err("fake USB interface 2 is still claimed by the previous connection".into());
         }
         self.claimed.store(2, Ordering::SeqCst);
+        let release_delay = *self.claim_release_delay.lock().unwrap();
+        let claim = || Claim {
+            claimed: Arc::clone(&self.claimed),
+            release_delay,
+        };
+        {
+            let (held, wake) = &*self.hold_open;
+            let mut held = held.lock().unwrap();
+            while *held {
+                held = wake.wait(held).unwrap();
+            }
+        }
         *self.cut.lock().unwrap() = false;
         *self.opens.lock().unwrap() += 1;
         let (replies, inbox) = mpsc::channel();
@@ -426,7 +455,7 @@ impl FibreOpener for FakeOpener {
                 inbox,
                 _keep_open: replies.clone(),
                 cut: Arc::clone(&self.cut),
-                _claim: Claim(Arc::clone(&self.claimed)),
+                _claim: claim(),
             }),
             writer: Box::new(FakeWriter {
                 board: Arc::clone(&self.board),
@@ -434,7 +463,7 @@ impl FibreOpener for FakeOpener {
                 cut: Arc::clone(&self.cut),
                 gate: Arc::clone(&self.write_gate),
                 held: Arc::clone(&self.writes_held),
-                _claim: Claim(Arc::clone(&self.claimed)),
+                _claim: claim(),
             }),
         })
     }

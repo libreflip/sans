@@ -176,3 +176,92 @@ fn ended_connection_leaves_no_fresh_sample_behind() {
 
     assert!(link.handle.fresh_sample(Instant::now()).is_none());
 }
+
+#[test]
+fn move_stuck_in_the_writer_past_its_deadline_never_reaches_the_board() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    let mut link = Link::start(&opener);
+    link.wait_for_phase(1, LinkPhase::Verified);
+    let arm = link.handle.submit(LinkCommand::Arm, Priority::Ordinary);
+    assert_eq!(link.result(arm), CommandResult::Completed);
+    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
+
+    opener.block_writes();
+    let held = opener.writes_held.load(Ordering::SeqCst);
+    let clear = link
+        .handle
+        .submit(LinkCommand::ClearErrors, Priority::Urgent);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while opener.writes_held.load(Ordering::SeqCst) == held {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never picked up the urgent packet"
+        );
+        std::thread::yield_now();
+    }
+    let movement = link.handle.submit(
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Ordinary,
+    );
+    // Keep the writer stuck until the link has faulted and the move is retired.
+    let move_result = link.result(movement);
+    link.wait_for(|event| {
+        matches!(event, LinkEvent::Status(status)
+            if status.blockers.iter().any(|blocker| blocker.starts_with("link fault")))
+    });
+    opener.release_writes();
+
+    assert_eq!(move_result, CommandResult::Retired { transmitted: false });
+    assert!(matches!(
+        link.result(clear),
+        CommandResult::OutcomeUnknown { .. }
+    ));
+    // Disarm stays possible on the faulted link.
+    let disarm = link.handle.submit(LinkCommand::Disarm, Priority::Urgent);
+    assert_eq!(link.result(disarm), CommandResult::Completed);
+    let board = opener.board.lock().unwrap();
+    assert!(
+        board.writes_to(INPUT_POS).is_empty(),
+        "a stale move reached the board"
+    );
+    assert_eq!(board.requested_states(), vec![1, 8, 1]);
+}
+
+#[test]
+fn reopen_waits_until_the_old_device_halves_are_destroyed() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    // Each half takes 100 ms to give up the claim in its destructor.
+    *opener.claim_release_delay.lock().unwrap() = Duration::from_millis(100);
+    let mut link = Link::start(&opener);
+    link.wait_for_phase(1, LinkPhase::Verified);
+
+    link.handle.reconnect();
+    link.wait_for_phase(2, LinkPhase::Verified);
+
+    assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn superseded_open_is_destroyed_before_the_next_open() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    *opener.claim_release_delay.lock().unwrap() = Duration::from_millis(100);
+    *opener.hold_open.0.lock().unwrap() = true;
+    let mut link = Link::start(&opener);
+    // Epoch 1's open has claimed the device and is still draining.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while opener.claimed.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "epoch 1 never claimed the device"
+        );
+        std::thread::yield_now();
+    }
+
+    link.handle.reconnect();
+    link.wait_for(|event| matches!(event, LinkEvent::Status(status) if status.epoch == 2));
+    opener.release_open();
+    link.wait_for_phase(2, LinkPhase::Verified);
+
+    assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(*opener.opens.lock().unwrap(), 2);
+}

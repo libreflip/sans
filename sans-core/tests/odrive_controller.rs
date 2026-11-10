@@ -299,3 +299,42 @@ fn cutting_the_connection_then_reconnecting_reaches_verified_in_epoch_2_without_
     assert!(board.writes_to(CLEAR_ERRORS).is_empty());
     assert_eq!(*started.opener.opens.lock().unwrap(), 2);
 }
+
+#[test]
+fn shown_telemetry_keeps_ageing_after_the_link_falls_silent() {
+    let started = start(
+        &commissioned(),
+        FakeOpener::new(FakeFibre::compatible()),
+        true,
+    );
+    recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot
+            .lift_axis
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry.fresh)
+    });
+
+    // Every request now stalls: the link faults once and then sends no events.
+    started.opener.block_writes();
+    let stale = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot
+            .lift_axis
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| !telemetry.fresh)
+    });
+    let stale_age = stale.lift_axis.telemetry.as_ref().unwrap().age_ms;
+    // No link event follows the fault; only the controller's refresh can show
+    // the sample getting older.
+    let later = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot
+            .lift_axis
+            .telemetry
+            .as_ref()
+            .is_some_and(|telemetry| telemetry.age_ms > stale_age)
+    });
+    started.opener.release_writes();
+
+    assert!(!later.lift_axis.telemetry.as_ref().unwrap().fresh);
+}

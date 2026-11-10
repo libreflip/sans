@@ -190,9 +190,13 @@ fn assert_polling_controller_blocks(
     failure: &str,
 ) {
     fault_sender.send(SetupBlocker::new(failure)).unwrap();
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    // Lift-axis status snapshots keep the Ready screen; wait for the Setup change.
+    let blocked = support::recv_until(controller, |snapshot| {
+        !matches!(
+            snapshot.screen,
+            MachineScreen::Setup(SetupState::Ready { .. })
+        )
+    });
     assert_eq!(
         blocked.screen,
         MachineScreen::Setup(SetupState::Blocked {

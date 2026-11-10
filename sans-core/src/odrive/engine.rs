@@ -13,6 +13,8 @@
 //! reboot or DFU functions.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::descriptor::{check_capabilities, value_type, Descriptor, Endpoint, ResolvedEndpoints};
@@ -29,6 +31,8 @@ use crate::MachineProfile;
 const MAX_DESCRIPTOR_BYTES: usize = 256 * 1024;
 /// Ordinary commands that may wait for the link; a fifth is rejected.
 const ORDINARY_QUEUE_CAPACITY: usize = 4;
+/// Count-only status changes (ignored replies) publish at most this often.
+const COUNT_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 /// Pause between state-confirmation reads that did not match yet.
 const CONFIRM_REREAD_INTERVAL: Duration = Duration::from_millis(1);
 
@@ -102,7 +106,9 @@ pub enum LinkCommand {
         /// Target in millimetres, inside the commissioned travel bounds.
         position_mm: f32,
     },
-    /// Call `clear_errors`; confirmed by the next telemetry sample.
+    /// Call `clear_errors`; confirmed by the next telemetry sample. Accepted
+    /// only once this connection passed the capability, fingerprint and
+    /// identity checks and read the axis back idle.
     ClearErrors,
 }
 
@@ -339,21 +345,68 @@ pub enum LinkEvent {
     },
 }
 
+const DISPATCH_QUEUED: u8 = 0;
+const DISPATCH_SENT: u8 = 1;
+const DISPATCH_REVOKED: u8 = 2;
+
+/// Shared by the engine and the writer for one packet: it is either claimed
+/// for sending or revoked, exactly once, so both agree whether it left.
+#[derive(Clone, Debug)]
+struct DispatchToken(Arc<AtomicU8>);
+
+impl DispatchToken {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU8::new(DISPATCH_QUEUED)))
+    }
+
+    /// Revoke the packet. True when it never left the host.
+    fn revoke(&self) -> bool {
+        match self.0.compare_exchange(
+            DISPATCH_QUEUED,
+            DISPATCH_REVOKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == DISPATCH_REVOKED,
+        }
+    }
+}
+
 /// One packet to hand to the transport writer.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Transmit {
     /// The epoch the packet belongs to.
     pub epoch: u64,
     /// Urgent packets go before anything still queued.
     pub urgent: bool,
-    /// An ordinary command packet. A writer that still holds it when an urgent
-    /// packet arrives must discard it and report [`LinkEngine::transmit_withdrawn`],
-    /// so a queued move can never follow a stop.
-    pub retractable: bool,
-    /// The Fibre request sequence number the packet carries.
-    pub sequence: u16,
     /// The whole request packet.
     pub packet: Vec<u8>,
+    valid_until: Instant,
+    token: DispatchToken,
+}
+
+impl Transmit {
+    /// Claim the packet immediately before handing it to USB. `false` means
+    /// drop it unsent: the engine revoked it (deadline, link fault, an urgent
+    /// command, or the end of its connection), or `now` is past its validity.
+    /// An energizing write is valid only while the sample it was accepted on
+    /// is fresh, so readiness cannot go stale between enqueue and dispatch.
+    pub fn claim_for_send(&self, now: Instant) -> bool {
+        if now >= self.valid_until {
+            self.token.revoke();
+            return false;
+        }
+        self.token
+            .0
+            .compare_exchange(
+                DISPATCH_QUEUED,
+                DISPATCH_SENT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
 }
 
 /// Validated link configuration drawn from the Machine profile.
@@ -489,6 +542,14 @@ struct InFlight {
     sequence: u16,
     spec: RequestSpec,
     deadline: Instant,
+    token: DispatchToken,
+}
+
+impl InFlight {
+    /// The write or call that opens a command, as opposed to its confirmation read.
+    fn is_first_packet(&self) -> bool {
+        matches!(self.spec, RequestSpec::Write(..) | RequestSpec::Call(_))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -701,6 +762,8 @@ impl RawTelemetry {
 struct Connection {
     epoch: u64,
     opened: bool,
+    /// Capabilities, fingerprint and identity passed and idle was read back.
+    idle_confirmed: bool,
     ended: bool,
     gate: Option<GateStep>,
     gate_until: Instant,
@@ -739,6 +802,10 @@ pub struct LinkEngine {
     events: VecDeque<LinkEvent>,
     unmatched_replies: u64,
     last_status: Option<LinkStatus>,
+    /// The latest time any input carried.
+    clock: Option<Instant>,
+    last_count_publish: Option<Instant>,
+    count_pending: bool,
 }
 
 impl LinkEngine {
@@ -759,16 +826,21 @@ impl LinkEngine {
             events: VecDeque::new(),
             unmatched_replies: 0,
             last_status: None,
+            clock: None,
+            last_count_publish: None,
+            count_pending: false,
         }
     }
 
     /// Start a connection attempt with a fresh epoch, ending any current one.
     pub fn begin_attempt(&mut self, now: Instant) -> u64 {
+        self.clock = Some(now);
         self.end_epoch("connection ended for a new attempt");
         self.epoch += 1;
         self.connection = Some(Connection {
             epoch: self.epoch,
             opened: false,
+            idle_confirmed: false,
             ended: false,
             gate: Some(GateStep::Opening),
             gate_until: now + self.config.gate_deadline,
@@ -807,6 +879,8 @@ impl LinkEngine {
 
     /// The device opened and stale IN packets were discarded; start the gate.
     pub fn transport_opened(&mut self, now: Instant, usb_serial: &str) {
+        // A gate that already ran out must not start its descriptor download.
+        self.expire(now);
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -902,14 +976,7 @@ impl LinkEngine {
                             .any(|lane| lane.op.ticket == ticket && lane.op.transmitted)
                     }) {
                         self.retire_queue();
-                        let (withdrawn, kept): (VecDeque<_>, VecDeque<_>) = self
-                            .transmit_ordinary
-                            .drain(..)
-                            .partition(|transmit| transmit.retractable);
-                        self.transmit_ordinary = kept;
-                        for transmit in withdrawn {
-                            self.withdraw(transmit.epoch, transmit.sequence);
-                        }
+                        self.revoke_ordinary_command();
                     }
                 }
             },
@@ -948,13 +1015,6 @@ impl LinkEngine {
             .or_else(|| self.transmit_ordinary.pop_front())
     }
 
-    /// Whether packets or events are waiting to be taken.
-    pub fn has_output(&self) -> bool {
-        !(self.transmit_urgent.is_empty()
-            && self.transmit_ordinary.is_empty()
-            && self.events.is_empty())
-    }
-
     /// The next event.
     pub fn take_event(&mut self) -> Option<LinkEvent> {
         self.events.pop_front()
@@ -962,6 +1022,21 @@ impl LinkEngine {
 
     /// The earliest time `poll` has work to do.
     pub fn next_wakeup(&self) -> Option<Instant> {
+        let count_due = self
+            .count_pending
+            .then(|| {
+                self.last_count_publish
+                    .map(|last| last + COUNT_PUBLISH_INTERVAL)
+            })
+            .flatten();
+        let connection_wake = self.connection_wakeup();
+        match (count_due, connection_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn connection_wakeup(&self) -> Option<Instant> {
         let connection = self.connection.as_ref()?;
         if connection.ended {
             return None;
@@ -1042,6 +1117,7 @@ impl LinkEngine {
     /// The latest current-epoch sample, or `None` if there is none or it is
     /// older than the profile allows. A stale sample latches a link fault.
     pub fn fresh_sample(&mut self, now: Instant) -> Option<TelemetrySample> {
+        self.clock = Some(now);
         let sample = self.fresh_sample_inner(now);
         self.publish_status();
         sample
@@ -1081,20 +1157,37 @@ impl LinkEngine {
         let epoch = connection.epoch;
         let mut results = Vec::new();
         let mut quarantine = Vec::new();
+        let mut release = Vec::new();
+        let mut active_unsent_first = false;
         if let Some((in_flight, _)) = connection.ordinary.take() {
-            quarantine.push(in_flight.sequence);
+            if in_flight.token.revoke() {
+                release.push(in_flight.sequence);
+                active_unsent_first = in_flight.is_first_packet();
+            } else {
+                quarantine.push(in_flight.sequence);
+            }
         }
         if let Some(op) = connection.active.take() {
-            results.push((op.ticket, op.command, op.transmitted));
+            results.push((
+                op.ticket,
+                op.command,
+                op.transmitted && !active_unsent_first,
+            ));
         }
         for (ticket, command) in connection.queue.drain(..) {
             results.push((ticket, command, false));
         }
         for lane in connection.urgent.drain(..) {
+            let mut transmitted = lane.op.transmitted;
             if let Some(in_flight) = lane.in_flight {
-                quarantine.push(in_flight.sequence);
+                if in_flight.token.revoke() {
+                    release.push(in_flight.sequence);
+                    transmitted &= !in_flight.is_first_packet();
+                } else {
+                    quarantine.push(in_flight.sequence);
+                }
             }
-            results.push((lane.op.ticket, lane.op.command, lane.op.transmitted));
+            results.push((lane.op.ticket, lane.op.command, transmitted));
         }
         for waiting in connection.awaiting_sample.drain(..) {
             results.push((waiting.op.ticket, waiting.op.command, true));
@@ -1103,6 +1196,9 @@ impl LinkEngine {
         connection.polling = false;
         for sequence in quarantine {
             self.sequences.quarantine(sequence);
+        }
+        for sequence in release {
+            self.sequences.complete(sequence);
         }
         self.transmit_urgent
             .retain(|transmit| transmit.epoch != epoch);
@@ -1128,6 +1224,7 @@ impl LinkEngine {
             connection.fault = Some(reason);
         }
         self.retire_queue();
+        self.revoke_ordinary_command();
     }
 
     fn retire_queue(&mut self) {
@@ -1170,13 +1267,7 @@ impl LinkEngine {
 
     // ----- sending ------------------------------------------------------------
 
-    fn send(
-        &mut self,
-        now: Instant,
-        spec: RequestSpec,
-        urgent: bool,
-        retractable: bool,
-    ) -> Option<InFlight> {
+    fn send(&mut self, now: Instant, spec: RequestSpec, urgent: bool) -> Option<InFlight> {
         let connection = self.connection.as_ref()?;
         let epoch = connection.epoch;
         let Some(sequence) = self.sequences.allocate() else {
@@ -1222,12 +1313,27 @@ impl LinkEngine {
             } else {
                 self.config.request_deadline
             };
+        // An energizing write is valid only while its accepting sample is fresh.
+        let energizing = matches!(
+            spec,
+            RequestSpec::Write(Endpoint::InputPos, _)
+                | RequestSpec::Write(
+                    Endpoint::RequestedState,
+                    WireValue::I32(AXIS_STATE_CLOSED_LOOP_CONTROL | AXIS_STATE_HOMING)
+                )
+        );
+        let valid_until = match self.connection.as_ref().and_then(|c| c.latest.as_ref()) {
+            Some(sample) if energizing => deadline.min(sample.taken_at + self.config.max_age),
+            None if energizing => now,
+            _ => deadline,
+        };
+        let token = DispatchToken::new();
         let transmit = Transmit {
             epoch,
             urgent,
-            retractable,
-            sequence,
             packet,
+            valid_until,
+            token: token.clone(),
         };
         if urgent {
             self.transmit_urgent.push_back(transmit);
@@ -1238,12 +1344,12 @@ impl LinkEngine {
             sequence,
             spec,
             deadline,
+            token,
         })
     }
 
     fn send_ordinary(&mut self, now: Instant, spec: RequestSpec, owner: OrdinaryOwner) -> bool {
-        let retractable = owner == OrdinaryOwner::Command;
-        match self.send(now, spec, false, retractable) {
+        match self.send(now, spec, false) {
             Some(in_flight) => {
                 if let Some(connection) = self.connection.as_mut() {
                     connection.ordinary = Some((in_flight, owner));
@@ -1418,7 +1524,7 @@ impl LinkEngine {
         let Some(spec) = self.op_request(&op) else {
             return;
         };
-        if let Some(in_flight) = self.send(now, spec, true, false) {
+        if let Some(in_flight) = self.send(now, spec, true) {
             if let Some(entry) = self
                 .connection
                 .as_mut()
@@ -1455,10 +1561,24 @@ impl LinkEngine {
                     fault_on_miss: true,
                 },
             )),
-            LinkCommand::ClearErrors => Ok((
-                RequestSpec::Call(Endpoint::ClearErrors),
-                Confirm::NextSample,
-            )),
+            LinkCommand::ClearErrors => {
+                // Only a board whose identity and API passed and whose axis read
+                // back idle in this connection; Disarm alone needs less.
+                if !self
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.idle_confirmed)
+                {
+                    return Err(
+                        "clear errors needs a compatible board whose axis read back idle on this connection"
+                            .into(),
+                    );
+                }
+                Ok((
+                    RequestSpec::Call(Endpoint::ClearErrors),
+                    Confirm::NextSample,
+                ))
+            }
             LinkCommand::Arm => {
                 let values = self.ready_to_energize(now)?;
                 require_error_words_zero(&values)?;
@@ -1636,47 +1756,37 @@ impl LinkEngine {
     }
 
     /// The runner dropped a packet that arrived from an ended connection's reader.
-    pub fn stale_packet_dropped(&mut self) {
+    pub fn stale_packet_dropped(&mut self, now: Instant) {
+        self.clock = Some(now);
         self.note_unmatched("a packet from an ended connection");
         self.publish_status();
     }
 
-    /// A writer discarded an ordinary command packet before it left the host
-    /// because an urgent packet overtook it. The command is retired; it counts
-    /// as transmitted only if an earlier packet of it was sent.
-    pub fn transmit_withdrawn(&mut self, now: Instant, epoch: u64, sequence: u16) {
-        self.withdraw(epoch, sequence);
-        self.pump(now);
-        self.publish_status();
-    }
-
-    fn withdraw(&mut self, epoch: u64, sequence: u16) {
+    /// Revoke the ordinary command packet in flight if it has not left the
+    /// host, retiring its command with the exact transmitted flag. Used when an
+    /// urgent command is sent and when the link faults.
+    fn revoke_ordinary_command(&mut self) {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        if connection.epoch != epoch
-            || !connection
-                .ordinary
-                .as_ref()
-                .is_some_and(|(in_flight, owner)| {
-                    in_flight.sequence == sequence && *owner == OrdinaryOwner::Command
-                })
-        {
+        let unsent = connection
+            .ordinary
+            .as_ref()
+            .is_some_and(|(in_flight, owner)| {
+                *owner == OrdinaryOwner::Command && in_flight.token.revoke()
+            });
+        if !unsent {
             return;
         }
         let (in_flight, _) = connection.ordinary.take().expect("checked");
         // The number never left the host, so it can be handed out again.
-        self.sequences.complete(sequence);
-        let first_packet = matches!(
-            in_flight.spec,
-            RequestSpec::Write(..) | RequestSpec::Call(_)
-        );
+        self.sequences.complete(in_flight.sequence);
         if let Some(op) = self.connection.as_mut().and_then(|c| c.active.take()) {
             self.finish(
                 op.ticket,
                 op.command,
                 CommandResult::Retired {
-                    transmitted: !first_packet,
+                    transmitted: !in_flight.is_first_packet(),
                 },
             );
         }
@@ -1847,6 +1957,7 @@ impl LinkEngine {
                     return;
                 }
                 if let Some(connection) = self.connection.as_mut() {
+                    connection.idle_confirmed = true;
                     connection.polling = true;
                     connection.next_cycle_at = now;
                 }
@@ -2077,6 +2188,7 @@ impl LinkEngine {
     }
 
     fn expire(&mut self, now: Instant) {
+        self.clock = Some(now);
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -2103,12 +2215,33 @@ impl LinkEngine {
             .is_some_and(|(in_flight, _)| now >= in_flight.deadline)
         {
             let (in_flight, owner) = connection.ordinary.take().expect("checked");
-            self.sequences.quarantine(in_flight.sequence);
-            let reason = format!(
-                "{} got no reply within {} ms",
-                in_flight.spec.label(),
-                self.config.request_deadline.as_millis()
-            );
+            let unsent = in_flight.token.revoke();
+            let reason = if unsent {
+                self.sequences.complete(in_flight.sequence);
+                format!(
+                    "{} could not be sent within {} ms",
+                    in_flight.spec.label(),
+                    self.config.request_deadline.as_millis()
+                )
+            } else {
+                self.sequences.quarantine(in_flight.sequence);
+                format!(
+                    "{} got no reply within {} ms",
+                    in_flight.spec.label(),
+                    self.config.request_deadline.as_millis()
+                )
+            };
+            if unsent && owner == OrdinaryOwner::Command {
+                if let Some(op) = self.connection.as_mut().and_then(|c| c.active.take()) {
+                    self.finish(
+                        op.ticket,
+                        op.command,
+                        CommandResult::Retired {
+                            transmitted: !in_flight.is_first_packet(),
+                        },
+                    );
+                }
+            }
             self.latch_fault(reason.clone());
             self.fail_ordinary(now, owner, reason);
         }
@@ -2123,18 +2256,27 @@ impl LinkEngine {
             };
             let lane = connection.urgent.remove(lane);
             let in_flight = lane.in_flight.expect("checked");
-            self.sequences.quarantine(in_flight.sequence);
-            let reason = format!(
-                "urgent {} got no reply within {} ms",
-                in_flight.spec.label(),
-                self.config.urgent_deadline.as_millis()
-            );
-            self.latch_fault(reason.clone());
-            self.finish(
-                lane.op.ticket,
-                lane.op.command,
-                CommandResult::OutcomeUnknown { reason },
-            );
+            let result = if in_flight.token.revoke() {
+                self.sequences.complete(in_flight.sequence);
+                self.latch_fault(format!(
+                    "urgent {} could not be sent within {} ms",
+                    in_flight.spec.label(),
+                    self.config.urgent_deadline.as_millis()
+                ));
+                CommandResult::Retired {
+                    transmitted: !in_flight.is_first_packet(),
+                }
+            } else {
+                self.sequences.quarantine(in_flight.sequence);
+                let reason = format!(
+                    "urgent {} got no reply within {} ms",
+                    in_flight.spec.label(),
+                    self.config.urgent_deadline.as_millis()
+                );
+                self.latch_fault(reason.clone());
+                CommandResult::OutcomeUnknown { reason }
+            };
+            self.finish(lane.op.ticket, lane.op.command, result);
         }
         let connection = self.connection.as_mut().expect("connection");
         let (expired, waiting): (Vec<_>, Vec<_>) = connection
@@ -2178,12 +2320,42 @@ impl LinkEngine {
             .or(connection.freshness_reference)
     }
 
+    /// Emit a status event on change. Phase, blocker and discovery changes go
+    /// out at once; a change of only the ignored-reply count goes out at most
+    /// every 250 ms so a stream of stray packets cannot flood consumers.
     fn publish_status(&mut self) {
         let status = self.status();
-        if self.last_status.as_ref() != Some(&status) {
-            self.last_status = Some(status.clone());
-            self.events.push_back(LinkEvent::Status(status));
+        let Some(last) = self.last_status.as_ref() else {
+            return self.emit_status(status);
+        };
+        if *last == status {
+            return;
         }
+        let count_only = LinkStatus {
+            unmatched_replies: last.unmatched_replies,
+            ..status.clone()
+        } == *last;
+        if !count_only {
+            return self.emit_status(status);
+        }
+        let due = match (self.clock, self.last_count_publish) {
+            (Some(now), Some(last)) => {
+                now.saturating_duration_since(last) >= COUNT_PUBLISH_INTERVAL
+            }
+            _ => true,
+        };
+        if due {
+            self.emit_status(status);
+        } else {
+            self.count_pending = true;
+        }
+    }
+
+    fn emit_status(&mut self, status: LinkStatus) {
+        self.last_status = Some(status.clone());
+        self.last_count_publish = self.clock;
+        self.count_pending = false;
+        self.events.push_back(LinkEvent::Status(status));
     }
 }
 
