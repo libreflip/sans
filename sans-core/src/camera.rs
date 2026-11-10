@@ -1,5 +1,9 @@
 //! Complete Camera-pair acquisition behind role-specific adapters.
 
+#[cfg(any(target_os = "linux", test))]
+mod acquisition;
+#[cfg(any(target_os = "linux", test))]
+mod jpeg;
 #[cfg(target_os = "linux")]
 mod vl_cam;
 

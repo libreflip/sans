@@ -3,11 +3,12 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use image::ImageFormat;
 use rscam::{Camera, Config, IntervalInfo, ResolutionInfo};
 use thiserror::Error;
 
 use super::{
+    acquisition::{capture_fresh_frame, CAPTURE_BUFFERS},
+    jpeg::decode_camera_jpeg,
     resolve_live_camera_identities, resolve_live_camera_identity, CameraCaptureError, CameraRole,
     CapturePairMachine, CapturedFrame, RoleCamera,
 };
@@ -97,8 +98,7 @@ impl MachineFactory for V4lCameraMachineFactory {
 
 struct V4lRoleCamera {
     role: CameraRole,
-    identity: String,
-    interval: (u32, u32),
+    backend: Camera,
     rotation_degrees: u16,
     crop: crate::CropGeometry,
 }
@@ -129,17 +129,9 @@ impl V4lRoleCamera {
                 path.display()
             ))
         })?;
-        backend.stop().map_err(|error| {
-            SetupBlocker::new(format!(
-                "{role} Camera device {} cannot stop its readiness stream: {error}",
-                path.display()
-            ))
-        })?;
-
         Ok(Self {
             role,
-            identity: profile.identity.clone(),
-            interval,
+            backend,
             rotation_degrees: profile.rotation_degrees,
             crop: profile.crop,
         })
@@ -152,15 +144,7 @@ impl RoleCamera for V4lRoleCamera {
     }
 
     fn capture(&mut self) -> Result<CapturedFrame, CameraCaptureError> {
-        // rscam cannot restart a stopped Camera. Open a fresh stream for each
-        // request so no frame acquired while idle can become the next capture.
-        let mut backend = Camera::new(&self.identity)
-            .map_err(|error| CameraCaptureError::acquisition(self.role, error.to_string()))?;
-        backend
-            .start(&capture_config(self.interval))
-            .map_err(|error| CameraCaptureError::acquisition(self.role, error.to_string()))?;
-        let frame = backend
-            .capture()
+        let frame = capture_fresh_frame(|| self.backend.capture())
             .map_err(|error| CameraCaptureError::acquisition(self.role, error.to_string()))?;
         let captured_at = SystemTime::now();
         if frame.resolution != (FRAME_WIDTH, FRAME_HEIGHT) || frame.format != *MJPEG {
@@ -174,14 +158,9 @@ impl RoleCamera for V4lRoleCamera {
         }
         let jpeg = frame.to_vec();
         drop(frame);
-        backend
-            .stop()
-            .map_err(|error| CameraCaptureError::acquisition(self.role, error.to_string()))?;
-        drop(backend);
 
-        let decoded = image::load_from_memory_with_format(&jpeg, ImageFormat::Jpeg)
-            .map_err(|error| CameraCaptureError::decode(self.role, error.to_string()))?
-            .to_rgb8();
+        let decoded = decode_camera_jpeg(&jpeg)
+            .map_err(|error| CameraCaptureError::decode(self.role, error))?;
         if decoded.dimensions() != (FRAME_WIDTH, FRAME_HEIGHT) {
             return Err(CameraCaptureError::Profile {
                 role: self.role,
@@ -214,8 +193,7 @@ fn capture_config(interval: (u32, u32)) -> Config<'static> {
         interval,
         resolution: (FRAME_WIDTH, FRAME_HEIGHT),
         format: MJPEG,
-        // One transfer buffer is required by V4L2. There is no frame backlog.
-        nbuffers: 1,
+        nbuffers: CAPTURE_BUFFERS,
         ..Default::default()
     }
 }
