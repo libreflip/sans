@@ -4,4 +4,5 @@
 
 pub mod cameras;
 pub mod fixtures;
+pub mod pixels;
 pub mod session;
