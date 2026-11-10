@@ -271,6 +271,15 @@ pub fn portrait_full_frame() -> (Fixture, Fixture) {
     full_frame_pair(360, 640)
 }
 
+/// Portrait full-frame crop whose Left 100% preview is unavailable.
+pub fn portrait_without_left_detail() -> (Fixture, Fixture) {
+    let (left, right) = portrait_full_frame();
+    (
+        left.without_native_detail("fixture detail allocation failed"),
+        right,
+    )
+}
+
 /// Landscape full-frame crop.
 pub fn landscape_full_frame() -> (Fixture, Fixture) {
     full_frame_pair(640, 360)

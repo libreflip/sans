@@ -8,7 +8,9 @@ mod support;
 
 use eframe::egui;
 use sans_core::CameraRole;
-use support::fixtures::{crop_smaller_than_tile, portrait_full_frame, Fixture};
+use support::fixtures::{
+    crop_smaller_than_tile, portrait_full_frame, portrait_without_left_detail, Fixture,
+};
 use support::pixels::renderer;
 use support::proofs::{assert_detail_one_to_one, assert_full_page_markers, MIN_VISIBLE_ROWS};
 use support::session::{Session, Viewport, T2, T3, T4};
@@ -94,8 +96,7 @@ fn an_unavailable_detail_preview_leaves_the_other_three_views_intact() {
     let Some(renderer) = renderer("unavailable 100% preview") else {
         return;
     };
-    let (left, right) = portrait_full_frame();
-    let left = left.without_native_detail("fixture detail allocation failed");
+    let (left, right) = portrait_without_left_detail();
     let mut session =
         Session::with_pair_rendered((left.clone(), right.clone()), T2, Some(renderer));
 

@@ -7,7 +7,7 @@
 mod support;
 
 use support::cameras::{Gate, Step};
-use support::fixtures::portrait_full_frame;
+use support::fixtures::{portrait_full_frame, portrait_without_left_detail};
 use support::session::{Session, MATRIX_AND_MINIMUM, MINIMUM, T1};
 
 /// Assert `actions` stay put, nothing overflows sideways, and the node whose
@@ -132,9 +132,7 @@ fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
 #[test]
 fn warning_state_marks_the_unavailable_100_percent_preview() {
     for viewport in MATRIX_AND_MINIMUM {
-        let (left, right) = portrait_full_frame();
-        let left = left.without_native_detail("fixture detail allocation failed");
-        let mut session = Session::with_pair((left, right), viewport);
+        let mut session = Session::with_pair(portrait_without_left_detail(), viewport);
 
         assert!(
             session.has("100% preview warning"),
@@ -236,9 +234,7 @@ fn fatal_screen_scrolls_a_long_message_with_close_sans_fixed() {
 #[test]
 fn the_status_reads_in_full_beside_a_warning_tag_at_the_minimum_window() {
     let status_width = |viewport| {
-        let (left, right) = portrait_full_frame();
-        let left = left.without_native_detail("fixture detail allocation failed");
-        let session = Session::with_pair((left, right), viewport);
+        let session = Session::with_pair(portrait_without_left_detail(), viewport);
         assert!(session.has("100% preview warning"));
         session.rect("Cameras ready").width()
     };
