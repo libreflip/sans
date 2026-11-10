@@ -467,11 +467,6 @@ impl LinkConfig {
         self.gate_deadline
     }
 
-    /// Oldest usable telemetry sample.
-    pub fn max_telemetry_age(&self) -> Duration {
-        self.max_age
-    }
-
     /// Ordinary request deadline.
     pub fn request_deadline(&self) -> Duration {
         self.request_deadline
@@ -932,13 +927,6 @@ impl LinkEngine {
         self.publish_status();
     }
 
-    /// Explicitly end the current epoch.
-    pub fn disconnect(&mut self, now: Instant) {
-        self.expire(now);
-        self.end_epoch("disconnected");
-        self.publish_status();
-    }
-
     /// Handle one received packet.
     pub fn receive(&mut self, now: Instant, packet: &[u8]) {
         // Deadlines that passed before this packet arrived take effect first,
@@ -1002,7 +990,7 @@ impl LinkEngine {
                             .any(|lane| lane.op.ticket == ticket && lane.op.transmitted)
                     }) {
                         self.retire_queue();
-                        self.revoke_ordinary_command();
+                        self.revoke_ordinary_command(false);
                     }
                 }
             },
@@ -1011,19 +999,15 @@ impl LinkEngine {
                     self.retire_queue();
                     self.revoke_unsent_energizing();
                 }
-                let connection = self.connection.as_mut().expect("usable connection");
-                if connection.queue.len() >= ORDINARY_QUEUE_CAPACITY {
+                let queue = &mut self.connection.as_mut().expect("usable connection").queue;
+                if queue.len() < ORDINARY_QUEUE_CAPACITY {
+                    queue.push_back((ticket, command));
+                } else {
                     self.finish(ticket, command, CommandResult::Rejected {
                         reason: format!(
                             "ordinary command queue already holds {ORDINARY_QUEUE_CAPACITY} commands"
                         ),
                     });
-                } else {
-                    self.connection
-                        .as_mut()
-                        .expect("usable connection")
-                        .queue
-                        .push_back((ticket, command));
                 }
             }
         }
@@ -1057,17 +1041,10 @@ impl LinkEngine {
     /// The earliest time `poll` has work to do.
     pub fn next_wakeup(&self) -> Option<Instant> {
         let count_due = self
-            .count_pending
-            .then(|| {
-                self.last_count_publish
-                    .map(|last| last + COUNT_PUBLISH_INTERVAL)
-            })
-            .flatten();
-        let connection_wake = self.connection_wakeup();
-        match (count_due, connection_wake) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+            .last_count_publish
+            .filter(|_| self.count_pending)
+            .map(|last| last + COUNT_PUBLISH_INTERVAL);
+        self.connection_wakeup().into_iter().chain(count_due).min()
     }
 
     fn connection_wakeup(&self) -> Option<Instant> {
@@ -1082,23 +1059,15 @@ impl LinkEngine {
         if let Some((in_flight, _)) = &connection.ordinary {
             times.push(in_flight.deadline);
         }
-        times.extend(
-            connection
-                .urgent
-                .iter()
-                .filter_map(|lane| lane.in_flight.as_ref().map(|in_flight| in_flight.deadline)),
-        );
+        for lane in &connection.urgent {
+            times.extend(lane.in_flight.as_ref().map(|in_flight| in_flight.deadline));
+            times.extend(lane.op.not_before);
+        }
         times.extend(
             connection
                 .awaiting_sample
                 .iter()
                 .map(|waiting| waiting.until),
-        );
-        times.extend(
-            connection
-                .urgent
-                .iter()
-                .filter_map(|lane| lane.op.not_before),
         );
         times.extend(connection.active.as_ref().and_then(|op| op.not_before));
         if let Some(GateStep::IdleRead { not_before }) = connection.gate {
@@ -1163,9 +1132,6 @@ impl LinkEngine {
             return None;
         }
         let sample = connection.latest.clone()?;
-        if sample.epoch != connection.epoch {
-            return None;
-        }
         if sample.fresh_values(now).is_none() {
             self.latch_fault(format!(
                 "telemetry is older than {} ms",
@@ -1189,51 +1155,42 @@ impl LinkEngine {
         connection.gate = None;
         connection.blockers = vec![reason.to_owned()];
         let epoch = connection.epoch;
-        let mut results = Vec::new();
-        let mut quarantine = Vec::new();
-        let mut release = Vec::new();
-        let mut active_unsent_first = false;
-        if let Some((in_flight, _)) = connection.ordinary.take() {
-            if in_flight.token.revoke() {
-                release.push(in_flight.sequence);
-                active_unsent_first = in_flight.is_first_packet();
-            } else {
-                quarantine.push(in_flight.sequence);
-            }
-        }
-        if let Some(op) = connection.active.take() {
-            results.push((
-                op.ticket,
-                op.command,
-                op.transmitted && !active_unsent_first,
-            ));
-        }
-        for (ticket, command) in connection.queue.drain(..) {
-            results.push((ticket, command, false));
-        }
-        for lane in connection.urgent.drain(..) {
-            let mut transmitted = lane.op.transmitted;
-            if let Some(in_flight) = lane.in_flight {
-                if in_flight.token.revoke() {
-                    release.push(in_flight.sequence);
-                    transmitted &= !in_flight.is_first_packet();
-                } else {
-                    quarantine.push(in_flight.sequence);
-                }
-            }
-            results.push((lane.op.ticket, lane.op.command, transmitted));
-        }
-        for waiting in connection.awaiting_sample.drain(..) {
-            results.push((waiting.op.ticket, waiting.op.command, true));
-        }
         connection.cycle = None;
         connection.polling = false;
-        for sequence in quarantine {
-            self.sequences.quarantine(sequence);
+        let ordinary = connection.ordinary.take().map(|(in_flight, _)| in_flight);
+        let active = connection.active.take();
+        let queued = std::mem::take(&mut connection.queue);
+        let urgent = std::mem::take(&mut connection.urgent);
+        let awaiting = std::mem::take(&mut connection.awaiting_sample);
+
+        let mut results = Vec::new();
+        // A command counts as transmitted unless its only packet never left.
+        let unsent_first = ordinary.is_some_and(|in_flight| {
+            self.settle_unanswered(&in_flight) && in_flight.is_first_packet()
+        });
+        if let Some(op) = active {
+            results.push((op.ticket, op.command, op.transmitted && !unsent_first));
         }
-        for sequence in release {
-            self.sequences.complete(sequence);
+        results.extend(
+            queued
+                .into_iter()
+                .map(|(ticket, command)| (ticket, command, false)),
+        );
+        for lane in urgent {
+            let unsent_first = lane.in_flight.is_some_and(|in_flight| {
+                self.settle_unanswered(&in_flight) && in_flight.is_first_packet()
+            });
+            results.push((
+                lane.op.ticket,
+                lane.op.command,
+                lane.op.transmitted && !unsent_first,
+            ));
         }
+        results.extend(
+            awaiting
+                .into_iter()
+                .map(|waiting| (waiting.op.ticket, waiting.op.command, true)),
+        );
         self.transmit_urgent
             .retain(|transmit| transmit.epoch != epoch);
         self.transmit_ordinary
@@ -1275,6 +1232,19 @@ impl LinkEngine {
                 result: CommandResult::Retired { transmitted: false },
             });
         }
+    }
+
+    /// Settle a request that will get no reply. A number that never left the
+    /// host is handed out again; one that did is quarantined for the process.
+    /// True when the request never left.
+    fn settle_unanswered(&mut self, in_flight: &InFlight) -> bool {
+        let unsent = in_flight.token.revoke();
+        if unsent {
+            self.sequences.complete(in_flight.sequence);
+        } else {
+            self.sequences.quarantine(in_flight.sequence);
+        }
+        unsent
     }
 
     fn finish(&mut self, ticket: Ticket, command: LinkCommand, result: CommandResult) {
@@ -1376,15 +1346,14 @@ impl LinkEngine {
     }
 
     fn send_ordinary(&mut self, now: Instant, spec: RequestSpec, owner: OrdinaryOwner) -> bool {
-        match self.send(now, spec, false) {
-            Some(in_flight) => {
-                if let Some(connection) = self.connection.as_mut() {
-                    connection.ordinary = Some((in_flight, owner));
-                }
-                true
-            }
-            None => false,
-        }
+        let Some(in_flight) = self.send(now, spec, false) else {
+            return false;
+        };
+        self.connection
+            .as_mut()
+            .expect("send needs a connection")
+            .ordinary = Some((in_flight, owner));
+        true
     }
 
     /// Fill the ordinary slot: gate, then a waiting command, then telemetry.
@@ -1407,42 +1376,33 @@ impl LinkEngine {
                     return;
                 }
             }
-            let connection = self.connection.as_ref().expect("checked above");
-            // While a confirmation waits to re-read, telemetry may use the slot
-            // so freshness is still maintained; queued commands still wait.
-            let mut confirmation_waiting = false;
+            let connection = self.connection.as_mut().expect("checked above");
             if let Some(op) = connection.active.clone() {
-                if op.not_before.is_some_and(|not_before| now < not_before) {
-                    confirmation_waiting = true;
-                } else {
+                // While a confirmation waits to re-read, telemetry may use the
+                // slot so freshness is maintained; queued commands still wait.
+                if !op.not_before.is_some_and(|not_before| now < not_before) {
                     if let Some(spec) = self.op_request(&op) {
                         if self.send_ordinary(now, spec, OrdinaryOwner::Command) {
-                            let connection = self.connection.as_mut().expect("connection");
-                            let active = connection.active.as_mut().expect("active");
+                            let active = self.connection.as_mut().and_then(|c| c.active.as_mut());
+                            let active = active.expect("active");
                             active.transmitted = true;
                             advance_after_send(active, now);
                         }
                     }
                     return;
                 }
-            }
-            if !confirmation_waiting
-                && (connection.gate.is_none()
-                    || matches!(connection.gate, Some(GateStep::FirstCycle)))
+            } else if connection.gate.is_none()
+                || matches!(connection.gate, Some(GateStep::FirstCycle))
             {
-                if let Some((ticket, command)) = self
-                    .connection
-                    .as_mut()
-                    .and_then(|connection| connection.queue.pop_front())
-                {
+                if let Some((ticket, command)) = connection.queue.pop_front() {
                     match self.plan(now, command) {
                         Err(reason) => {
                             self.finish(ticket, command, CommandResult::Rejected { reason });
                         }
                         Ok((write, confirm)) => {
                             let window = self.config.request_deadline;
-                            if let Some(connection) = self.connection.as_mut() {
-                                connection.active = Some(Operation {
+                            self.connection.as_mut().expect("connection").active =
+                                Some(Operation {
                                     ticket,
                                     command,
                                     write,
@@ -1453,7 +1413,6 @@ impl LinkEngine {
                                     confirm_until: None,
                                     not_before: None,
                                 });
-                            }
                         }
                     }
                     continue;
@@ -1466,13 +1425,11 @@ impl LinkEngine {
             let index = match &connection.cycle {
                 Some(cycle) => cycle.next,
                 None if now >= connection.next_cycle_at => {
-                    if let Some(connection) = self.connection.as_mut() {
-                        connection.cycle = Some(Cycle {
-                            started_at: now,
-                            next: 0,
-                            raw: RawTelemetry::default(),
-                        });
-                    }
+                    self.connection.as_mut().expect("connection").cycle = Some(Cycle {
+                        started_at: now,
+                        next: 0,
+                        raw: RawTelemetry::default(),
+                    });
                     0
                 }
                 None => return,
@@ -1589,8 +1546,8 @@ impl LinkEngine {
                 },
             )),
             LinkCommand::ClearErrors => {
-                // Only a board whose identity and API passed and whose axis read
-                // back idle in this connection; Disarm alone needs less.
+                // Only a board whose identity and capabilities passed and whose
+                // axis read back idle in this connection; Disarm alone needs less.
                 if !self
                     .connection
                     .as_ref()
@@ -1812,57 +1769,37 @@ impl LinkEngine {
     /// disarm, clear-errors and read packets are untouched, so a new disarm
     /// stays possible. Used on link faults and when a disarm is accepted.
     fn revoke_unsent_energizing(&mut self) {
+        self.revoke_ordinary_command(true);
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
-        let mut retired = Vec::new();
-        let mut released = Vec::new();
-        if connection
-            .ordinary
-            .as_ref()
-            .is_some_and(|(in_flight, owner)| {
-                *owner == OrdinaryOwner::Command
-                    && in_flight.is_energizing()
-                    && in_flight.token.revoke()
-            })
-        {
-            let (in_flight, _) = connection.ordinary.take().expect("checked");
-            released.push(in_flight.sequence);
-            if let Some(op) = connection.active.take() {
-                retired.push((op.ticket, op.command));
-            }
-        }
+        let mut revoked = Vec::new();
         let mut index = 0;
         while index < connection.urgent.len() {
-            let revoked = connection.urgent[index]
+            let unsent = connection.urgent[index]
                 .in_flight
                 .as_ref()
                 .is_some_and(|in_flight| in_flight.is_energizing() && in_flight.token.revoke());
-            if revoked {
-                let lane = connection.urgent.remove(index);
-                released.push(lane.in_flight.expect("checked").sequence);
-                retired.push((lane.op.ticket, lane.op.command));
+            if unsent {
+                revoked.push(connection.urgent.remove(index));
             } else {
                 index += 1;
             }
         }
-        for sequence in released {
-            // The number never left the host, so it can be handed out again.
-            self.sequences.complete(sequence);
-        }
-        for (ticket, command) in retired {
+        for lane in revoked {
+            self.settle_unanswered(&lane.in_flight.expect("checked"));
             self.finish(
-                ticket,
-                command,
+                lane.op.ticket,
+                lane.op.command,
                 CommandResult::Retired { transmitted: false },
             );
         }
     }
 
     /// Revoke the ordinary command packet in flight if it has not left the
-    /// host, retiring its command with the exact transmitted flag. Used when an
-    /// urgent command is sent and when the link faults.
-    fn revoke_ordinary_command(&mut self) {
+    /// host (only an energizing one when `energizing_only`), retiring its
+    /// command with the exact transmitted flag.
+    fn revoke_ordinary_command(&mut self, energizing_only: bool) {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -1870,14 +1807,15 @@ impl LinkEngine {
             .ordinary
             .as_ref()
             .is_some_and(|(in_flight, owner)| {
-                *owner == OrdinaryOwner::Command && in_flight.token.revoke()
+                *owner == OrdinaryOwner::Command
+                    && (!energizing_only || in_flight.is_energizing())
+                    && in_flight.token.revoke()
             });
         if !unsent {
             return;
         }
         let (in_flight, _) = connection.ordinary.take().expect("checked");
-        // The number never left the host, so it can be handed out again.
-        self.sequences.complete(in_flight.sequence);
+        self.settle_unanswered(&in_flight);
         if let Some(op) = self.connection.as_mut().and_then(|c| c.active.take()) {
             self.finish(
                 op.ticket,
@@ -2092,14 +2030,15 @@ impl LinkEngine {
                 },
                 Reply::Value(value),
             ) => {
-                let (endpoint, written) = self.limit_writes().expect("commissioned")[index];
+                let limits = self.limit_writes().expect("commissioned");
+                let (endpoint, written) = limits[index];
                 if !same_bits(value, WireValue::F32(written)) {
                     self.fail_gate(Some(format!(
                         "{endpoint:?} read back {value:?} after Sans wrote {written}"
                     )));
                     return;
                 }
-                if index + 1 < 5 {
+                if index + 1 < limits.len() {
                     self.set_gate(GateStep::Limit {
                         index: index + 1,
                         readback: false,
@@ -2304,22 +2243,17 @@ impl LinkEngine {
             .is_some_and(|(in_flight, _)| now >= in_flight.deadline)
         {
             let (in_flight, owner) = connection.ordinary.take().expect("checked");
-            let unsent = in_flight.token.revoke();
-            let reason = if unsent {
-                self.sequences.complete(in_flight.sequence);
-                format!(
-                    "{} could not be sent within {} ms",
-                    in_flight.spec.label(),
-                    self.config.request_deadline.as_millis()
-                )
-            } else {
-                self.sequences.quarantine(in_flight.sequence);
-                format!(
-                    "{} got no reply within {} ms",
-                    in_flight.spec.label(),
-                    self.config.request_deadline.as_millis()
-                )
-            };
+            let unsent = self.settle_unanswered(&in_flight);
+            let reason = format!(
+                "{} {} within {} ms",
+                in_flight.spec.label(),
+                if unsent {
+                    "could not be sent"
+                } else {
+                    "got no reply"
+                },
+                self.config.request_deadline.as_millis()
+            );
             if unsent && owner == OrdinaryOwner::Command {
                 if let Some(op) = self.connection.as_mut().and_then(|c| c.active.take()) {
                     self.finish(
@@ -2345,24 +2279,23 @@ impl LinkEngine {
             };
             let lane = connection.urgent.remove(lane);
             let in_flight = lane.in_flight.expect("checked");
-            let result = if in_flight.token.revoke() {
-                self.sequences.complete(in_flight.sequence);
-                self.latch_fault(format!(
-                    "urgent {} could not be sent within {} ms",
-                    in_flight.spec.label(),
-                    self.config.urgent_deadline.as_millis()
-                ));
+            let unsent = self.settle_unanswered(&in_flight);
+            let reason = format!(
+                "urgent {} {} within {} ms",
+                in_flight.spec.label(),
+                if unsent {
+                    "could not be sent"
+                } else {
+                    "got no reply"
+                },
+                self.config.urgent_deadline.as_millis()
+            );
+            self.latch_fault(reason.clone());
+            let result = if unsent {
                 CommandResult::Retired {
                     transmitted: !in_flight.is_first_packet(),
                 }
             } else {
-                self.sequences.quarantine(in_flight.sequence);
-                let reason = format!(
-                    "urgent {} got no reply within {} ms",
-                    in_flight.spec.label(),
-                    self.config.urgent_deadline.as_millis()
-                );
-                self.latch_fault(reason.clone());
                 CommandResult::OutcomeUnknown { reason }
             };
             self.finish(lane.op.ticket, lane.op.command, result);
@@ -2383,23 +2316,23 @@ impl LinkEngine {
             );
         }
         let connection = self.connection.as_ref().expect("connection");
-        if connection.fault.is_none() {
-            if let Some(reference) = self.freshness_reference(connection) {
-                if now > reference + self.config.max_age {
-                    self.latch_fault(format!(
-                        "telemetry is older than {} ms",
-                        self.config.max_age.as_millis()
-                    ));
-                }
-            }
+        if self
+            .freshness_reference(connection)
+            .is_some_and(|reference| now > reference + self.config.max_age)
+        {
+            self.latch_fault(format!(
+                "telemetry is older than {} ms",
+                self.config.max_age.as_millis()
+            ));
         }
     }
 
     fn freshness_reference(&self, connection: &Connection) -> Option<Instant> {
-        if connection.ended || connection.gate.is_some() || !connection.polling {
-            return None;
-        }
-        if connection.fault.is_some() {
+        if connection.ended
+            || connection.gate.is_some()
+            || !connection.polling
+            || connection.fault.is_some()
+        {
             return None;
         }
         connection

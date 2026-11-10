@@ -126,7 +126,7 @@ where
                 shared,
                 active: None,
                 attempt_epoch: Arc::new(AtomicU64::new(0)),
-                releasing: Some(ReleaseBarrier::new(0)),
+                release: ReleaseBarrier::new(),
             }
             .run(inbox);
         })?;
@@ -156,9 +156,9 @@ struct ReleaseBarrier {
 }
 
 impl ReleaseBarrier {
-    fn new(halves: usize) -> Arc<Self> {
+    fn new() -> Arc<Self> {
         Arc::new(Self {
-            live: Mutex::new(halves),
+            live: Mutex::new(0),
             released: Condvar::new(),
         })
     }
@@ -255,17 +255,15 @@ struct GuardedConnection {
     usb_serial: String,
     reader: ReleaseOnExit<Box<dyn PacketReader>>,
     writer: ReleaseOnExit<Box<dyn PacketWriter>>,
-    released: Arc<ReleaseBarrier>,
 }
 
 impl GuardedConnection {
-    fn new(connection: FibreConnection, released: Arc<ReleaseBarrier>) -> Self {
-        released.register_connection();
+    fn new(connection: FibreConnection, release: &Arc<ReleaseBarrier>) -> Self {
+        release.register_connection();
         Self {
             usb_serial: connection.usb_serial,
-            reader: ReleaseOnExit::new(connection.reader, &released),
-            writer: ReleaseOnExit::new(connection.writer, &released),
-            released,
+            reader: ReleaseOnExit::new(connection.reader, release),
+            writer: ReleaseOnExit::new(connection.writer, release),
         }
     }
 }
@@ -274,27 +272,13 @@ struct ActiveTransport {
     epoch: u64,
     stop: Arc<AtomicBool>,
     writer: Arc<WriterQueue>,
-    released: Arc<ReleaseBarrier>,
 }
 
 impl ActiveTransport {
-    /// Ask both I/O threads to stop and return the barrier of their release.
-    fn close(self) -> Arc<ReleaseBarrier> {
+    /// Ask both I/O threads to stop; their guards report release on exit.
+    fn close(self) {
         self.stop.store(true, Ordering::SeqCst);
         self.writer.close();
-        self.released
-    }
-}
-
-/// Wait, on the open thread, until the previous connection has released the
-/// device, so a reopen never races the old claim.
-fn await_release(released: Option<Arc<ReleaseBarrier>>, bound: Duration) -> Result<(), String> {
-    match released {
-        Some(barrier) if !barrier.wait(bound) => Err(format!(
-            "the previous ODrive connection did not release the device within {} ms",
-            bound.as_millis()
-        )),
-        _ => Ok(()),
     }
 }
 
@@ -308,9 +292,9 @@ struct EngineThread<E> {
     active: Option<ActiveTransport>,
     /// Fences open threads that are superseded while waiting for the opener.
     attempt_epoch: Arc<AtomicU64>,
-    /// Shared release barrier for all opens, including rejected results.
-    /// Kept across attempts that time out waiting for transfer cancellation.
-    releasing: Option<Arc<ReleaseBarrier>>,
+    /// One release barrier for every open, including rejected results, so an
+    /// attempt that times out waiting leaves the wait for the next attempt.
+    release: Arc<ReleaseBarrier>,
 }
 
 impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
@@ -377,7 +361,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         let request = OpenRequest {
             usb_serial: self.config.usb_serial().to_owned(),
         };
-        let released = self.releasing.clone();
+        let release = Arc::clone(&self.release);
         let release_bound = self.config.gate_deadline();
         let spawned = thread::Builder::new()
             .name("sans-odrive-open".into())
@@ -388,7 +372,13 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                 if attempt_epoch.load(Ordering::SeqCst) != epoch {
                     return;
                 }
-                if let Err(reason) = await_release(released.clone(), release_bound) {
+                // Wait until the previous connection released the device, so a
+                // reopen never races the old claim.
+                if !release.wait(release_bound) {
+                    let reason = format!(
+                        "the previous ODrive connection did not release the device within {} ms",
+                        release_bound.as_millis()
+                    );
                     let (accepted, _) = mpsc::channel();
                     let _ = loopback.send(Input::Opened(epoch, Err(reason), accepted));
                     return;
@@ -397,10 +387,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                     return;
                 }
                 let result = opener.open(&request).map(|connection| {
-                    let mut connection = GuardedConnection::new(
-                        connection,
-                        released.expect("runner retains its release barrier"),
-                    );
+                    let mut connection = GuardedConnection::new(connection, &release);
                     drain(connection.reader.half().as_mut());
                     connection
                 });
@@ -443,7 +430,6 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
             usb_serial,
             reader,
             writer,
-            released,
         } = connection;
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriterQueue::default());
@@ -464,7 +450,6 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
             epoch,
             stop,
             writer: queue,
-            released,
         });
         match started {
             Ok(()) => self.engine.transport_opened(now, &usb_serial),
@@ -478,7 +463,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
 
     fn close_transport(&mut self) {
         if let Some(active) = self.active.take() {
-            self.releasing = Some(active.close());
+            active.close();
         }
     }
 

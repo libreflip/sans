@@ -16,9 +16,9 @@ use super::transport::{FibreConnection, FibreOpener, OpenRequest, PacketReader, 
 // (fw-v0.5.1), fetched 2026-11-10, and the #57 capture (`1209:0d32`).
 
 /// USB vendor ID. `Firmware/Board/v3/Src/usbd_desc.c` `USBD_VID 0x1209`.
-pub const ODRIVE_USB_VENDOR_ID: u16 = 0x1209;
+const ODRIVE_USB_VENDOR_ID: u16 = 0x1209;
 /// USB product ID. `Firmware/Board/v3/Src/usbd_desc.c` `USBD_PID_FS 0x0D32`.
-pub const ODRIVE_USB_PRODUCT_ID: u16 = 0x0d32;
+const ODRIVE_USB_PRODUCT_ID: u16 = 0x0d32;
 /// The native vendor-class interface: `bInterfaceNumber 0x02`, class `0x00`
 /// "vendor specific", in the configuration descriptor of
 /// `Firmware/Board/v3/Middlewares/ST/STM32_USB_Device_Library/Class/CDC/Src/usbd_cdc.c`.

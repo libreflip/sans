@@ -1669,3 +1669,22 @@ fn ordinary_disarm_retires_a_full_queue_before_checking_capacity() {
     assert_eq!(link.result(20), Some(CommandResult::Completed));
     assert!(link.board.writes_to(INPUT_POS).is_empty());
 }
+
+#[test]
+fn connection_loss_retires_an_active_command_whose_write_never_left_as_untransmitted() {
+    let mut link = verified(commissioned(), FakeFibre::compatible());
+    link.engine
+        .submit(link.now, Ticket(1), LinkCommand::Arm, Priority::Ordinary);
+    let stuck = link.take_unclaimed();
+    assert_eq!(stuck.len(), 1, "the arm write waits in the writer");
+
+    link.engine.transport_lost(link.now, "fake cable cut");
+    link.drain_events();
+
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(!stuck[0].claim_for_send(link.now));
+    assert_eq!(link.board.requested_states(), vec![1]);
+}

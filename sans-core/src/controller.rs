@@ -1,6 +1,5 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
-use std::cell::Cell;
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -428,7 +427,7 @@ fn spawn_controller<Factory: MachineFactory>(
                 latest_complete_pair: None,
                 snapshots: snapshot_sender,
             };
-            if !state.publish(&lift) {
+            if !state.publish(&mut lift) {
                 return;
             }
 
@@ -438,7 +437,7 @@ fn spawn_controller<Factory: MachineFactory>(
                         state.screen = MachineScreen::Setup(SetupState::Blocked {
                             reasons: vec![blocker],
                         });
-                        if !state.publish(&lift) {
+                        if !state.publish(&mut lift) {
                             return;
                         }
                         active_machine = None;
@@ -449,10 +448,10 @@ fn spawn_controller<Factory: MachineFactory>(
                 // Machine, or the next refresh of a shown sample, so its age
                 // and freshness keep moving even if the link has gone silent.
                 let setup_poll = active_machine.is_some().then_some(SETUP_POLL_INTERVAL);
-                let wait = match (setup_poll, lift.refresh_wait(Instant::now())) {
-                    (Some(poll), Some(refresh)) => Some(poll.min(refresh)),
-                    (poll, refresh) => poll.or(refresh),
-                };
+                let wait = setup_poll
+                    .into_iter()
+                    .chain(lift.refresh_wait(Instant::now()))
+                    .min();
                 let message = match wait {
                     None => match inbox.recv() {
                         Ok(message) => message,
@@ -461,7 +460,7 @@ fn spawn_controller<Factory: MachineFactory>(
                     Some(wait) => match inbox.recv_timeout(wait) {
                         Ok(message) => message,
                         Err(RecvTimeoutError::Timeout) => {
-                            if lift.refresh_due(Instant::now()) && !state.publish(&lift) {
+                            if lift.refresh_due(Instant::now()) && !state.publish(&mut lift) {
                                 return;
                             }
                             continue;
@@ -478,7 +477,7 @@ fn spawn_controller<Factory: MachineFactory>(
                             CaptureStatus::Capturing,
                             state.latest_complete_pair.clone(),
                         );
-                        if !state.publish(&lift) {
+                        if !state.publish(&mut lift) {
                             return;
                         }
                         let status = match machine.capture_pair() {
@@ -491,19 +490,19 @@ fn spawn_controller<Factory: MachineFactory>(
                             },
                         };
                         state.screen = capture_preview(status, state.latest_complete_pair.clone());
-                        if !state.publish(&lift) {
+                        if !state.publish(&mut lift) {
                             return;
                         }
                     }
                     Inbox::Intent(ControllerIntent::ReconnectLiftAxis) => lift.reconnect(),
                     Inbox::Intent(ControllerIntent::Exit) => {
                         state.screen = MachineScreen::Exited;
-                        let _ = state.publish(&lift);
+                        let _ = state.publish(&mut lift);
                         return;
                     }
                     Inbox::Link(event) => {
                         let publish = lift.apply(event) || lift.refresh_due(Instant::now());
-                        if publish && !state.publish(&lift) {
+                        if publish && !state.publish(&mut lift) {
                             return;
                         }
                     }
@@ -529,7 +528,7 @@ struct Projection {
 
 impl Projection {
     /// Replace the pending snapshot with the current projection.
-    fn publish(&mut self, lift: &LiftAxis) -> bool {
+    fn publish(&mut self, lift: &mut LiftAxis) -> bool {
         let snapshot = ControllerSnapshot {
             revision: self.revision,
             screen: self.screen.clone(),
@@ -548,7 +547,7 @@ struct LiftAxis {
     status: LiftAxisStatus,
     latest: Option<TelemetrySample>,
     /// When a snapshot last carried this projection.
-    last_publish: Cell<Option<Instant>>,
+    last_publish: Option<Instant>,
 }
 
 impl LiftAxis {
@@ -561,7 +560,7 @@ impl LiftAxis {
             link: None,
             status: LiftAxisStatus::starting(),
             latest: None,
-            last_publish: Cell::new(None),
+            last_publish: None,
         };
         let config = match LinkConfig::from_profile(profile.profile()) {
             Ok(config) => config,
@@ -619,24 +618,21 @@ impl LiftAxis {
         }
     }
 
-    /// A sample is shown and the last snapshot is at least 250 ms old.
-    fn refresh_due(&self, now: Instant) -> bool {
-        self.latest.is_some()
-            && self.last_publish.get().is_none_or(|last| {
-                now.saturating_duration_since(last) >= TELEMETRY_PUBLISH_INTERVAL
-            })
-    }
-
     /// How long the controller may wait before the next refresh, if a sample is shown.
     fn refresh_wait(&self, now: Instant) -> Option<Duration> {
         self.latest.as_ref()?;
-        Some(self.last_publish.get().map_or(Duration::ZERO, |last| {
+        Some(self.last_publish.map_or(Duration::ZERO, |last| {
             TELEMETRY_PUBLISH_INTERVAL.saturating_sub(now.saturating_duration_since(last))
         }))
     }
 
-    fn status(&self, now: Instant) -> LiftAxisStatus {
-        self.last_publish.set(Some(now));
+    /// A sample is shown and the last snapshot is at least 250 ms old.
+    fn refresh_due(&self, now: Instant) -> bool {
+        self.refresh_wait(now).is_some_and(|wait| wait.is_zero())
+    }
+
+    fn status(&mut self, now: Instant) -> LiftAxisStatus {
+        self.last_publish = Some(now);
         let mut status = self.status.clone();
         status.telemetry = self
             .latest

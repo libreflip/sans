@@ -18,10 +18,8 @@ pub use crate::camera::{
 pub use crate::config::{
     prepare_machine_profile, resolve_machine_profile_path, BoardProfile, CameraProfiles,
     CameraRoleProfile, CropGeometry, LiftAxisProfile, LiftDirection, MachineProfile, MotionProfile,
-    MotorLimits, OdriveProfile, PageWidthProfile, PickupProfile, PreparedMachineProfile,
-    ProfileSaveError, StartupError, TimeoutProfile, MACHINE_PROFILE_SCHEMA_VERSION,
-    MACHINE_PROFILE_TEMPLATE, ODRIVE_ACCELERATION_CAP_TURNS_PER_S2, ODRIVE_CURRENT_LIMIT_CAP_A,
-    ODRIVE_VELOCITY_CAP_TURNS_PER_S,
+    OdriveProfile, PageWidthProfile, PickupProfile, PreparedMachineProfile, ProfileSaveError,
+    StartupError, TimeoutProfile, MACHINE_PROFILE_TEMPLATE,
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
@@ -37,5 +35,5 @@ pub use crate::odrive::{
     spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,
     LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkHandle, LinkPhase, LinkRunner, LinkStatus,
     OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample, TelemetryValues, Ticket,
-    Transmit, UsbFibreOpener, ODRIVE_USB_PRODUCT_ID, ODRIVE_USB_VENDOR_ID,
+    Transmit, UsbFibreOpener,
 };

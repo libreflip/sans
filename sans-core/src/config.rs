@@ -12,8 +12,7 @@ use thiserror::Error;
 pub const MACHINE_PROFILE_TEMPLATE: &str = include_str!("../../sans.example.toml");
 
 /// The only Machine-profile schema version this build reads.
-pub const MACHINE_PROFILE_SCHEMA_VERSION: u32 = 2;
-const SCHEMA_VERSION_INTEGER: i64 = MACHINE_PROFILE_SCHEMA_VERSION as i64;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_TOUCHDOWN_PRESS_PERCENT: f32 = 50.0;
 const MAX_CLASSIFICATION_START_PERCENT: f32 = 10.0;
 const MAX_WIGGLE_START_PERCENT: f32 = 65.0;
@@ -24,29 +23,29 @@ const MAX_FINAL_LIFT_PERCENT: f32 = 105.0;
 const MAX_BLOWER_OFF_DESCENT_PERCENT: f32 = 80.0;
 const MAX_STOP_TERMINAL_MS: u64 = 500;
 /// Immutable bounds on `odrive.poll_interval_ms`. Provisional and unmeasured; #60 reviews them.
-pub const ODRIVE_POLL_INTERVAL_BOUNDS_MS: (u64, u64) = (5, 100);
+const ODRIVE_POLL_INTERVAL_BOUNDS_MS: (u64, u64) = (5, 100);
 /// Immutable ceiling on `odrive.telemetry_max_age_ms`. Provisional and unmeasured.
-pub const ODRIVE_MAX_TELEMETRY_AGE_CEILING_MS: u64 = 250;
+const ODRIVE_MAX_TELEMETRY_AGE_CEILING_MS: u64 = 250;
 /// Immutable bounds on `odrive.request_deadline_ms`. Provisional and unmeasured.
-pub const ODRIVE_REQUEST_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 250);
+const ODRIVE_REQUEST_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 250);
 /// Immutable bounds on `odrive.urgent_deadline_ms`. Provisional and unmeasured.
-pub const ODRIVE_URGENT_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 100);
+const ODRIVE_URGENT_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 100);
 /// Software policy cap on the commissioned motor current limit, in amps.
 ///
 /// This is an arbitrary conservative starting bound chosen as host policy. It is
 /// not derived from the mechanism and makes no physical safety qualification.
 /// It matches the `current_lim` observed on the board on 2026-11-10, which is
 /// provenance only. #60 reviews it before any change.
-pub const ODRIVE_CURRENT_LIMIT_CAP_A: f32 = 4.8;
+const ODRIVE_CURRENT_LIMIT_CAP_A: f32 = 4.8;
 /// Software policy cap on commissioned velocity, in motor turns per second.
 ///
 /// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
-pub const ODRIVE_VELOCITY_CAP_TURNS_PER_S: f32 = 1.0;
+const ODRIVE_VELOCITY_CAP_TURNS_PER_S: f32 = 1.0;
 /// Software policy cap on commissioned acceleration and deceleration, in motor
 /// turns per second squared.
 ///
 /// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
-pub const ODRIVE_ACCELERATION_CAP_TURNS_PER_S2: f32 = 1.0;
+const ODRIVE_ACCELERATION_CAP_TURNS_PER_S2: f32 = 1.0;
 const CAMERA_FRAME_WIDTH: u32 = 3840;
 const CAMERA_FRAME_HEIGHT: u32 = 2160;
 
@@ -287,20 +286,20 @@ pub struct MotionProfile {
 
 /// Commissioned limits converted to the board's motor units.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MotorLimits {
+pub(crate) struct MotorLimits {
     /// `motor.config.current_lim` in amps.
-    pub current_a: f32,
+    pub(crate) current_a: f32,
     /// `controller.config.vel_limit` and `trap_traj.config.vel_limit` in turns per second.
-    pub velocity_turns_per_s: f32,
+    pub(crate) velocity_turns_per_s: f32,
     /// `trap_traj.config.accel_limit` in turns per second squared.
-    pub acceleration_turns_per_s2: f32,
+    pub(crate) acceleration_turns_per_s2: f32,
     /// `trap_traj.config.decel_limit` in turns per second squared.
-    pub deceleration_turns_per_s2: f32,
+    pub(crate) deceleration_turns_per_s2: f32,
 }
 
 impl LiftAxisProfile {
     /// Convert the commissioned limits to motor units, the values written to the board.
-    pub fn motor_limits(&self) -> MotorLimits {
+    pub(crate) fn motor_limits(&self) -> MotorLimits {
         MotorLimits {
             current_a: self.current_limit_a,
             velocity_turns_per_s: self.velocity_limit_mm_s / self.mm_per_turn,
@@ -485,7 +484,7 @@ fn check_schema_version(path: &Path, source: &str) -> Result<(), StartupError> {
             source,
         })?;
     match table.get("schema_version") {
-        Some(toml::Value::Integer(SCHEMA_VERSION_INTEGER)) => Ok(()),
+        Some(toml::Value::Integer(SCHEMA_VERSION)) => Ok(()),
         Some(toml::Value::Integer(1)) => Err(StartupError::ProfileVersionRetired {
             path: path.to_path_buf(),
         }),
@@ -517,11 +516,6 @@ fn create_template(path: &Path) -> Result<(), StartupError> {
 fn validate_profile(profile: &MachineProfile) -> Vec<String> {
     let mut problems = Vec::new();
 
-    if profile.schema_version != MACHINE_PROFILE_SCHEMA_VERSION {
-        problems.push(format!(
-            "schema_version must be {MACHINE_PROFILE_SCHEMA_VERSION}"
-        ));
-    }
     validate_board_path(
         "boards.monospace_path",
         &profile.boards.monospace_path,

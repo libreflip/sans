@@ -16,4 +16,4 @@ pub use self::engine::{
 };
 pub use self::runner::{spawn_link, LinkHandle, LinkRunner};
 pub use self::transport::{FibreConnection, FibreOpener, OpenRequest, PacketReader, PacketWriter};
-pub use self::usb::{UsbFibreOpener, ODRIVE_USB_PRODUCT_ID, ODRIVE_USB_VENDOR_ID};
+pub use self::usb::UsbFibreOpener;
