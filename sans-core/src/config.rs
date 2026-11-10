@@ -699,7 +699,7 @@ fn validate_lift_axis(lift_axis: &LiftAxisProfile, problems: &mut Vec<String>) {
         ),
     ] {
         validate_positive_finite(&format!("{name}.{field}"), value, problems);
-        if !(converted <= cap) {
+        if converted.is_nan() || converted > cap {
             problems.push(format!(
                 "{name}.{field} exceeds the {cap} {unit} software policy cap after conversion"
             ));

@@ -4,6 +4,7 @@ mod camera;
 mod config;
 mod controller;
 mod hardware;
+mod odrive;
 
 #[cfg(target_os = "linux")]
 pub use crate::camera::{
@@ -31,4 +32,9 @@ pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
     MonospaceEventKind, MonospaceEvents, MonospaceFault, MonospaceUrgentWriter,
     MONOSPACE_BAUD_RATE,
+};
+pub use crate::odrive::{
+    AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener, LinkCommand,
+    LinkConfig, LinkEngine, LinkEvent, LinkPhase, LinkStatus, OpenRequest, PacketReader,
+    PacketWriter, Priority, TelemetrySample, TelemetryValues, Ticket, Transmit,
 };
