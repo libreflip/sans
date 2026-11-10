@@ -256,6 +256,7 @@ fn reopen_waits_until_the_old_device_halves_are_destroyed() {
 #[test]
 fn superseded_open_is_destroyed_before_the_next_open() {
     let opener = FakeOpener::new(FakeFibre::compatible());
+    *opener.reap_delay.lock().unwrap() = Duration::from_millis(500);
     *opener.claim_release_delay.lock().unwrap() = Duration::from_millis(100);
     *opener.hold_open.0.lock().unwrap() = true;
     let mut link = Link::start(&opener);

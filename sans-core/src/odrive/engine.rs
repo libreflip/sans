@@ -1016,7 +1016,15 @@ impl LinkEngine {
                         ),
                     });
                 } else {
-                    connection.queue.push_back((ticket, command));
+                    if command == LinkCommand::Disarm {
+                        self.retire_queue();
+                        self.revoke_unsent_energizing();
+                    }
+                    self.connection
+                        .as_mut()
+                        .expect("usable connection")
+                        .queue
+                        .push_back((ticket, command));
                 }
             }
         }

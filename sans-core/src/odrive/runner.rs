@@ -37,7 +37,7 @@ enum Input {
     /// An open finished. The opener lock stays held until the engine thread
     /// acknowledges, after accepting or destroying the connection, so a
     /// superseded connection never overlaps the next open.
-    Opened(u64, Result<FibreConnection, String>, Sender<()>),
+    Opened(u64, Result<GuardedConnection, String>, Sender<()>),
     Packet(u64, Vec<u8>),
     TransportFailed(u64, String),
 }
@@ -125,7 +125,7 @@ where
                 events,
                 shared,
                 active: None,
-                releasing: None,
+                releasing: Some(ReleaseBarrier::new(0)),
             }
             .run(inbox);
         })?;
@@ -146,7 +146,7 @@ fn sequence_seed() -> u16 {
 /// How long one shutdown attempt may wait for a half's pending transfers.
 const RELEASE_SLICE: Duration = Duration::from_millis(100);
 
-/// Counts the device halves of one connection not yet proven released. It is
+/// Counts device halves from all successful opens not yet proven released. It is
 /// shared, so a reconnect that gives up waiting does not lose it: every later
 /// attempt waits on the same barrier until the device is truly let go.
 struct ReleaseBarrier {
@@ -160,6 +160,10 @@ impl ReleaseBarrier {
             live: Mutex::new(halves),
             released: Condvar::new(),
         })
+    }
+
+    fn register_connection(&self) {
+        *self.live.lock().unwrap_or_else(PoisonError::into_inner) += 2;
     }
 
     fn half_released(&self) {
@@ -244,6 +248,27 @@ impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
     }
 }
 
+/// Every successful open is guarded before draining or handing it to the
+/// engine, including results that become stale while opening.
+struct GuardedConnection {
+    usb_serial: String,
+    reader: ReleaseOnExit<Box<dyn PacketReader>>,
+    writer: ReleaseOnExit<Box<dyn PacketWriter>>,
+    released: Arc<ReleaseBarrier>,
+}
+
+impl GuardedConnection {
+    fn new(connection: FibreConnection, released: Arc<ReleaseBarrier>) -> Self {
+        released.register_connection();
+        Self {
+            usb_serial: connection.usb_serial,
+            reader: ReleaseOnExit::new(connection.reader, &released),
+            writer: ReleaseOnExit::new(connection.writer, &released),
+            released,
+        }
+    }
+}
+
 struct ActiveTransport {
     epoch: u64,
     stop: Arc<AtomicBool>,
@@ -280,8 +305,8 @@ struct EngineThread<E> {
     events: Sender<E>,
     shared: Arc<Mutex<Shared>>,
     active: Option<ActiveTransport>,
-    /// Release barrier of the most recently closed connection. Kept, not
-    /// taken, so an attempt that times out waiting leaves it for the next.
+    /// Shared release barrier for all opens, including rejected results.
+    /// Kept across attempts that time out waiting for transfer cancellation.
     releasing: Option<Arc<ReleaseBarrier>>,
 }
 
@@ -351,14 +376,20 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         let spawned = thread::Builder::new()
             .name("sans-odrive-open".into())
             .spawn(move || {
-                if let Err(reason) = await_release(released, release_bound) {
+                // Serialize release checks with opens: an earlier open can
+                // register new halves while this attempt waits for the lock.
+                let mut opener = opener.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Err(reason) = await_release(released.clone(), release_bound) {
                     let (accepted, _) = mpsc::channel();
                     let _ = loopback.send(Input::Opened(epoch, Err(reason), accepted));
                     return;
                 }
-                let mut opener = opener.lock().unwrap_or_else(PoisonError::into_inner);
-                let result = opener.open(&request).map(|mut connection| {
-                    drain(connection.reader.as_mut());
+                let result = opener.open(&request).map(|connection| {
+                    let mut connection = GuardedConnection::new(
+                        connection,
+                        released.expect("runner retains its release barrier"),
+                    );
+                    drain(connection.reader.half().as_mut());
                     connection
                 });
                 let (accepted, acknowledgement) = mpsc::channel();
@@ -381,7 +412,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         let _ = self.flush();
     }
 
-    fn opened(&mut self, now: Instant, epoch: u64, result: Result<FibreConnection, String>) {
+    fn opened(&mut self, now: Instant, epoch: u64, result: Result<GuardedConnection, String>) {
         let current = self.engine.status();
         let still_opening = current.epoch == epoch
             && current.phase == LinkPhase::Connecting
@@ -396,16 +427,14 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                 return;
             }
         };
-        let FibreConnection {
+        let GuardedConnection {
             usb_serial,
             reader,
             writer,
+            released,
         } = connection;
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriterQueue::default());
-        let released = ReleaseBarrier::new(2);
-        let reader = ReleaseOnExit::new(reader, &released);
-        let writer = ReleaseOnExit::new(writer, &released);
         // A half whose thread cannot start is shut down and released by its
         // guard's destructor, so the barrier always completes.
         let started = spawn_reader(epoch, reader, Arc::clone(&stop), self.loopback.clone())

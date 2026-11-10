@@ -1597,6 +1597,36 @@ fn disarm_supersedes_unsent_urgent_energizing_writes() {
 }
 
 #[test]
+fn ordinary_disarm_supersedes_unsent_urgent_energizing_writes() {
+    let (mut link, read, held) =
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+
+    link.engine.submit(
+        link.now,
+        Ticket(3),
+        LinkCommand::MoveAbsolute { position_mm: 48.0 },
+        Priority::Ordinary,
+    );
+    link.engine
+        .submit(link.now, Ticket(2), LinkCommand::Disarm, Priority::Ordinary);
+    let sent = link.transmit_only();
+
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert_eq!(
+        link.result(3),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(!held.claim_for_send(link.now));
+    assert!(sent
+        .iter()
+        .all(|(_, request, _)| request.endpoint != INPUT_POS));
+    drop(read);
+}
+
+#[test]
 fn reply_to_a_request_never_sent_advances_nothing() {
     let (mut link, _read, held) =
         held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
