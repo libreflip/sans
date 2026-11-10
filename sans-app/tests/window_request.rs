@@ -6,6 +6,8 @@ use eframe::egui;
 const DISPLAY: egui::Vec2 = egui::vec2(600.0, 1_024.0);
 /// A 36 pixel title bar plus a 36 pixel desktop menu bar.
 const CHROME_HEIGHT: f32 = 72.0;
+/// A 10 pixel window border on each side.
+const CHROME_WIDTH: f32 = 20.0;
 
 #[test]
 fn minimum_inner_size_fits_the_display_with_chrome_at_every_scale_factor() {
@@ -14,7 +16,7 @@ fn minimum_inner_size_fits_the_display_with_chrome_at_every_scale_factor() {
         .expect("the request sets a minimum inner size");
 
     for pixels_per_point in [1.0, 1.5, 2.0] {
-        let physical = minimum * pixels_per_point + egui::vec2(0.0, CHROME_HEIGHT);
+        let physical = minimum * pixels_per_point + egui::vec2(CHROME_WIDTH, CHROME_HEIGHT);
         assert!(
             physical.x <= DISPLAY.x && physical.y <= DISPLAY.y,
             "minimum {minimum:?} at scale {pixels_per_point} needs {physical:?} physical pixels"

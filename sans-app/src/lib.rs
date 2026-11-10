@@ -22,8 +22,8 @@ use crate::screen::Header;
 /// Initial size hint, used only when no window manager honours the maximize request.
 const PORTRAIT_SIZE_HINT: [f32; 2] = [600.0, 1_024.0];
 /// Small enough that the window manager is never forced past the work area,
-/// even at scale factor 2 on the 600 pixel wide display.
-const MINIMUM_INNER_SIZE: [f32; 2] = [300.0, 240.0];
+/// even at scale factor 2 on the 600 pixel wide display with window borders.
+const MINIMUM_INNER_SIZE: [f32; 2] = [280.0, 240.0];
 const EXIT_FALLBACK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The startup window request for the native application.
