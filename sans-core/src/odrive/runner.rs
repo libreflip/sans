@@ -125,6 +125,7 @@ where
                 events,
                 shared,
                 active: None,
+                attempt_epoch: Arc::new(AtomicU64::new(0)),
                 releasing: Some(ReleaseBarrier::new(0)),
             }
             .run(inbox);
@@ -305,6 +306,8 @@ struct EngineThread<E> {
     events: Sender<E>,
     shared: Arc<Mutex<Shared>>,
     active: Option<ActiveTransport>,
+    /// Fences open threads that are superseded while waiting for the opener.
+    attempt_epoch: Arc<AtomicU64>,
     /// Shared release barrier for all opens, including rejected results.
     /// Kept across attempts that time out waiting for transfer cancellation.
     releasing: Option<Arc<ReleaseBarrier>>,
@@ -354,6 +357,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                 break;
             }
         }
+        self.attempt_epoch.store(0, Ordering::SeqCst);
         self.close_transport();
     }
 
@@ -366,6 +370,8 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
     fn start_attempt(&mut self) {
         self.close_transport();
         let epoch = self.engine.begin_attempt(Instant::now());
+        self.attempt_epoch.store(epoch, Ordering::SeqCst);
+        let attempt_epoch = Arc::clone(&self.attempt_epoch);
         let opener = Arc::clone(&self.opener);
         let loopback = self.loopback.clone();
         let request = OpenRequest {
@@ -379,9 +385,15 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                 // Serialize release checks with opens: an earlier open can
                 // register new halves while this attempt waits for the lock.
                 let mut opener = opener.lock().unwrap_or_else(PoisonError::into_inner);
+                if attempt_epoch.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
                 if let Err(reason) = await_release(released.clone(), release_bound) {
                     let (accepted, _) = mpsc::channel();
                     let _ = loopback.send(Input::Opened(epoch, Err(reason), accepted));
+                    return;
+                }
+                if attempt_epoch.load(Ordering::SeqCst) != epoch {
                     return;
                 }
                 let result = opener.open(&request).map(|connection| {

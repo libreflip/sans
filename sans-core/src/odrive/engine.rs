@@ -1008,6 +1008,10 @@ impl LinkEngine {
                 }
             },
             Priority::Ordinary => {
+                if command == LinkCommand::Disarm {
+                    self.retire_queue();
+                    self.revoke_unsent_energizing();
+                }
                 let connection = self.connection.as_mut().expect("usable connection");
                 if connection.queue.len() >= ORDINARY_QUEUE_CAPACITY {
                     self.finish(ticket, command, CommandResult::Rejected {
@@ -1016,10 +1020,6 @@ impl LinkEngine {
                         ),
                     });
                 } else {
-                    if command == LinkCommand::Disarm {
-                        self.retire_queue();
-                        self.revoke_unsent_energizing();
-                    }
                     self.connection
                         .as_mut()
                         .expect("usable connection")

@@ -272,8 +272,11 @@ fn superseded_open_is_destroyed_before_the_next_open() {
 
     link.handle.reconnect();
     link.wait_for(|event| matches!(event, LinkEvent::Status(status) if status.epoch == 2));
+    // A third attempt supersedes another thread queued on the opener mutex.
+    link.handle.reconnect();
+    link.wait_for(|event| matches!(event, LinkEvent::Status(status) if status.epoch == 3));
     opener.release_open();
-    link.wait_for_phase(2, LinkPhase::Verified);
+    link.wait_for_phase(3, LinkPhase::Verified);
 
     assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
     assert_eq!(*opener.opens.lock().unwrap(), 2);

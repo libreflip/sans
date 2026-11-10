@@ -1642,3 +1642,36 @@ fn reply_to_a_request_never_sent_advances_nothing() {
     assert!(link.take_unclaimed().is_empty(), "no readback was queued");
     assert!(!status_has_fault(&link));
 }
+
+#[test]
+fn ordinary_disarm_retires_a_full_queue_before_checking_capacity() {
+    let mut link = armed(commissioned());
+    let read = hold_next_telemetry_read(&mut link);
+    for ticket in 10..14 {
+        link.engine.submit(
+            link.now,
+            Ticket(ticket),
+            LinkCommand::MoveAbsolute { position_mm: 40.0 },
+            Priority::Ordinary,
+        );
+    }
+    link.engine.submit(
+        link.now,
+        Ticket(20),
+        LinkCommand::Disarm,
+        Priority::Ordinary,
+    );
+    link.drain_events();
+    for ticket in 10..14 {
+        assert_eq!(
+            link.result(ticket),
+            Some(CommandResult::Retired { transmitted: false })
+        );
+    }
+    assert_eq!(link.result(20), None);
+    let reply = link.board.handle(&read).unwrap();
+    link.engine.receive(link.now, &reply);
+    link.exchange();
+    assert_eq!(link.result(20), Some(CommandResult::Completed));
+    assert!(link.board.writes_to(INPUT_POS).is_empty());
+}
