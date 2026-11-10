@@ -16,4 +16,5 @@ eframe = { version = "0.36.1", default-features = false, features = [
 sans-core = { path = "../sans-core" }
 
 [dev-dependencies]
+egui_kittest = { version = "0.36.1", features = ["eframe", "wgpu"] }
 tempfile = "3"
