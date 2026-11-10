@@ -12,6 +12,7 @@ This repository is a Rust workspace. `sans-app/` builds the native `sans` touchs
 - `cargo clippy --workspace --all-targets -- -D warnings` treats lint findings as failures.
 - `cargo run -p sans` starts the native application with the normal user Machine profile; use `-- --config <path>` for an explicit profile.
 - `cross build --target aarch64-unknown-linux-gnu` mirrors the 64-bit Raspberry Pi 4+ target used by CI.
+- `scripts/pi-run [--binary <path>] [--env NAME=VALUE]... <host> [-- <sans-arg>...]` builds the release binary with `cross`, uploads it to `~/.local/bin/sans-dev` on the Pi, and runs it there over SSH. `sans-app/tests/pi_run.rs` tests it with fake `cross` and `ssh` on `PATH`. Agents must not run it against a real Pi: like `hw_diag`, it drives real hardware and needs a supervised session.
 
 Run `cargo run -p sans-core --bin hw_diag -- --port /dev/ttyACM0` only during supervised hardware testing while the `sans` application is stopped. It opens a real serial device and can energize vacuum, flutter fan, turn blower, and light relays.
 

@@ -14,3 +14,6 @@ eframe = { version = "0.36.1", default-features = false, features = [
     "x11",
 ] }
 sans-core = { path = "../sans-core" }
+
+[dev-dependencies]
+tempfile = "3"
