@@ -2,6 +2,7 @@
 
 mod support;
 
+use support::cameras::Step;
 use support::fixtures::{
     clamped_crop, landscape_full_frame, landscape_smaller_crop, portrait_full_frame,
     portrait_smaller_crop, rotated_crop,
@@ -71,5 +72,39 @@ fn captions_say_full_frame_or_crop_with_dimensions() {
             .count();
 
         assert_eq!(shown, 2, "{caption:?} under both Full-page labels");
+    }
+}
+
+#[test]
+fn each_capture_replaces_the_shown_pair_with_the_new_one() {
+    let (first_left, first_right) = portrait_full_frame();
+    let (second_left, second_right) = landscape_full_frame();
+    let (third_left, third_right) = portrait_smaller_crop();
+    let mut session = Session::cameras(
+        vec![
+            Step::Frame(first_left.frame),
+            Step::Frame(second_left.frame),
+            Step::Frame(third_left.frame),
+        ],
+        vec![
+            Step::Frame(first_right.frame),
+            Step::Frame(second_right.frame),
+            Step::Frame(third_right.frame),
+        ],
+        T1,
+    );
+
+    for caption in [
+        "Full frame, 360x640 px",
+        "Full frame, 640x360 px",
+        "Crop 301x521 px of 400x700 px frame",
+    ] {
+        session.capture_pair();
+        let shown = session
+            .labelled_rects()
+            .into_iter()
+            .filter(|(label, _)| label == caption)
+            .count();
+        assert_eq!(shown, 2, "after a capture, both captions read {caption:?}");
     }
 }
