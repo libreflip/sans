@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# Build Sans for a 64-bit Raspberry Pi, upload it over SSH as
+# ~/.local/bin/sans-dev, and run it in the foreground on the Pi's desktop
+# session. See README.md for requirements and supervised-use guidance.
+#
+# Compatible with Bash 3.2 (macOS) and Bash 5. The remote side assumes a
+# POSIX login shell; user data reaches it only as quoted positional
+# parameters of fixed `/bin/sh -c` snippets.
+set -euo pipefail
+
+readonly TARGET=aarch64-unknown-linux-gnu
+
+usage() {
+    cat <<'EOF'
+usage: scripts/pi-run [--binary <local-path>] [--env NAME=VALUE]... <host> [-- <sans-arg>...]
+
+Build Sans for aarch64-unknown-linux-gnu with cross, upload it to
+~/.local/bin/sans-dev on <host> over SSH, and run it in the foreground.
+
+  --binary <local-path>  upload an existing aarch64 sans binary instead of building
+  --env NAME=VALUE       set a remote environment variable before display selection
+  -h, --help             show this help
+
+SSH configuration (~/.ssh/config) supplies identity, port, and jump hosts.
+EOF
+}
+
+usage_error() {
+    echo "pi-run: $*" >&2
+    usage >&2
+    exit 2
+}
+
+binary=
+envs=()
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        --binary)
+            [ $# -ge 2 ] && [ -n "$2" ] || usage_error "--binary needs a path"
+            binary=$2
+            shift 2
+            ;;
+        --env)
+            [ $# -ge 2 ] || usage_error "--env needs NAME=VALUE"
+            case $2 in
+                *=*) ;;
+                *) usage_error "--env value must be NAME=VALUE: $2" ;;
+            esac
+            name=${2%%=*}
+            if ! [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                usage_error "--env name is not a shell identifier: $name"
+            fi
+            envs+=("$2")
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[ $# -gt 0 ] || usage_error "missing <host>"
+host=$1
+shift
+case $host in
+    '') usage_error "<host> must not be empty" ;;
+    -*) usage_error "unknown option or invalid host: $host" ;;
+esac
+if [ $# -gt 0 ]; then
+    [ "$1" = -- ] || usage_error "unexpected argument before --: $1"
+    shift
+fi
+
+die() {
+    echo "pi-run: $*" >&2
+    exit 1
+}
+
+# Report a failed phase and exit with its status.
+fail() {
+    local status=$1
+    shift
+    echo "pi-run: $* (exit $status)" >&2
+    exit "$status"
+}
+
+progress() {
+    echo "pi-run: $*" >&2
+}
+
+if [ -n "$binary" ]; then
+    [ -f "$binary" ] && [ -r "$binary" ] ||
+        die "--binary is not a readable regular file: $binary"
+fi
+
+# Quote one word for a POSIX shell.
+sh_quote() {
+    local escaped="'\\''"
+    printf "'%s'" "${1//\'/$escaped}"
+}
+
+# Build a remote command line that runs a fixed snippet with `/bin/sh -c`,
+# passing every remaining argument as a quoted positional parameter. The shell
+# path is absolute so an `--env PATH=...` value cannot stop `env` finding it.
+remote_command() {
+    local snippet=$1 command word
+    shift
+    command="/bin/sh -c $(sh_quote "$snippet") pi-run"
+    for word in "$@"; do
+        command="$command $(sh_quote "$word")"
+    done
+    printf '%s' "$command"
+}
+
+if [ -z "$binary" ]; then
+    command -v cross >/dev/null 2>&1 ||
+        die "cross is not installed; install cross with a running container engine, or pass --binary <local-path> with a prebuilt aarch64 sans binary"
+    repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+    target_dir=${CARGO_TARGET_DIR:-$repo_root/target}
+    case $target_dir in
+        /*) ;;
+        *) target_dir=$PWD/$target_dir ;;
+    esac
+    progress "building sans for $TARGET"
+    # cross 0.2.5 publishes its Linux images for linux/amd64 only, so an
+    # arm64 Docker host (Apple Silicon, OrbStack) must pull and run them under
+    # amd64 emulation instead of looking for a missing arm64 manifest.
+    (
+        cd "$repo_root" || exit "$?"
+        DOCKER_DEFAULT_PLATFORM=linux/amd64 CARGO_TARGET_DIR=$target_dir cross build --package sans --release --locked --target "$TARGET"
+    ) || fail "$?" "cross build failed"
+    binary=$target_dir/$TARGET/release/sans
+    [ -f "$binary" ] && [ -r "$binary" ] ||
+        die "cross build did not produce a readable binary at $binary"
+fi
+
+size=$(wc -c <"$binary" | tr -d ' ')
+
+# Stream the binary into a temporary file beside the destination, check the
+# byte count, and atomically rename it into place.
+readonly UPLOAD_SNIPPET='set -eu
+expected=$1
+dir=$HOME/.local/bin
+mkdir -p "$dir"
+tmp=$(mktemp "$dir/.sans-dev.XXXXXX")
+trap '\''rm -f "$tmp"'\'' EXIT
+trap '\''exit 1'\'' HUP INT TERM
+cat >"$tmp"
+received=$(wc -c <"$tmp" | tr -d " ")
+if [ "$received" != "$expected" ]; then
+    echo "pi-run: upload truncated: expected $expected bytes, received $received" >&2
+    exit 1
+fi
+chmod 755 "$tmp"
+mv -f "$tmp" "$dir/sans-dev"'
+
+progress "uploading $binary ($size bytes) to $host:~/.local/bin/sans-dev"
+ssh -T -x -- "$host" "$(remote_command "$UPLOAD_SNIPPET" "$size")" <"$binary" ||
+    fail "$?" "upload failed; any previous sans-dev is unchanged"
+
+# The remote login shell expands $HOME to locate sans-dev before `env`
+# applies the --env values, so they cannot move the executable. The snippet
+# receives that path as $1 and keeps no variables of its own: detection runs
+# in a command substitution, and everything else is "$@".
+readonly RUN_SNIPPET='set -eu
+if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    WAYLAND_DISPLAY=$(
+        [ -n "${XDG_RUNTIME_DIR:-}" ] || exit 0
+        for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
+            if [ "${socket%.lock}" = "$socket" ] && [ -S "$socket" ]; then
+                printf "%s" "${socket##*/}"
+                break
+            fi
+        done
+    )
+    if [ -z "$WAYLAND_DISPLAY" ]; then
+        echo "pi-run: no DISPLAY or WAYLAND_DISPLAY in the remote session and no wayland-* socket in XDG_RUNTIME_DIR (${XDG_RUNTIME_DIR:-unset})." >&2
+        echo "pi-run: log in to the Pi desktop as this SSH user, or pass --env WAYLAND_DISPLAY=wayland-0 (with --env XDG_RUNTIME_DIR=/run/user/<uid> if unset) or --env DISPLAY=:0." >&2
+        exit 1
+    fi
+    export WAYLAND_DISPLAY
+fi
+exec "$@"'
+
+run_command="env --"
+for pair in ${envs[@]+"${envs[@]}"}; do
+    run_command="$run_command $(sh_quote "$pair")"
+done
+run_command="$run_command $(remote_command "$RUN_SNIPPET")"
+run_command="$run_command \"\$HOME/.local/bin/sans-dev\""
+for word in "$@"; do
+    run_command="$run_command $(sh_quote "$word")"
+done
+
+progress "running sans-dev on $host (Ctrl-C is sent to sans-dev on the Pi)"
+exec ssh -tt -x -- "$host" "$run_command"

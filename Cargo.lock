@@ -2566,6 +2566,7 @@ dependencies = [
  "clap",
  "eframe",
  "sans-core",
+ "tempfile",
 ]
 
 [[package]]
