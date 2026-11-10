@@ -23,6 +23,20 @@ fn assert_actions_fixed(session: &Session, actions: &[(&str, egui::Rect)]) {
     }
 }
 
+/// Tap `action` and assert it captured exactly once with each Camera.
+fn assert_one_capture(session: &mut Session, action: &str) {
+    let (left, right) = (session.calls.left(), session.calls.right());
+
+    session.tap_and_wait_for_capture(action);
+
+    assert_eq!(
+        (session.calls.left(), session.calls.right()),
+        (left + 1, right + 1),
+        "captures after tapping {action} at {}",
+        session.viewport.name
+    );
+}
+
 #[test]
 fn actions_stay_inside_the_window_and_still_at_every_scroll_step() {
     for viewport in MATRIX {
@@ -40,16 +54,7 @@ fn tapping_capture_pair_captures_once_at_any_scroll_position() {
         for scroll in [0.0, 150.0, 100_000.0] {
             session.wheel(-100_000.0);
             session.wheel(scroll);
-            let (left, right) = (session.calls.left(), session.calls.right());
-
-            session.capture_pair();
-
-            assert_eq!(
-                (session.calls.left(), session.calls.right()),
-                (left + 1, right + 1),
-                "captures after tapping at scroll {scroll} at {}",
-                viewport.name
-            );
+            assert_one_capture(&mut session, "Capture pair");
         }
     }
 }
@@ -72,16 +77,8 @@ fn tapping_retry_capture_captures_once_from_the_blocked_state() {
         session.tap_label("Capture pair");
         session.wait_for_label("Retry Capture");
         session.wheel(100_000.0);
-        let (left, right) = (session.calls.left(), session.calls.right());
 
-        session.tap_and_wait_for_capture("Retry Capture");
-
-        assert_eq!(
-            (session.calls.left(), session.calls.right()),
-            (left + 1, right + 1),
-            "captures after Retry Capture at {}",
-            viewport.name
-        );
+        assert_one_capture(&mut session, "Retry Capture");
     }
 }
 

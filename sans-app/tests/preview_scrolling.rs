@@ -70,42 +70,33 @@ fn drag_through(session: &mut Session, touch: bool, mut visit: impl FnMut(&Sessi
     );
 }
 
-#[test]
-fn pointer_drag_without_touch_events_brings_every_view_into_the_body() {
+/// Drag through the whole body, optionally with touch events, and see every view.
+fn assert_drags_reach_every_view(touch: bool) {
     for viewport in SCROLLING {
         let mut session = Session::with_pair(portrait_full_frame(), viewport);
         let mut seen = BTreeSet::new();
 
-        drag_through(&mut session, false, |session| {
+        drag_through(&mut session, touch, |session| {
             views_in_body(session, &mut seen)
         });
 
         assert_eq!(
             seen,
             BTreeSet::from(VIEWS),
-            "views reached by drag at {}",
+            "views reached by drag with touch events {touch} at {}",
             viewport.name
         );
     }
 }
 
 #[test]
+fn pointer_drag_without_touch_events_brings_every_view_into_the_body() {
+    assert_drags_reach_every_view(false);
+}
+
+#[test]
 fn pointer_drag_with_touch_events_brings_every_view_into_the_body() {
-    for viewport in SCROLLING {
-        let mut session = Session::with_pair(portrait_full_frame(), viewport);
-        let mut seen = BTreeSet::new();
-
-        drag_through(&mut session, true, |session| {
-            views_in_body(session, &mut seen)
-        });
-
-        assert_eq!(
-            seen,
-            BTreeSet::from(VIEWS),
-            "views reached by touch at {}",
-            viewport.name
-        );
-    }
+    assert_drags_reach_every_view(true);
 }
 
 /// Drag 80 points upward from the visible centre of `start_on` and assert the body followed.
