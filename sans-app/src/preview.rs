@@ -5,12 +5,20 @@ use std::time::Duration;
 
 use eframe::egui;
 use sans_core::{
-    CapturePair, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle,
+    CapturePair, CapturePreview, CaptureStatus, CapturedFrame, ControllerClosed, ControllerHandle,
     ControllerIntent, PreviewImage,
 };
 
-const FULL_PAGE_MAX_HEIGHT: f32 = 360.0;
+use crate::screen::{self, Header};
+
+/// Smallest Full-page height before the body scrolls instead.
+const FULL_PAGE_MIN_HEIGHT: f32 = 240.0;
+/// Largest side of a 100% tile.
 const DETAIL_MAX_SIDE: f32 = 220.0;
+/// Gap between the Full-page row and the 100% row.
+const ROW_GAP: f32 = 8.0;
+/// Room for rounding so a composition that fits never overflows by a fraction.
+const LAYOUT_SLACK: f32 = 2.0;
 
 pub(crate) struct PreviewTextures {
     pair: Arc<CapturePair>,
@@ -83,118 +91,208 @@ fn load_texture(
     context.load_texture(name, color_image, options)
 }
 
-pub(crate) fn render_capture_preview(
+/// Show the Capture preview screen for `preview`.
+///
+/// The action bar holds the state's capture action followed by `exit`.
+pub(crate) fn show_capture_preview(
     ui: &mut egui::Ui,
     context: &egui::Context,
     handle: &ControllerHandle,
     preview: &CapturePreview,
     textures: Option<&PreviewTextures>,
+    exit: impl FnOnce(&mut egui::Ui),
 ) -> Result<(), ControllerClosed> {
-    match &preview.status {
-        CaptureStatus::Ready => {
-            ui.colored_label(egui::Color32::LIGHT_GREEN, "Cameras ready");
-            if large_button(ui, "Capture pair").clicked() {
-                handle.send(ControllerIntent::CapturePair)?;
-                context.request_repaint_after(Duration::from_millis(16));
-            }
-        }
-        CaptureStatus::Capturing => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Capturing both Camera roles. The previous pair stays visible.");
-            });
-            context.request_repaint_after(Duration::from_millis(16));
-        }
-        CaptureStatus::Blocked { reason } => {
-            ui.colored_label(egui::Color32::LIGHT_RED, "Capture blocked");
-            ui.label(reason);
-            if large_button(ui, "Retry Capture").clicked() {
-                handle.send(ControllerIntent::CapturePair)?;
-                context.request_repaint_after(Duration::from_millis(16));
-            }
-        }
+    let (status, colour) = match &preview.status {
+        CaptureStatus::Ready => ("Cameras ready", egui::Color32::LIGHT_GREEN),
+        CaptureStatus::Capturing => ("Capturing both Camera roles", egui::Color32::LIGHT_BLUE),
+        CaptureStatus::Blocked { .. } => ("Capture blocked", egui::Color32::LIGHT_RED),
+    };
+    let header = Header::new(status, colour).warning_tag(
+        preview
+            .preview_warning
+            .as_ref()
+            .map(|_| "100% preview warning"),
+    );
+    if preview.status == CaptureStatus::Capturing {
+        context.request_repaint_after(Duration::from_millis(16));
     }
-    if let Some(warning) = &preview.preview_warning {
-        ui.colored_label(egui::Color32::YELLOW, warning);
-    }
-    ui.add_space(10.0);
 
-    match (preview.latest_complete_pair.as_ref(), textures) {
-        (Some(_), Some(textures)) => render_four_views(ui, textures),
-        _ => {
-            ui.label("No complete Capture pair yet.");
+    let mut result = Ok(());
+    screen::show(
+        ui,
+        header,
+        |ui| {
+            result = show_capture_action(ui, context, handle, &preview.status);
+            exit(ui);
+        },
+        |ui, viewport_height| {
+            if let CaptureStatus::Blocked { reason } = &preview.status {
+                ui.colored_label(egui::Color32::LIGHT_RED, reason);
+            }
+            if let Some(warning) = &preview.preview_warning {
+                ui.colored_label(egui::Color32::YELLOW, warning);
+            }
+            match (preview.latest_complete_pair.as_ref(), textures) {
+                (Some(_), Some(textures)) => render_four_views(ui, textures, viewport_height),
+                _ => {
+                    ui.label("No complete Capture pair yet.");
+                }
+            }
+        },
+    );
+    result
+}
+
+fn show_capture_action(
+    ui: &mut egui::Ui,
+    context: &egui::Context,
+    handle: &ControllerHandle,
+    status: &CaptureStatus,
+) -> Result<(), ControllerClosed> {
+    let label = match status {
+        CaptureStatus::Capturing => {
+            screen::action_indicator(ui, "Capturing...");
+            return Ok(());
         }
+        CaptureStatus::Ready => "Capture pair",
+        CaptureStatus::Blocked { .. } => "Retry Capture",
+    };
+    if screen::action_button(ui, label).clicked() {
+        handle.send(ControllerIntent::CapturePair)?;
+        context.request_repaint_after(Duration::from_millis(16));
     }
     Ok(())
 }
 
-fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures) {
+/// Lay out both Full-page previews over both 100% previews.
+///
+/// The Full-page previews take whatever height the body viewport has left
+/// after the content above them, their labels and captions, and the 100% row,
+/// down to [`FULL_PAGE_MIN_HEIGHT`]. Below that floor the body scrolls instead.
+fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures, viewport_height: f32) {
+    let spacing = ui.spacing().item_spacing;
+    let column_width = (ui.available_width() - spacing.x) / 2.0;
+    let detail_side = column_width.min(DETAIL_MAX_SIDE);
+    let label_height = ui.text_style_height(&egui::TextStyle::Body);
+    let caption_height = ui.text_style_height(&egui::TextStyle::Small);
+    let used_above = ui.cursor().top() - ui.min_rect().top();
+    let fixed_rows = 2.0 * label_height
+        + caption_height
+        + 4.0 * spacing.y
+        + ROW_GAP
+        + detail_side
+        + LAYOUT_SLACK;
+    let full_page_height = (viewport_height - used_above - fixed_rows).max(FULL_PAGE_MIN_HEIGHT);
+    let full_page_area = egui::vec2(column_width, full_page_height);
+
     ui.columns(2, |columns| {
         render_full_page(
             &mut columns[0],
-            "Left Full-page",
+            "Left",
             &textures.left_full_page,
-            textures.pair.left.full_page_preview(),
+            &textures.pair.left,
+            full_page_area,
         );
         render_full_page(
             &mut columns[1],
-            "Right Full-page",
+            "Right",
             &textures.right_full_page,
-            textures.pair.right.full_page_preview(),
+            &textures.pair.right,
+            full_page_area,
         );
     });
-    ui.add_space(8.0);
+    ui.add_space(ROW_GAP);
     ui.columns(2, |columns| {
         render_detail(
             &mut columns[0],
-            "Left 100%",
+            "Left",
             textures.left_detail.as_ref(),
             textures.pair.left.native_detail_preview().ok(),
+            detail_side,
         );
         render_detail(
             &mut columns[1],
-            "Right 100%",
+            "Right",
             textures.right_detail.as_ref(),
             textures.pair.right.native_detail_preview().ok(),
+            detail_side,
         );
     });
 }
 
 fn render_full_page(
     ui: &mut egui::Ui,
-    label: &str,
+    role: &str,
     texture: &egui::TextureHandle,
-    image: &PreviewImage,
+    frame: &CapturedFrame,
+    area: egui::Vec2,
 ) {
     ui.vertical_centered(|ui| {
-        ui.label(label);
-        let available = egui::vec2(ui.available_width(), FULL_PAGE_MAX_HEIGHT);
-        let layout = full_page_layout(available, image);
-        let (rect, _) = ui.allocate_exact_size(layout.draw_size, egui::Sense::hover());
+        ui.label(format!("{role} Full-page"));
+        ui.label(egui::RichText::new(crop_caption(frame)).small().weak());
+        let image = frame.full_page_preview();
+        let layout = full_page_layout(area, image);
+        let (rect, response) = ui.allocate_exact_size(layout.draw_size, egui::Sense::hover());
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Image,
+                true,
+                format!("{role} Full-page preview"),
+            )
+        });
         ui.painter()
             .image(texture.id(), rect, layout.uv, egui::Color32::WHITE);
     });
 }
 
+/// Say whether the Full-page preview is the whole post-rotation frame or a commissioned crop.
+fn crop_caption(frame: &CapturedFrame) -> String {
+    let crop = frame.crop;
+    if crop.x == 0 && crop.y == 0 && crop.width == frame.width && crop.height == frame.height {
+        format!("Full frame, {}x{} px", frame.width, frame.height)
+    } else {
+        format!(
+            "Crop {}x{} px of {}x{} px frame",
+            crop.width, crop.height, frame.width, frame.height
+        )
+    }
+}
+
 fn render_detail(
     ui: &mut egui::Ui,
-    label: &str,
+    role: &str,
     texture: Option<&egui::TextureHandle>,
     image: Option<&PreviewImage>,
+    side: f32,
 ) {
     ui.vertical_centered(|ui| {
-        ui.label(label);
-        let side = ui.available_width().min(DETAIL_MAX_SIDE);
-        let (tile, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+        ui.label(format!("{role} 100%"));
+        let (tile, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
         ui.painter().rect_filled(tile, 0.0, egui::Color32::BLACK);
         match (texture, image) {
             (Some(texture), Some(image)) => {
-                let layout = native_detail_layout(side, ui.ctx().pixels_per_point(), image);
-                let rect = egui::Rect::from_center_size(tile.center(), layout.draw_size);
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Image,
+                        true,
+                        format!("{role} 100% preview"),
+                    )
+                });
+                let pixels_per_point = ui.ctx().pixels_per_point();
+                let layout = native_detail_layout(side, pixels_per_point, image);
+                let rect =
+                    snap_to_physical_pixels(tile.center(), layout.draw_size, pixels_per_point);
                 ui.painter()
                     .image(texture.id(), rect, layout.uv, egui::Color32::WHITE);
             }
             _ => {
+                response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Image,
+                        true,
+                        format!("{role} 100% preview unavailable"),
+                    )
+                });
                 ui.painter().text(
                     tile.center(),
                     egui::Align2::CENTER_CENTER,
@@ -205,6 +303,24 @@ fn render_detail(
             }
         }
     });
+}
+
+/// Centre `size` on `center`, then move its origin to the nearest physical pixel.
+///
+/// Recomputed every frame from the tile's current position, so the image
+/// stays on the physical pixel grid after any scroll offset. The image may
+/// sit up to half a physical pixel off the tile centre.
+fn snap_to_physical_pixels(
+    center: egui::Pos2,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    let origin = center - size / 2.0;
+    let snapped = egui::pos2(
+        (origin.x * pixels_per_point).round() / pixels_per_point,
+        (origin.y * pixels_per_point).round() / pixels_per_point,
+    );
+    egui::Rect::from_min_size(snapped, size)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -248,10 +364,6 @@ fn native_detail_layout(side: f32, pixels_per_point: f32, image: &PreviewImage) 
     }
 }
 
-fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized([240.0, 56.0], egui::Button::new(label))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -259,7 +371,10 @@ mod tests {
 
     use sans_core::{CameraRole, CapturePair, CapturedFrame, CropGeometry};
 
-    use super::{full_page_layout, native_detail_layout, sync_preview_textures, PreviewTextures};
+    use super::{
+        full_page_layout, native_detail_layout, snap_to_physical_pixels, sync_preview_textures,
+        PreviewTextures,
+    };
 
     fn frame(role: CameraRole) -> CapturedFrame {
         CapturedFrame::from_rgb8(
@@ -296,6 +411,20 @@ mod tests {
         assert_eq!(layout.draw_size, eframe::egui::vec2(80.0, 50.0));
         assert_eq!(layout.uv.min, eframe::egui::pos2(20.0 / 200.0, 0.0));
         assert_eq!(layout.uv.max, eframe::egui::pos2(180.0 / 200.0, 1.0));
+    }
+
+    #[test]
+    fn detail_preview_origin_lands_on_the_physical_pixel_grid() {
+        // A 120x75 pixel block centred on a tile centre that sits between pixels at scale 1.5.
+        // Unsnapped, the origin would be (60.2, 25.1) points, or (90.3, 37.65) pixels.
+        let rect = snap_to_physical_pixels(
+            eframe::egui::pos2(100.2, 50.1),
+            eframe::egui::vec2(80.0, 50.0),
+            1.5,
+        );
+
+        assert_eq!(rect.min, eframe::egui::pos2(90.0 / 1.5, 38.0 / 1.5));
+        assert_eq!(rect.size(), eframe::egui::vec2(80.0, 50.0));
     }
 
     #[test]

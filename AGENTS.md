@@ -22,7 +22,7 @@ Use standard `rustfmt` output and four-space indentation. Name modules, function
 
 ## Testing Guidelines
 
-Place focused unit tests beside code in `#[cfg(test)]` modules and cross-module tests under `<crate>/tests/`. Use descriptive `snake_case` test names such as `classifies_malformed`. There is no configured coverage threshold; add regression tests for protocol parsing and other deterministic behavior. Record physical observations separately from automated test results.
+Place focused unit tests beside code in `#[cfg(test)]` modules and cross-module tests under `<crate>/tests/`. Use descriptive `snake_case` test names such as `classifies_malformed`. There is no configured coverage threshold; add regression tests for protocol parsing and other deterministic behavior. Record physical observations separately from automated test results. The `sans` pixel proofs need a wgpu renderer (Metal on macOS, lavapipe on Linux). They skip with a printed notice when no adapter exists; set `SANS_REQUIRE_PIXEL_PROOF=1` wherever a skip must count as a failure. Headless fixture renders are automated evidence, not target-screen evidence.
 
 ## Hardware Design Principles
 

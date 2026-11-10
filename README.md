@@ -15,11 +15,19 @@ cargo test --workspace
 
 The repository pins Rust 1.98.0 in `rust-toolchain.toml`.
 
+The `sans` tests include rendered-pixel proofs that the previews keep every edge of the crop and stay one-to-one at 100%. They render through wgpu and need an adapter: Metal on macOS, or Mesa's lavapipe Vulkan driver on Linux (`sudo apt-get install libvulkan1 mesa-vulkan-drivers`). Without an adapter each proof prints a `SKIPPED pixel proof` notice and passes. Set `SANS_REQUIRE_PIXEL_PROOF=1` to make a missing adapter fail instead, as CI does:
+
+```sh
+SANS_REQUIRE_PIXEL_PROOF=1 cargo test -p sans
+```
+
 Start the native application with the normal Machine-profile path:
 
 ```sh
 cargo run -p sans
 ```
+
+Sans opens maximized with its window decorations, so the desktop decides the usable size after its title bar and menu bar. It respects the desktop's scale factor. On a desktop it runs in a normal resizable window at any size down to 280x240 points. Every screen keeps its status line at the top and its actions, such as Capture pair and Exit, in a bar at the bottom. Everything between scrolls by finger or mouse drag, mouse wheel, or the scroll bar.
 
 Use `cargo run -p sans -- --config /path/to/sans.toml` for an explicit development or deployment profile. The normal path is `$XDG_CONFIG_HOME/sans/sans.toml`, falling back to `~/.config/sans/sans.toml`.
 
