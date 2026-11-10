@@ -27,6 +27,7 @@ const RECORDED_ENV: &[&str] = &[
     "count",
     "app",
     "socket",
+    "PATH",
 ];
 
 /// An isolated developer checkout, fake tool directory, and fake Pi.
@@ -87,6 +88,14 @@ impl Harness {
 
     fn unset_remote_env(mut self, name: &str) -> Self {
         self.remote_env.retain(|(existing, _)| existing != name);
+        self
+    }
+
+    /// Seeds the fake Pi with an earlier `sans-dev` containing
+    /// `previous sans-dev`.
+    fn with_previous_binary(self) -> Self {
+        fs::create_dir_all(self.home().join(".local/bin")).unwrap();
+        fs::write(self.remote_binary(), b"previous sans-dev").unwrap();
         self
     }
 
@@ -453,9 +462,7 @@ fn bin_dir_entries(harness: &Harness) -> Vec<String> {
 
 #[test]
 fn upload_atomically_replaces_development_binary_byte_for_byte() {
-    let harness = Harness::with_desktop();
-    fs::create_dir_all(harness.home().join(".local/bin")).unwrap();
-    fs::write(harness.remote_binary(), b"previous sans-dev").unwrap();
+    let harness = Harness::with_desktop().with_previous_binary();
     let old_link = harness.home().join(".local/bin/old-link");
     fs::hard_link(harness.remote_binary(), &old_link).unwrap();
     let local = harness.write_local("ci-sans", &binary_with_all_bytes());
@@ -477,10 +484,8 @@ fn upload_atomically_replaces_development_binary_byte_for_byte() {
 
 #[test]
 fn truncated_upload_keeps_previous_binary_and_skips_run() {
-    let mut harness = Harness::new();
+    let mut harness = Harness::new().with_previous_binary();
     harness.truncate_upload = Some(10);
-    fs::create_dir_all(harness.home().join(".local/bin")).unwrap();
-    fs::write(harness.remote_binary(), b"previous sans-dev").unwrap();
     let local = harness.write_local("ci-sans", &binary_with_all_bytes());
 
     let output = harness.run(&["--binary", local.to_str().unwrap(), HOST]);
@@ -729,10 +734,8 @@ fn build_without_output_fails_before_ssh() {
 
 #[test]
 fn failed_upload_connection_keeps_previous_binary_and_skips_run() {
-    let mut harness = Harness::with_desktop();
+    let mut harness = Harness::with_desktop().with_previous_binary();
     harness.upload_ssh_status = Some(255);
-    fs::create_dir_all(harness.home().join(".local/bin")).unwrap();
-    fs::write(harness.remote_binary(), b"previous sans-dev").unwrap();
 
     let output = harness.run(&[HOST]);
 
@@ -762,4 +765,14 @@ fn build_selects_amd64_cross_images_even_on_arm64_docker_hosts() {
         assert!(output.status.success(), "{local:?}: {}", stderr(&output));
         assert_eq!(harness.cross_platform(), "linux/amd64", "{local:?}");
     }
+}
+
+#[test]
+fn path_override_reaches_application_without_breaking_the_runner() {
+    let harness = Harness::with_desktop();
+
+    let output = harness.run(&["--env", "PATH=/nonexistent", HOST]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(harness.app_env()["PATH"].as_deref(), Some("/nonexistent"));
 }

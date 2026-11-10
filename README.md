@@ -46,9 +46,9 @@ Sans selects the Machine profile on the Pi exactly as it does locally, from `$XD
 Requirements:
 
 - 64-bit Raspberry Pi OS on a Pi 4 or newer, with the runtime libraries the CI binary links against (`libv4l` and the desktop's Wayland or X11 client libraries).
-- An active desktop session on the Pi, owned by the SSH user. An existing `DISPLAY` or `WAYLAND_DISPLAY` is kept. Otherwise the script uses the first `wayland-*` socket in the remote `XDG_RUNTIME_DIR`, skipping lock files. If there is no socket, it stops and suggests `--env WAYLAND_DISPLAY=wayland-0` or `--env DISPLAY=:0`.
+- An active desktop session on the Pi, owned by the SSH user. An existing `DISPLAY` or `WAYLAND_DISPLAY` is kept. Otherwise the script uses the first `wayland-*` socket in the remote `XDG_RUNTIME_DIR`, skipping lock files. If there is no socket, it stops and suggests `--env WAYLAND_DISPLAY=wayland-0` or `--env DISPLAY=:0`. A Wayland display name such as `wayland-0` resolves inside `XDG_RUNTIME_DIR`, so if the SSH session does not set it, also pass `--env XDG_RUNTIME_DIR=/run/user/<uid>`.
 - Locally, `cross` with a running Docker engine, or `--binary`. The cross 0.2.5 images exist only for `linux/amd64`, so the script runs `cross` with `DOCKER_DEFAULT_PLATFORM=linux/amd64`. On Apple Silicon this runs the build under amd64 emulation (OrbStack or Docker Desktop with Rosetta), which is slower than a native build. Podman ignores that variable; on an arm64 host, use Docker or `--binary`.
-- Host, user, port, identity, and jump hosts come from your SSH configuration. Key authentication is recommended, because the command connects twice.
+- `<host>` is passed to `ssh` unchanged: either `user@hostname`, or an SSH config alias whose `HostName` and `User` come from your SSH configuration. Port, identity, and jump hosts also come from that configuration. Key authentication is recommended, because the command connects twice.
 - A POSIX login shell on the Pi. The script never uses `sudo`, installs packages, or kills remote processes.
 
 Use the command only during supervised hardware testing. Stop any other Sans instance on the Pi first, because both would open the same serial port and cameras. What happens to Sans on Ctrl-C or when the SSH connection drops has not been validated on hardware, so check that the Machine has reached a safe state before you walk away.

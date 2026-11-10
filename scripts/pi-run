@@ -5,7 +5,7 @@
 #
 # Compatible with Bash 3.2 (macOS) and Bash 5. The remote side assumes a
 # POSIX login shell; user data reaches it only as quoted positional
-# parameters of fixed `sh -c` snippets.
+# parameters of fixed `/bin/sh -c` snippets.
 set -euo pipefail
 
 readonly TARGET=aarch64-unknown-linux-gnu
@@ -103,12 +103,13 @@ sh_quote() {
     printf "'%s'" "${1//\'/$escaped}"
 }
 
-# Build a remote command line that runs a fixed snippet with `sh -c`, passing
-# every remaining argument as a quoted positional parameter.
+# Build a remote command line that runs a fixed snippet with `/bin/sh -c`,
+# passing every remaining argument as a quoted positional parameter. The shell
+# path is absolute so an `--env PATH=...` value cannot stop `env` finding it.
 remote_command() {
     local snippet=$1 command word
     shift
-    command="sh -c $(sh_quote "$snippet") pi-run"
+    command="/bin/sh -c $(sh_quote "$snippet") pi-run"
     for word in "$@"; do
         command="$command $(sh_quote "$word")"
     done
