@@ -249,7 +249,8 @@ fn render_detail(
                 });
                 let pixels_per_point = ui.ctx().pixels_per_point();
                 let layout = native_detail_layout(side, pixels_per_point, image);
-                let rect = egui::Rect::from_center_size(tile.center(), layout.draw_size);
+                let rect =
+                    snap_to_physical_pixels(tile.center(), layout.draw_size, pixels_per_point);
                 ui.painter()
                     .image(texture.id(), rect, layout.uv, egui::Color32::WHITE);
             }
@@ -271,6 +272,24 @@ fn render_detail(
             }
         }
     });
+}
+
+/// Centre `size` on `center`, then move its origin to the nearest physical pixel.
+///
+/// Recomputed every frame from the tile's current position, so the image
+/// stays on the physical pixel grid after any scroll offset. The image may
+/// sit up to half a physical pixel off the tile centre.
+fn snap_to_physical_pixels(
+    center: egui::Pos2,
+    size: egui::Vec2,
+    pixels_per_point: f32,
+) -> egui::Rect {
+    let origin = center - size / 2.0;
+    let snapped = egui::pos2(
+        (origin.x * pixels_per_point).round() / pixels_per_point,
+        (origin.y * pixels_per_point).round() / pixels_per_point,
+    );
+    egui::Rect::from_min_size(snapped, size)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -321,7 +340,10 @@ mod tests {
 
     use sans_core::{CameraRole, CapturePair, CapturedFrame, CropGeometry};
 
-    use super::{full_page_layout, native_detail_layout, sync_preview_textures, PreviewTextures};
+    use super::{
+        full_page_layout, native_detail_layout, snap_to_physical_pixels, sync_preview_textures,
+        PreviewTextures,
+    };
 
     fn frame(role: CameraRole) -> CapturedFrame {
         CapturedFrame::from_rgb8(
@@ -358,6 +380,20 @@ mod tests {
         assert_eq!(layout.draw_size, eframe::egui::vec2(80.0, 50.0));
         assert_eq!(layout.uv.min, eframe::egui::pos2(20.0 / 200.0, 0.0));
         assert_eq!(layout.uv.max, eframe::egui::pos2(180.0 / 200.0, 1.0));
+    }
+
+    #[test]
+    fn detail_preview_origin_lands_on_the_physical_pixel_grid() {
+        // A 120x75 pixel block centred on a tile centre that sits between pixels at scale 1.5.
+        // Unsnapped, the origin would be (60.2, 25.1) points, or (90.3, 37.65) pixels.
+        let rect = snap_to_physical_pixels(
+            eframe::egui::pos2(100.2, 50.1),
+            eframe::egui::vec2(80.0, 50.0),
+            1.5,
+        );
+
+        assert_eq!(rect.min, eframe::egui::pos2(90.0 / 1.5, 38.0 / 1.5));
+        assert_eq!(rect.size(), eframe::egui::vec2(80.0, 50.0));
     }
 
     #[test]

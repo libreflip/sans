@@ -66,7 +66,11 @@ pub(crate) fn show(
     actions: impl FnOnce(&mut egui::Ui),
     body: impl FnOnce(&mut egui::Ui, f32),
 ) {
-    ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+    let scroll = &mut ui.style_mut().spacing.scroll;
+    *scroll = egui::style::ScrollStyle::solid();
+    // The solid bar already shows that more content exists. A fade would dim
+    // 100% preview pixels near the body edges.
+    scroll.fade.strength = 0.0;
 
     egui::Panel::top("screen-header")
         .resizable(false)
