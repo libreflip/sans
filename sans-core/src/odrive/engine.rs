@@ -89,8 +89,12 @@ pub enum LinkCommand {
     /// Write `requested_state` closed-loop control; confirmed when
     /// `current_state` reads closed-loop control.
     Arm,
-    /// Write `requested_state` homing; confirmed when `current_state` reads
-    /// homing. Home progress and evidence belong to #59.
+    /// Write `requested_state` homing; confirmed when `current_state` is
+    /// observed reading homing, which shows entry and never completion. A run
+    /// that ends before the first read is reported not confirmed. Upstream
+    /// `axis.cpp` clears `requested_state` as soon as it is taken, so reading the
+    /// written endpoint back cannot confirm the write. Home progress and
+    /// evidence belong to #59.
     Home,
     /// Write `controller.input_pos`; confirmed when it reads back the written
     /// value. Motion completion belongs to #59.
@@ -342,6 +346,12 @@ pub struct Transmit {
     pub epoch: u64,
     /// Urgent packets go before anything still queued.
     pub urgent: bool,
+    /// An ordinary command packet. A writer that still holds it when an urgent
+    /// packet arrives must discard it and report [`LinkEngine::transmit_withdrawn`],
+    /// so a queued move can never follow a stop.
+    pub retractable: bool,
+    /// The Fibre request sequence number the packet carries.
+    pub sequence: u16,
     /// The whole request packet.
     pub packet: Vec<u8>,
 }
@@ -499,7 +509,7 @@ enum Reply {
 enum GateStep {
     Opening,
     Descriptor { buffer: Vec<u8> },
-    Identity { values: Vec<WireValue> },
+    Identity { next: usize, reads: IdentityReads },
     IdleWrite,
     IdleRead { not_before: Instant },
     Limit { index: usize, readback: bool },
@@ -550,7 +560,142 @@ struct AwaitingSample {
 
 struct Cycle {
     started_at: Instant,
-    values: Vec<WireValue>,
+    next: usize,
+    raw: RawTelemetry,
+}
+
+/// Identity reads, assigned by endpoint rather than by position.
+#[derive(Clone, Debug, Default)]
+struct IdentityReads {
+    serial_number: Option<u64>,
+    hardware: [Option<u8>; 3],
+    firmware: [Option<u8>; 4],
+    vbus_voltage: Option<f32>,
+    armed_state: Option<i32>,
+}
+
+impl IdentityReads {
+    fn record(&mut self, endpoint: Endpoint, value: WireValue) -> Result<(), String> {
+        match (endpoint, value) {
+            (Endpoint::SerialNumber, WireValue::U64(v)) => self.serial_number = Some(v),
+            (Endpoint::HwVersionMajor, WireValue::U8(v)) => self.hardware[0] = Some(v),
+            (Endpoint::HwVersionMinor, WireValue::U8(v)) => self.hardware[1] = Some(v),
+            (Endpoint::HwVersionVariant, WireValue::U8(v)) => self.hardware[2] = Some(v),
+            (Endpoint::FwVersionMajor, WireValue::U8(v)) => self.firmware[0] = Some(v),
+            (Endpoint::FwVersionMinor, WireValue::U8(v)) => self.firmware[1] = Some(v),
+            (Endpoint::FwVersionRevision, WireValue::U8(v)) => self.firmware[2] = Some(v),
+            (Endpoint::FwVersionUnreleased, WireValue::U8(v)) => self.firmware[3] = Some(v),
+            (Endpoint::VbusVoltage, WireValue::F32(v)) => self.vbus_voltage = Some(v),
+            (Endpoint::MotorArmedState, WireValue::I32(v)) => self.armed_state = Some(v),
+            (endpoint, value) => {
+                return Err(format!("identity read {endpoint:?} returned {value:?}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One telemetry cycle's raw reads, assigned by endpoint rather than by
+/// position, so reordering the read list cannot swap fields.
+#[derive(Clone, Debug, Default)]
+struct RawTelemetry {
+    current_state: Option<i32>,
+    axis_error: Option<i32>,
+    motor_error: Option<i32>,
+    encoder_error: Option<i32>,
+    controller_error: Option<i32>,
+    pos_estimate_turns: Option<f32>,
+    vel_estimate_turns_s: Option<f32>,
+    iq_measured: Option<f32>,
+    iq_setpoint: Option<f32>,
+    trajectory_done: Option<bool>,
+    is_homed: Option<bool>,
+    min_endstop: Option<bool>,
+    motor_calibrated: Option<bool>,
+    encoder_ready: Option<bool>,
+    control_mode: Option<i32>,
+    input_mode: Option<i32>,
+}
+
+impl RawTelemetry {
+    /// Store one read. Non-finite measurements are rejected: a sample built
+    /// from them could pass a readiness check it means nothing for.
+    fn record(&mut self, endpoint: Endpoint, value: WireValue) -> Result<(), String> {
+        let finite = |value: f32| {
+            if value.is_finite() {
+                Ok(Some(value))
+            } else {
+                Err(format!("telemetry {endpoint:?} was not finite ({value})"))
+            }
+        };
+        match (endpoint, value) {
+            (Endpoint::CurrentState, WireValue::I32(v)) => self.current_state = Some(v),
+            (Endpoint::AxisError, WireValue::I32(v)) => self.axis_error = Some(v),
+            (Endpoint::MotorError, WireValue::I32(v)) => self.motor_error = Some(v),
+            (Endpoint::EncoderError, WireValue::I32(v)) => self.encoder_error = Some(v),
+            (Endpoint::ControllerError, WireValue::I32(v)) => self.controller_error = Some(v),
+            (Endpoint::PosEstimate, WireValue::F32(v)) => self.pos_estimate_turns = finite(v)?,
+            (Endpoint::VelEstimate, WireValue::F32(v)) => self.vel_estimate_turns_s = finite(v)?,
+            (Endpoint::IqMeasured, WireValue::F32(v)) => self.iq_measured = finite(v)?,
+            (Endpoint::IqSetpoint, WireValue::F32(v)) => self.iq_setpoint = finite(v)?,
+            (Endpoint::TrajectoryDone, WireValue::Bool(v)) => self.trajectory_done = Some(v),
+            (Endpoint::IsHomed, WireValue::Bool(v)) => self.is_homed = Some(v),
+            (Endpoint::MinEndstopState, WireValue::Bool(v)) => self.min_endstop = Some(v),
+            (Endpoint::MotorIsCalibrated, WireValue::Bool(v)) => self.motor_calibrated = Some(v),
+            (Endpoint::EncoderIsReady, WireValue::Bool(v)) => self.encoder_ready = Some(v),
+            (Endpoint::ControlMode, WireValue::I32(v)) => self.control_mode = Some(v),
+            (Endpoint::InputMode, WireValue::I32(v)) => self.input_mode = Some(v),
+            (endpoint, value) => {
+                return Err(format!("telemetry read {endpoint:?} returned {value:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert a complete cycle to Sans units; `None` scale means uncommissioned.
+    fn finish(&self, scale_mm_per_turn: Option<f32>) -> Result<TelemetryValues, String> {
+        let missing = |name: &str| format!("telemetry cycle is missing {name}");
+        let millimetres = |turns: Option<f32>, name: &str| -> Result<Option<f32>, String> {
+            let turns = turns.ok_or_else(|| missing(name))?;
+            match scale_mm_per_turn {
+                None => Ok(None),
+                Some(scale) => {
+                    let value = turns * scale;
+                    if value.is_finite() {
+                        Ok(Some(value))
+                    } else {
+                        Err(format!("{name} converted to a non-finite value"))
+                    }
+                }
+            }
+        };
+        Ok(TelemetryValues {
+            axis_state: AxisState::from_raw(
+                self.current_state.ok_or_else(|| missing("current_state"))?,
+            ),
+            axis_error: self.axis_error.ok_or_else(|| missing("error"))? as u32,
+            motor_error: self.motor_error.ok_or_else(|| missing("motor.error"))? as u32,
+            encoder_error: self.encoder_error.ok_or_else(|| missing("encoder.error"))? as u32,
+            controller_error: self
+                .controller_error
+                .ok_or_else(|| missing("controller.error"))? as u32,
+            position_mm: millimetres(self.pos_estimate_turns, "position")?,
+            velocity_mm_s: millimetres(self.vel_estimate_turns_s, "velocity")?,
+            iq_measured_a: self.iq_measured.ok_or_else(|| missing("Iq_measured"))?,
+            iq_setpoint_a: self.iq_setpoint.ok_or_else(|| missing("Iq_setpoint"))?,
+            trajectory_done: self
+                .trajectory_done
+                .ok_or_else(|| missing("trajectory_done"))?,
+            is_homed: self.is_homed.ok_or_else(|| missing("is_homed"))?,
+            min_endstop_pressed: self.min_endstop.ok_or_else(|| missing("endstop_state"))?,
+            motor_calibrated: self
+                .motor_calibrated
+                .ok_or_else(|| missing("is_calibrated"))?,
+            encoder_ready: self.encoder_ready.ok_or_else(|| missing("is_ready"))?,
+            control_mode: self.control_mode.ok_or_else(|| missing("control_mode"))?,
+            input_mode: self.input_mode.ok_or_else(|| missing("input_mode"))?,
+        })
+    }
 }
 
 struct Connection {
@@ -619,7 +764,7 @@ impl LinkEngine {
 
     /// Start a connection attempt with a fresh epoch, ending any current one.
     pub fn begin_attempt(&mut self, now: Instant) -> u64 {
-        self.end_epoch(now, "connection ended for a new attempt");
+        self.end_epoch("connection ended for a new attempt");
         self.epoch += 1;
         self.connection = Some(Connection {
             epoch: self.epoch,
@@ -650,7 +795,7 @@ impl LinkEngine {
 
     /// The device could not be opened; the attempt is blocked with `reason`.
     pub fn open_failed(&mut self, now: Instant, reason: impl Into<String>) {
-        let _ = now;
+        self.expire(now);
         if let Some(connection) = self.connection.as_mut() {
             if !connection.opened && connection.gate.is_some() {
                 connection.gate = None;
@@ -686,18 +831,23 @@ impl LinkEngine {
 
     /// The transport failed or the device went away; end the epoch.
     pub fn transport_lost(&mut self, now: Instant, reason: impl Into<String>) {
-        self.end_epoch(now, &reason.into());
+        self.expire(now);
+        self.end_epoch(&reason.into());
         self.publish_status();
     }
 
     /// Explicitly end the current epoch.
     pub fn disconnect(&mut self, now: Instant) {
-        self.end_epoch(now, "disconnected");
+        self.expire(now);
+        self.end_epoch("disconnected");
         self.publish_status();
     }
 
     /// Handle one received packet.
     pub fn receive(&mut self, now: Instant, packet: &[u8]) {
+        // Deadlines that passed before this packet arrived take effect first,
+        // so a reply after its deadline completes nothing.
+        self.expire(now);
         self.handle_packet(now, packet);
         self.pump(now);
         self.publish_status();
@@ -711,6 +861,7 @@ impl LinkEngine {
         command: LinkCommand,
         priority: Priority,
     ) {
+        self.expire(now);
         let usable = self.connection.as_ref().is_some_and(Connection::usable);
         if !usable {
             self.finish(
@@ -751,6 +902,14 @@ impl LinkEngine {
                             .any(|lane| lane.op.ticket == ticket && lane.op.transmitted)
                     }) {
                         self.retire_queue();
+                        let (withdrawn, kept): (VecDeque<_>, VecDeque<_>) = self
+                            .transmit_ordinary
+                            .drain(..)
+                            .partition(|transmit| transmit.retractable);
+                        self.transmit_ordinary = kept;
+                        for transmit in withdrawn {
+                            self.withdraw(transmit.epoch, transmit.sequence);
+                        }
                     }
                 }
             },
@@ -787,6 +946,13 @@ impl LinkEngine {
         self.transmit_urgent
             .pop_front()
             .or_else(|| self.transmit_ordinary.pop_front())
+    }
+
+    /// Whether packets or events are waiting to be taken.
+    pub fn has_output(&self) -> bool {
+        !(self.transmit_urgent.is_empty()
+            && self.transmit_ordinary.is_empty()
+            && self.events.is_empty())
     }
 
     /// The next event.
@@ -902,8 +1068,7 @@ impl LinkEngine {
 
     // ----- epochs -------------------------------------------------------------
 
-    fn end_epoch(&mut self, now: Instant, reason: &str) {
-        let _ = now;
+    fn end_epoch(&mut self, reason: &str) {
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
@@ -1005,11 +1170,19 @@ impl LinkEngine {
 
     // ----- sending ------------------------------------------------------------
 
-    fn send(&mut self, now: Instant, spec: RequestSpec, urgent: bool) -> Option<InFlight> {
+    fn send(
+        &mut self,
+        now: Instant,
+        spec: RequestSpec,
+        urgent: bool,
+        retractable: bool,
+    ) -> Option<InFlight> {
         let connection = self.connection.as_ref()?;
         let epoch = connection.epoch;
         let Some(sequence) = self.sequences.allocate() else {
-            self.latch_fault("all 16384 sequence numbers are pending or quarantined".into());
+            self.latch_fault(
+                "all 16384 Fibre request sequence numbers are pending or quarantined".into(),
+            );
             return None;
         };
         let packet = if let RequestSpec::Chunk(offset) = spec {
@@ -1052,6 +1225,8 @@ impl LinkEngine {
         let transmit = Transmit {
             epoch,
             urgent,
+            retractable,
+            sequence,
             packet,
         };
         if urgent {
@@ -1067,7 +1242,8 @@ impl LinkEngine {
     }
 
     fn send_ordinary(&mut self, now: Instant, spec: RequestSpec, owner: OrdinaryOwner) -> bool {
-        match self.send(now, spec, false) {
+        let retractable = owner == OrdinaryOwner::Command;
+        match self.send(now, spec, false, retractable) {
             Some(in_flight) => {
                 if let Some(connection) = self.connection.as_mut() {
                     connection.ordinary = Some((in_flight, owner));
@@ -1099,21 +1275,28 @@ impl LinkEngine {
                 }
             }
             let connection = self.connection.as_ref().expect("checked above");
+            // While a confirmation waits to re-read, telemetry may use the slot
+            // so freshness is still maintained; queued commands still wait.
+            let mut confirmation_waiting = false;
             if let Some(op) = connection.active.clone() {
                 if op.not_before.is_some_and(|not_before| now < not_before) {
+                    confirmation_waiting = true;
+                } else {
+                    if let Some(spec) = self.op_request(&op) {
+                        if self.send_ordinary(now, spec, OrdinaryOwner::Command) {
+                            let connection = self.connection.as_mut().expect("connection");
+                            let active = connection.active.as_mut().expect("active");
+                            active.transmitted = true;
+                            advance_after_send(active, now);
+                        }
+                    }
                     return;
                 }
-                if let Some(spec) = self.op_request(&op, false) {
-                    if self.send_ordinary(now, spec, OrdinaryOwner::Command) {
-                        let connection = self.connection.as_mut().expect("connection");
-                        let active = connection.active.as_mut().expect("active");
-                        active.transmitted = true;
-                        advance_after_send(active, now);
-                    }
-                }
-                return;
             }
-            if connection.gate.is_none() || matches!(connection.gate, Some(GateStep::FirstCycle)) {
+            if !confirmation_waiting
+                && (connection.gate.is_none()
+                    || matches!(connection.gate, Some(GateStep::FirstCycle)))
+            {
                 if let Some((ticket, command)) = self
                     .connection
                     .as_mut()
@@ -1148,12 +1331,13 @@ impl LinkEngine {
                 return;
             }
             let index = match &connection.cycle {
-                Some(cycle) => cycle.values.len(),
+                Some(cycle) => cycle.next,
                 None if now >= connection.next_cycle_at => {
                     if let Some(connection) = self.connection.as_mut() {
                         connection.cycle = Some(Cycle {
                             started_at: now,
-                            values: Vec::new(),
+                            next: 0,
+                            raw: RawTelemetry::default(),
                         });
                     }
                     0
@@ -1173,7 +1357,7 @@ impl LinkEngine {
         Some(match step {
             GateStep::Opening | GateStep::FirstCycle => return None,
             GateStep::Descriptor { buffer } => RequestSpec::Chunk(buffer.len() as u32),
-            GateStep::Identity { values } => RequestSpec::Read(IDENTITY_READS[values.len()]),
+            GateStep::Identity { next, .. } => RequestSpec::Read(IDENTITY_READS[*next]),
             GateStep::IdleWrite => {
                 RequestSpec::Write(Endpoint::RequestedState, WireValue::I32(AXIS_STATE_IDLE))
             }
@@ -1205,7 +1389,7 @@ impl LinkEngine {
         ])
     }
 
-    fn op_request(&self, op: &Operation, _urgent: bool) -> Option<RequestSpec> {
+    fn op_request(&self, op: &Operation) -> Option<RequestSpec> {
         match op.step {
             OpStep::SendWrite => Some(op.write),
             OpStep::SendConfirm => Some(match op.confirm {
@@ -1231,10 +1415,10 @@ impl LinkEngine {
         if op.not_before.is_some_and(|not_before| now < not_before) {
             return;
         }
-        let Some(spec) = self.op_request(&op, true) else {
+        let Some(spec) = self.op_request(&op) else {
             return;
         };
-        if let Some(in_flight) = self.send(now, spec, true) {
+        if let Some(in_flight) = self.send(now, spec, true, false) {
             if let Some(entry) = self
                 .connection
                 .as_mut()
@@ -1340,7 +1524,13 @@ impl LinkEngine {
                     ));
                 }
                 let (sign, mm_per_turn) = self.config.direction_sign().expect("commissioned");
-                let turns = WireValue::F32(sign * position_mm / mm_per_turn);
+                let native = sign * position_mm / mm_per_turn;
+                if !native.is_finite() {
+                    return Err(format!(
+                        "move target {position_mm} mm converts to a non-finite {native} turns"
+                    ));
+                }
+                let turns = WireValue::F32(native);
                 Ok((
                     RequestSpec::Write(Endpoint::InputPos, turns),
                     Confirm::Readback(Endpoint::InputPos, turns),
@@ -1374,15 +1564,15 @@ impl LinkEngine {
 
     fn handle_packet(&mut self, now: Instant, packet: &[u8]) {
         let Some((sequence, payload)) = decode_reply(packet) else {
-            self.unmatched_replies += 1;
+            self.note_unmatched("a packet without the reply bit");
             return;
         };
         let Some(connection) = self.connection.as_mut() else {
-            self.unmatched_replies += 1;
+            self.note_unmatched("a reply before any connection");
             return;
         };
         if connection.ended {
-            self.unmatched_replies += 1;
+            self.note_unmatched("a reply after its connection ended");
             return;
         }
         if connection
@@ -1394,7 +1584,7 @@ impl LinkEngine {
             match validate(&in_flight, payload) {
                 Ok(reply) => {
                     self.sequences.complete(sequence);
-                    self.on_ordinary_reply(now, owner, reply);
+                    self.on_ordinary_reply(now, owner, in_flight.spec, reply);
                 }
                 Err(reason) => {
                     self.sequences.quarantine(sequence);
@@ -1433,13 +1623,78 @@ impl LinkEngine {
             }
             return;
         }
-        self.unmatched_replies += 1;
+        self.note_unmatched("a reply matching no pending Fibre request sequence number");
     }
 
-    fn on_ordinary_reply(&mut self, now: Instant, owner: OrdinaryOwner, reply: Reply) {
+    /// Count an ignored reply and log it without flooding the log.
+    fn note_unmatched(&mut self, what: &str) {
+        self.unmatched_replies += 1;
+        let count = self.unmatched_replies;
+        if count <= 8 || count.is_power_of_two() {
+            log::warn!("ODrive link ignored {what} ({count} ignored so far)");
+        }
+    }
+
+    /// The runner dropped a packet that arrived from an ended connection's reader.
+    pub fn stale_packet_dropped(&mut self) {
+        self.note_unmatched("a packet from an ended connection");
+        self.publish_status();
+    }
+
+    /// A writer discarded an ordinary command packet before it left the host
+    /// because an urgent packet overtook it. The command is retired; it counts
+    /// as transmitted only if an earlier packet of it was sent.
+    pub fn transmit_withdrawn(&mut self, now: Instant, epoch: u64, sequence: u16) {
+        self.withdraw(epoch, sequence);
+        self.pump(now);
+        self.publish_status();
+    }
+
+    fn withdraw(&mut self, epoch: u64, sequence: u16) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        if connection.epoch != epoch
+            || !connection
+                .ordinary
+                .as_ref()
+                .is_some_and(|(in_flight, owner)| {
+                    in_flight.sequence == sequence && *owner == OrdinaryOwner::Command
+                })
+        {
+            return;
+        }
+        let (in_flight, _) = connection.ordinary.take().expect("checked");
+        // The number never left the host, so it can be handed out again.
+        self.sequences.complete(sequence);
+        let first_packet = matches!(
+            in_flight.spec,
+            RequestSpec::Write(..) | RequestSpec::Call(_)
+        );
+        if let Some(op) = self.connection.as_mut().and_then(|c| c.active.take()) {
+            self.finish(
+                op.ticket,
+                op.command,
+                CommandResult::Retired {
+                    transmitted: !first_packet,
+                },
+            );
+        }
+    }
+
+    fn on_ordinary_reply(
+        &mut self,
+        now: Instant,
+        owner: OrdinaryOwner,
+        spec: RequestSpec,
+        reply: Reply,
+    ) {
         match owner {
             OrdinaryOwner::Gate => self.on_gate_reply(now, reply),
-            OrdinaryOwner::Telemetry => self.on_telemetry_reply(now, reply),
+            OrdinaryOwner::Telemetry => match spec {
+                RequestSpec::Read(endpoint) => self.on_telemetry_reply(now, endpoint, reply),
+                other => self.drop_cycle(now, now, format!("telemetry slot sent {other:?}")),
+            },
             OrdinaryOwner::Command => {
                 let Some(mut op) = self.connection.as_mut().and_then(|c| c.active.take()) else {
                     return;
@@ -1567,13 +1822,19 @@ impl LinkEngine {
                 }
                 self.set_gate(GateStep::Descriptor { buffer });
             }
-            (GateStep::Identity { mut values }, Reply::Value(value)) => {
-                values.push(value);
-                if values.len() < IDENTITY_READS.len() {
-                    self.set_gate(GateStep::Identity { values });
+            (GateStep::Identity { next, mut reads }, Reply::Value(value)) => {
+                if let Err(reason) = reads.record(IDENTITY_READS[next], value) {
+                    self.fail_gate(Some(reason));
                     return;
                 }
-                self.finish_identity(&values);
+                if next + 1 < IDENTITY_READS.len() {
+                    self.set_gate(GateStep::Identity {
+                        next: next + 1,
+                        reads,
+                    });
+                    return;
+                }
+                self.finish_identity(&reads);
             }
             (GateStep::IdleWrite, Reply::Ack) => {
                 self.set_gate(GateStep::IdleRead { not_before: now })
@@ -1684,63 +1945,75 @@ impl LinkEngine {
             ));
         }
         if problems.is_empty() {
-            connection.gate = Some(GateStep::Identity { values: Vec::new() });
+            connection.gate = Some(GateStep::Identity {
+                next: 0,
+                reads: IdentityReads::default(),
+            });
         } else {
             connection.gate = None;
             connection.blockers.extend(problems);
         }
     }
 
-    fn finish_identity(&mut self, values: &[WireValue]) {
-        let byte = |index: usize| match values[index] {
-            WireValue::U8(value) => value,
-            _ => 0,
-        };
-        let board_serial = match values[0] {
-            WireValue::U64(value) => value,
-            _ => 0,
-        };
-        let vbus = match values[8] {
-            WireValue::F32(value) => value,
-            _ => f32::NAN,
-        };
+    fn finish_identity(&mut self, reads: &IdentityReads) {
         let expected = self.config.usb_serial;
         let expected_text = self.config.usb_serial_text.clone();
         let Some(connection) = self.connection.as_mut() else {
             return;
         };
         let record = &mut connection.discovery;
-        record.board_serial = Some(board_serial);
-        record.hardware_version = Some([byte(1), byte(2), byte(3)]);
-        record.firmware_version = Some([byte(4), byte(5), byte(6), byte(7)]);
-        record.vbus_voltage = Some(vbus);
-        record.armed_state = Some(as_i32(values[9]));
-        if board_serial != expected {
-            self.fail_gate(Some(format!(
-                "board serial_number {board_serial:x} does not match profile odrive.usb_serial {expected_text}"
-            )));
-        } else {
-            self.set_gate(GateStep::IdleWrite);
+        record.board_serial = reads.serial_number;
+        record.hardware_version = match reads.hardware {
+            [Some(major), Some(minor), Some(variant)] => Some([major, minor, variant]),
+            _ => None,
+        };
+        record.firmware_version = match reads.firmware {
+            [Some(major), Some(minor), Some(revision), Some(unreleased)] => {
+                Some([major, minor, revision, unreleased])
+            }
+            _ => None,
+        };
+        record.vbus_voltage = reads.vbus_voltage;
+        record.armed_state = reads.armed_state;
+        match reads.serial_number {
+            Some(board_serial) if board_serial == expected => self.set_gate(GateStep::IdleWrite),
+            board_serial => self.fail_gate(Some(format!(
+                "board serial_number {} does not match profile odrive.usb_serial {expected_text}",
+                board_serial.map_or_else(|| "<unread>".into(), |serial| format!("{serial:x}"))
+            ))),
         }
     }
 
-    fn on_telemetry_reply(&mut self, now: Instant, reply: Reply) {
+    fn on_telemetry_reply(&mut self, now: Instant, endpoint: Endpoint, reply: Reply) {
         let Reply::Value(value) = reply else {
             return;
         };
-        let Some(connection) = self.connection.as_mut() else {
+        let Some(cycle) = self.connection.as_mut().and_then(|c| c.cycle.as_mut()) else {
             return;
         };
-        let Some(cycle) = connection.cycle.as_mut() else {
-            return;
-        };
-        cycle.values.push(value);
-        if cycle.values.len() < TELEMETRY_READS.len() {
+        if let Err(reason) = cycle.raw.record(endpoint, value) {
+            let started_at = cycle.started_at;
+            self.drop_cycle(now, started_at, reason);
             return;
         }
+        cycle.next += 1;
+        if cycle.next < TELEMETRY_READS.len() {
+            return;
+        }
+        let connection = self.connection.as_mut().expect("connection");
         let cycle = connection.cycle.take().expect("checked");
         connection.next_cycle_at = (cycle.started_at + self.config.poll_interval).max(now);
-        let values = self.convert(&cycle.values);
+        let scale = self
+            .config
+            .direction_sign()
+            .map(|(sign, mm_per_turn)| sign * mm_per_turn);
+        let values = match cycle.raw.finish(scale) {
+            Ok(values) => values,
+            Err(reason) => {
+                self.drop_cycle(now, cycle.started_at, reason);
+                return;
+            }
+        };
         let sample = TelemetrySample {
             epoch: self.epoch,
             taken_at: cycle.started_at,
@@ -1769,40 +2042,20 @@ impl LinkEngine {
         }
     }
 
-    fn convert(&self, raw: &[WireValue]) -> TelemetryValues {
-        let float = |index: usize| match raw[index] {
-            WireValue::F32(value) => value,
-            _ => f32::NAN,
-        };
-        let flag = |index: usize| matches!(raw[index], WireValue::Bool(true));
-        let mm = self
-            .config
-            .direction_sign()
-            .map(|(sign, mm_per_turn)| sign * mm_per_turn);
-        TelemetryValues {
-            axis_state: AxisState::from_raw(as_i32(raw[0])),
-            axis_error: as_i32(raw[1]) as u32,
-            motor_error: as_i32(raw[2]) as u32,
-            encoder_error: as_i32(raw[3]) as u32,
-            controller_error: as_i32(raw[4]) as u32,
-            position_mm: mm.map(|scale| float(5) * scale),
-            velocity_mm_s: mm.map(|scale| float(6) * scale),
-            iq_measured_a: float(7),
-            iq_setpoint_a: float(8),
-            trajectory_done: flag(9),
-            is_homed: flag(10),
-            min_endstop_pressed: flag(11),
-            motor_calibrated: flag(12),
-            encoder_ready: flag(13),
-            control_mode: as_i32(raw[14]),
-            input_mode: as_i32(raw[15]),
+    /// A cycle produced an unusable value: no sample, and the link faults.
+    /// The next cycle keeps the normal schedule, so a board that keeps
+    /// returning bad values is not polled in a tight loop.
+    fn drop_cycle(&mut self, now: Instant, started_at: Instant, reason: String) {
+        if let Some(connection) = self.connection.as_mut() {
+            connection.cycle = None;
+            connection.next_cycle_at = (started_at + self.config.poll_interval).max(now);
         }
+        self.latch_fault(reason);
     }
 
     // ----- deadlines ----------------------------------------------------------
 
     fn fail_ordinary(&mut self, now: Instant, owner: OrdinaryOwner, reason: String) {
-        let _ = now;
         match owner {
             OrdinaryOwner::Gate => self.fail_gate(None),
             OrdinaryOwner::Telemetry => {

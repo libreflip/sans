@@ -271,13 +271,15 @@ fn cutting_the_connection_then_reconnecting_reaches_verified_in_epoch_2_without_
 
     *started.opener.cut.lock().unwrap() = true;
     let cut = recv_within(&started.controller, GATE_WAIT, |snapshot| {
-        matches!(
-            snapshot.lift_axis.phase,
-            LinkPhase::Disconnected | LinkPhase::Faulted
-        )
+        snapshot.lift_axis.phase == LinkPhase::Disconnected
     });
     assert_eq!(cut.lift_axis.epoch, 1);
     assert!(camera_preview_ready(&cut.screen));
+    assert!(
+        cut.lift_axis.telemetry.is_none(),
+        "a disconnected link must not show its last sample: {:#?}",
+        cut.lift_axis
+    );
 
     started
         .controller

@@ -36,6 +36,9 @@ pub(crate) fn show_lift_axis(
             let (text, colour) = phase_label(status.phase);
             ui.colored_label(colour, text);
             ui.label(format!("epoch {}", status.epoch));
+            if status.unmatched_replies > 0 {
+                ui.label(format!("{} ignored replies", status.unmatched_replies));
+            }
         });
         if status.phase != LinkPhase::Verified {
             for blocker in &status.blockers {

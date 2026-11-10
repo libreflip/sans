@@ -7,7 +7,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use sans_core::{FibreConnection, FibreOpener, OpenRequest, PacketReader, PacketWriter};
@@ -86,6 +87,10 @@ pub struct FakeFibre {
     pub ignore_state_requests: Vec<i32>,
     /// Values the fake returns on readback instead of what was written.
     pub readback_override: HashMap<u16, Vec<u8>>,
+    /// Requested states that are visible for exactly one `current_state`
+    /// read and then settle to the mapped state, like a homing run that ends.
+    pub settle_after_one_read: HashMap<i32, i32>,
+    settling: Option<i32>,
 }
 
 impl FakeFibre {
@@ -124,6 +129,8 @@ impl FakeFibre {
             sent_replies: Vec::new(),
             ignore_state_requests: Vec::new(),
             readback_override: HashMap::new(),
+            settle_after_one_read: HashMap::new(),
+            settling: None,
         };
         fake.set_u64(SERIAL_NUMBER, 54_310_774_846_261);
         fake.set_raw(5, vec![3]);
@@ -249,6 +256,11 @@ impl FakeFibre {
                 self.apply_write(endpoint, payload);
                 old
             };
+            if endpoint == CURRENT_STATE && payload_was_empty(packet) {
+                if let Some(settled) = self.settling.take() {
+                    self.set_i32(CURRENT_STATE, settled);
+                }
+            }
             current[..limit.min(current.len())].to_vec()
         };
         if !wants_reply {
@@ -277,11 +289,16 @@ impl FakeFibre {
             let state = i32::from_le_bytes(payload.try_into().unwrap());
             if !self.ignore_state_requests.contains(&state) {
                 self.set_i32(CURRENT_STATE, state);
+                self.settling = self.settle_after_one_read.get(&state).copied();
             }
             return;
         }
         self.values.insert(endpoint, payload);
     }
+}
+
+fn payload_was_empty(packet: &[u8]) -> bool {
+    packet.len() == 8
 }
 
 /// CRC16, polynomial 0x3d65, initial value 1, MSB first; written out here so the
@@ -321,6 +338,35 @@ pub struct FakeOpener {
     /// Set to cut the current connection.
     pub cut: Arc<Mutex<bool>>,
     pub opens: Arc<Mutex<usize>>,
+    /// While `true`, the writer holds the packet it was given and does not
+    /// deliver it; `writes_held` counts packets held so far.
+    pub write_gate: Arc<(Mutex<bool>, Condvar)>,
+    pub writes_held: Arc<AtomicUsize>,
+    /// Live halves of the claimed device; like a USB interface claim, a
+    /// second open fails until both halves of the previous one are dropped.
+    pub claimed: Arc<AtomicUsize>,
+    /// Opens refused because the previous claim was still held.
+    pub busy_refusals: Arc<AtomicUsize>,
+}
+
+impl FakeOpener {
+    pub fn block_writes(&self) {
+        *self.write_gate.0.lock().unwrap() = true;
+    }
+
+    pub fn release_writes(&self) {
+        *self.write_gate.0.lock().unwrap() = false;
+        self.write_gate.1.notify_all();
+    }
+}
+
+/// Keeps the fake claim while either half is alive.
+struct Claim(Arc<AtomicUsize>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl FakeOpener {
@@ -330,6 +376,10 @@ impl FakeOpener {
             usb_serials: Arc::new(Mutex::new(vec!["316536713335".into()])),
             cut: Arc::new(Mutex::new(false)),
             opens: Arc::new(Mutex::new(0)),
+            write_gate: Arc::new((Mutex::new(false), Condvar::new())),
+            writes_held: Arc::new(AtomicUsize::new(0)),
+            claimed: Arc::new(AtomicUsize::new(0)),
+            busy_refusals: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -362,6 +412,11 @@ impl FibreOpener for FakeOpener {
                 ))
             }
         }
+        if self.claimed.load(Ordering::SeqCst) != 0 {
+            self.busy_refusals.fetch_add(1, Ordering::SeqCst);
+            return Err("fake USB interface 2 is still claimed by the previous connection".into());
+        }
+        self.claimed.store(2, Ordering::SeqCst);
         *self.cut.lock().unwrap() = false;
         *self.opens.lock().unwrap() += 1;
         let (replies, inbox) = mpsc::channel();
@@ -369,12 +424,17 @@ impl FibreOpener for FakeOpener {
             usb_serial: matching[0].clone(),
             reader: Box::new(FakeReader {
                 inbox,
+                _keep_open: replies.clone(),
                 cut: Arc::clone(&self.cut),
+                _claim: Claim(Arc::clone(&self.claimed)),
             }),
             writer: Box::new(FakeWriter {
                 board: Arc::clone(&self.board),
                 replies,
                 cut: Arc::clone(&self.cut),
+                gate: Arc::clone(&self.write_gate),
+                held: Arc::clone(&self.writes_held),
+                _claim: Claim(Arc::clone(&self.claimed)),
             }),
         })
     }
@@ -382,7 +442,11 @@ impl FibreOpener for FakeOpener {
 
 struct FakeReader {
     inbox: mpsc::Receiver<Vec<u8>>,
+    /// Like a pending USB IN transfer, a read waits out its whole timeout even
+    /// after the writer is gone, holding the claim until it returns.
+    _keep_open: mpsc::Sender<Vec<u8>>,
     cut: Arc<Mutex<bool>>,
+    _claim: Claim,
 }
 
 impl PacketReader for FakeReader {
@@ -402,10 +466,23 @@ struct FakeWriter {
     board: Arc<Mutex<FakeFibre>>,
     replies: mpsc::Sender<Vec<u8>>,
     cut: Arc<Mutex<bool>>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    held: Arc<AtomicUsize>,
+    _claim: Claim,
 }
 
 impl PacketWriter for FakeWriter {
     fn write_packet(&mut self, packet: &[u8], _timeout: Duration) -> Result<(), String> {
+        {
+            let (blocked, wake) = &*self.gate;
+            let mut blocked = blocked.lock().unwrap();
+            if *blocked {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                while *blocked {
+                    blocked = wake.wait(blocked).unwrap();
+                }
+            }
+        }
         if *self.cut.lock().unwrap() {
             return Err("fake cable cut".into());
         }

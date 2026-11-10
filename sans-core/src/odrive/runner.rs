@@ -17,7 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::engine::{
-    LinkCommand, LinkConfig, LinkEngine, LinkEvent, Priority, TelemetrySample, Ticket, Transmit,
+    LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkPhase, Priority, TelemetrySample, Ticket,
+    Transmit,
 };
 use super::transport::{FibreConnection, FibreOpener, OpenRequest, PacketReader, PacketWriter};
 
@@ -41,6 +42,7 @@ enum Input {
 #[derive(Default)]
 struct Shared {
     epoch: u64,
+    ended: bool,
     latest: Option<TelemetrySample>,
 }
 
@@ -69,6 +71,9 @@ impl LinkHandle {
     /// profile allows.
     pub fn fresh_sample(&self, now: Instant) -> Option<TelemetrySample> {
         let shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        if shared.ended {
+            return None;
+        }
         shared
             .latest
             .as_ref()
@@ -117,6 +122,7 @@ where
                 events,
                 shared,
                 active: None,
+                releasing: None,
             }
             .run(inbox);
         })?;
@@ -138,12 +144,32 @@ struct ActiveTransport {
     epoch: u64,
     stop: Arc<AtomicBool>,
     writer: Arc<WriterQueue>,
+    /// Disconnects once the reader and writer threads have both exited and
+    /// dropped their halves of the device.
+    released: Receiver<()>,
 }
 
 impl ActiveTransport {
-    fn close(&self) {
+    /// Ask both I/O threads to stop and return the signal of their exit.
+    fn close(self) -> Receiver<()> {
         self.stop.store(true, Ordering::SeqCst);
         self.writer.close();
+        self.released
+    }
+}
+
+/// Wait, on the open thread, until the previous connection's I/O threads have
+/// released the device, so a reopen never races the old claim.
+fn await_release(released: Option<Receiver<()>>, bound: Duration) -> Result<(), String> {
+    let Some(released) = released else {
+        return Ok(());
+    };
+    match released.recv_timeout(bound) {
+        Err(RecvTimeoutError::Disconnected) | Ok(()) => Ok(()),
+        Err(RecvTimeoutError::Timeout) => Err(format!(
+            "the previous ODrive connection did not release the device within {} ms",
+            bound.as_millis()
+        )),
     }
 }
 
@@ -155,6 +181,8 @@ struct EngineThread<E> {
     events: Sender<E>,
     shared: Arc<Mutex<Shared>>,
     active: Option<ActiveTransport>,
+    /// Exit signal of the most recently closed connection's I/O threads.
+    releasing: Option<Receiver<()>>,
 }
 
 impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
@@ -188,8 +216,9 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                     self.close_transport();
                     self.engine.transport_lost(now, reason);
                 }
-                // Packets and failures from an ended epoch are dropped.
-                Some(Input::Packet(..) | Input::TransportFailed(..)) => {}
+                // Packets from an ended epoch are counted and dropped.
+                Some(Input::Packet(..)) => self.engine.stale_packet_dropped(),
+                Some(Input::TransportFailed(..)) => {}
             }
             self.engine.poll(Instant::now());
             if !self.flush() {
@@ -213,17 +242,21 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         let request = OpenRequest {
             usb_serial: self.config.usb_serial().to_owned(),
         };
+        let released = self.releasing.take();
+        let release_bound = self.config.gate_deadline();
         let spawned = thread::Builder::new()
             .name("sans-odrive-open".into())
             .spawn(move || {
-                let result = opener
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .open(&request)
-                    .map(|mut connection| {
-                        drain(connection.reader.as_mut());
-                        connection
-                    });
+                let result = await_release(released, release_bound).and_then(|()| {
+                    opener
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .open(&request)
+                        .map(|mut connection| {
+                            drain(connection.reader.as_mut());
+                            connection
+                        })
+                });
                 let _ = loopback.send(Input::Opened(epoch, result));
             });
         if let Err(error) = spawned {
@@ -238,7 +271,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
     fn opened(&mut self, now: Instant, epoch: u64, result: Result<FibreConnection, String>) {
         let current = self.engine.status();
         let still_opening = current.epoch == epoch
-            && current.phase == super::engine::LinkPhase::Connecting
+            && current.phase == LinkPhase::Connecting
             && current.discovery.is_none();
         if !still_opening {
             return; // A late open after the gate deadline or a newer attempt is dropped.
@@ -257,21 +290,30 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         } = connection;
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriterQueue::default());
-        let started = spawn_reader(epoch, reader, Arc::clone(&stop), self.loopback.clone())
-            .and_then(|()| {
-                spawn_writer(
-                    epoch,
-                    writer,
-                    Arc::clone(&queue),
-                    self.loopback.clone(),
-                    self.config.request_deadline(),
-                    self.config.urgent_deadline(),
-                )
-            });
+        let (release_guard, released) = mpsc::channel::<()>();
+        let started = spawn_reader(
+            epoch,
+            reader,
+            Arc::clone(&stop),
+            self.loopback.clone(),
+            release_guard.clone(),
+        )
+        .and_then(|()| {
+            spawn_writer(
+                epoch,
+                writer,
+                Arc::clone(&queue),
+                self.loopback.clone(),
+                self.config.request_deadline(),
+                self.config.urgent_deadline(),
+                release_guard,
+            )
+        });
         self.active = Some(ActiveTransport {
             epoch,
             stop,
             writer: queue,
+            released,
         });
         match started {
             Ok(()) => self.engine.transport_opened(now, &usb_serial),
@@ -285,27 +327,54 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
 
     fn close_transport(&mut self) {
         if let Some(active) = self.active.take() {
-            active.close();
+            self.releasing = Some(active.close());
         }
     }
 
     /// Hand transmits to the writer and events to the consumer. Returns false
     /// when the consumer is gone.
     fn flush(&mut self) -> bool {
+        // Withdrawals can produce further transmits and events, so repeat.
+        loop {
+            if !self.flush_once() {
+                return false;
+            }
+            if !self.engine.has_output() {
+                return true;
+            }
+        }
+    }
+
+    fn flush_once(&mut self) -> bool {
         while let Some(transmit) = self.engine.take_transmit() {
-            if let Some(active) = self
+            let Some(active) = self
                 .active
                 .as_ref()
                 .filter(|active| active.epoch == transmit.epoch)
-            {
-                active.writer.push(transmit);
+            else {
+                continue;
+            };
+            let epoch = active.epoch;
+            let withdrawn = active.writer.push(transmit);
+            for sequence in withdrawn {
+                self.engine
+                    .transmit_withdrawn(Instant::now(), epoch, sequence);
             }
         }
         while let Some(event) = self.engine.take_event() {
             {
                 let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 match &event {
-                    LinkEvent::Status(status) => shared.epoch = status.epoch,
+                    LinkEvent::Status(status) => {
+                        if status.epoch != shared.epoch {
+                            shared.latest = None;
+                        }
+                        shared.epoch = status.epoch;
+                        shared.ended = status.phase == LinkPhase::Disconnected;
+                        if shared.ended {
+                            shared.latest = None;
+                        }
+                    }
                     LinkEvent::Telemetry(sample) => shared.latest = Some(sample.clone()),
                     LinkEvent::CommandResult { .. } => {}
                 }
@@ -332,10 +401,13 @@ fn spawn_reader(
     mut reader: Box<dyn PacketReader>,
     stop: Arc<AtomicBool>,
     loopback: Sender<Input>,
+    release_guard: Sender<()>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("sans-odrive-read".into())
         .spawn(move || {
+            // Dropped with `reader` when this thread exits.
+            let _release_guard = release_guard;
             while !stop.load(Ordering::SeqCst) {
                 match reader.read_packet(READ_SLICE) {
                     Ok(Some(packet)) => {
@@ -359,7 +431,7 @@ fn spawn_reader(
 #[derive(Default)]
 struct WriterState {
     urgent: VecDeque<Vec<u8>>,
-    ordinary: VecDeque<Vec<u8>>,
+    ordinary: VecDeque<Transmit>,
     closed: bool,
 }
 
@@ -371,14 +443,25 @@ struct WriterQueue {
 }
 
 impl WriterQueue {
-    fn push(&self, transmit: Transmit) {
+    /// Queue a packet. An urgent packet discards every ordinary command
+    /// packet still waiting here, so a queued move cannot follow a stop; the
+    /// returned sequence numbers must be reported to the engine as withdrawn.
+    fn push(&self, transmit: Transmit) -> Vec<u16> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut withdrawn = Vec::new();
         if transmit.urgent {
+            state.ordinary.retain(|waiting| {
+                if waiting.retractable {
+                    withdrawn.push(waiting.sequence);
+                }
+                !waiting.retractable
+            });
             state.urgent.push_back(transmit.packet);
         } else {
-            state.ordinary.push_back(transmit.packet);
+            state.ordinary.push_back(transmit);
         }
         self.ready.notify_one();
+        withdrawn
     }
 
     fn close(&self) {
@@ -399,8 +482,8 @@ impl WriterQueue {
             if let Some(packet) = state.urgent.pop_front() {
                 return Some((true, packet));
             }
-            if let Some(packet) = state.ordinary.pop_front() {
-                return Some((false, packet));
+            if let Some(transmit) = state.ordinary.pop_front() {
+                return Some((false, transmit.packet));
             }
             state = self
                 .ready
@@ -417,10 +500,13 @@ fn spawn_writer(
     loopback: Sender<Input>,
     request_deadline: Duration,
     urgent_deadline: Duration,
+    release_guard: Sender<()>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("sans-odrive-write".into())
         .spawn(move || {
+            // Dropped with `writer` when this thread exits.
+            let _release_guard = release_guard;
             while let Some((urgent, packet)) = queue.pop() {
                 let timeout = if urgent {
                     urgent_deadline

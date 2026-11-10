@@ -584,7 +584,8 @@ impl LiftAxis {
                 discovery,
                 unmatched_replies,
             }) => {
-                if epoch != self.status.epoch {
+                // A sample never outlives its connection on screen.
+                if epoch != self.status.epoch || phase == LinkPhase::Disconnected {
                     self.latest = None;
                 }
                 self.status = LiftAxisStatus {

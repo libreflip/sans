@@ -76,7 +76,9 @@ impl Harness {
 
     /// Deliver transmitted packets to the board and replies back until quiet.
     fn exchange(&mut self) {
-        loop {
+        // A full gate is about 1300 rounds; far more at one instant means the
+        // engine is spinning without time passing.
+        for _ in 0..20_000 {
             let mut replies = Vec::new();
             while let Some(transmit) = self.engine.take_transmit() {
                 self.wire.push((transmit.urgent, transmit.packet.clone()));
@@ -96,6 +98,7 @@ impl Harness {
                 self.engine.receive(self.now, &reply);
             }
         }
+        panic!("the engine kept exchanging packets without time passing");
     }
 
     /// Transmit without delivering, returning the decoded requests.
@@ -1051,4 +1054,204 @@ fn no_request_is_ever_transmitted_twice() {
     }
     // The two dropped requests stay unanswered and were never sent again.
     assert!(outstanding.len() >= 2, "{outstanding:?}");
+}
+
+// ----- review regressions -----------------------------------------------------
+
+#[test]
+fn reply_arriving_after_its_deadline_completes_nothing_even_without_a_poll() {
+    // A command: the write's acknowledgement arrives 1 ms after its deadline.
+    let mut link = verified(commissioned(), FakeFibre::compatible());
+    link.engine
+        .submit(link.now, Ticket(1), LinkCommand::Arm, Priority::Ordinary);
+    let sent = link.transmit_only();
+    assert_eq!(sent.len(), 1);
+    let ack = link.board.handle(&sent[0].2).unwrap();
+    link.now += Duration::from_millis(101);
+    let unmatched = link.engine.status().unmatched_replies;
+    link.engine.receive(link.now, &ack);
+    link.drain_events();
+    assert!(matches!(
+        link.result(1),
+        Some(CommandResult::OutcomeUnknown { .. })
+    ));
+    assert!(status_has_fault(&link));
+    assert_eq!(link.engine.status().unmatched_replies, unmatched + 1);
+
+    // The gate: a descriptor chunk answered after its deadline does not advance it.
+    let mut gate = Harness::new(uncommissioned(), FakeFibre::compatible());
+    gate.engine.begin_attempt(gate.now);
+    gate.engine.transport_opened(gate.now, "316536713335");
+    let first = gate.transmit_only();
+    let chunk = gate.board.handle(&first[0].2).unwrap();
+    gate.now += Duration::from_millis(101);
+    gate.engine.receive(gate.now, &chunk);
+    gate.drain_events();
+    assert_eq!(gate.engine.status().phase, LinkPhase::Blocked);
+    assert!(
+        gate.transmit_only().is_empty(),
+        "the gate stopped instead of advancing"
+    );
+}
+
+#[test]
+fn urgent_command_withdraws_an_engine_queued_move_packet_before_it_leaves() {
+    let mut link = armed(commissioned());
+    link.engine.submit(
+        link.now,
+        Ticket(1),
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Ordinary,
+    );
+    link.engine
+        .submit(link.now, Ticket(2), LinkCommand::Disarm, Priority::Urgent);
+
+    let sent = link.transmit_only();
+
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].0);
+    assert_eq!(sent[0].1.endpoint, REQUESTED_STATE);
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(link.board.writes_to(INPUT_POS).is_empty());
+}
+
+#[test]
+fn non_finite_telemetry_faults_the_link_and_yields_no_usable_sample() {
+    for (endpoint, value) in [
+        (POS_ESTIMATE, f32::NAN),
+        (VEL_ESTIMATE, f32::INFINITY),
+        (IQ_MEASURED, f32::NEG_INFINITY),
+        (IQ_SETPOINT, f32::NAN),
+        // Finite on the wire, infinite after conversion at 8 mm per turn.
+        (POS_ESTIMATE, 3.0e38),
+    ] {
+        let mut link = armed(commissioned());
+        link.board.set_f32(endpoint, value);
+        let samples_before = link
+            .events
+            .iter()
+            .filter(|event| matches!(event, LinkEvent::Telemetry(_)))
+            .count();
+        link.run_for(30);
+        let samples_after = link
+            .events
+            .iter()
+            .filter(|event| matches!(event, LinkEvent::Telemetry(_)))
+            .count();
+
+        assert!(status_has_fault(&link), "{endpoint} {value}");
+        assert!(samples_after <= samples_before + 1, "{endpoint} {value}");
+        link.submit(
+            1,
+            LinkCommand::MoveAbsolute { position_mm: 40.0 },
+            Priority::Ordinary,
+        );
+        link.submit(2, LinkCommand::Home, Priority::Urgent);
+        assert!(matches!(
+            link.result(1),
+            Some(CommandResult::Rejected { .. })
+        ));
+        assert!(matches!(
+            link.result(2),
+            Some(CommandResult::Rejected { .. })
+        ));
+        assert!(link.board.writes_to(INPUT_POS).is_empty());
+    }
+}
+
+#[test]
+fn clear_errors_does_not_succeed_on_non_finite_telemetry() {
+    let mut link = verified(commissioned(), FakeFibre::compatible());
+    link.board.set_f32(IQ_MEASURED, f32::NAN);
+    link.submit(1, LinkCommand::ClearErrors, Priority::Ordinary);
+    link.run_for(300);
+    assert!(
+        matches!(link.result(1), Some(CommandResult::OutcomeUnknown { .. })),
+        "{:?}",
+        link.result(1)
+    );
+}
+
+#[test]
+fn move_target_that_converts_to_a_non_finite_native_value_is_rejected_unsent() {
+    let profile = format!(
+        "{VALID_PROFILE}{}",
+        LIFT_AXIS
+            .replace("mm_per_turn = 8.0", "mm_per_turn = 1.0e-38")
+            .replace("velocity_limit_mm_s = 6.0", "velocity_limit_mm_s = 1.0e-39")
+            .replace(
+                "acceleration_limit_mm_s2 = 4.0",
+                "acceleration_limit_mm_s2 = 1.0e-39"
+            )
+            .replace(
+                "deceleration_limit_mm_s2 = 2.0",
+                "deceleration_limit_mm_s2 = 1.0e-39"
+            )
+    );
+    let mut link = armed(config_from(&profile));
+    link.submit(
+        1,
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Urgent,
+    );
+    match link.result(1) {
+        Some(CommandResult::Rejected { reason }) => {
+            assert!(reason.contains("non-finite"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(link.board.writes_to(INPUT_POS).is_empty());
+}
+
+#[test]
+fn refused_arm_is_not_confirmed_while_telemetry_stays_fresh() {
+    // Default timing: the 100 ms confirmation window equals the 100 ms age limit.
+    let mut board = FakeFibre::compatible();
+    board.ignore_state_requests.push(8);
+    let mut link = verified(commissioned(), board);
+
+    link.submit(1, LinkCommand::Arm, Priority::Ordinary);
+    link.run_for(150);
+
+    match link.result(1) {
+        Some(CommandResult::NotConfirmed { observed }) => {
+            assert!(observed.contains("current_state 1"), "{observed}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(!status_has_fault(&link), "{:?}", link.engine.status());
+    assert_eq!(link.engine.status().phase, LinkPhase::Verified);
+    assert!(link.engine.fresh_sample(link.now).is_some());
+    // Freshness is still enforced afterwards.
+    let _held = hold_next_telemetry_read(&mut link);
+    link.now += Duration::from_millis(150);
+    link.engine.poll(link.now);
+    assert!(status_has_fault(&link));
+}
+
+#[test]
+fn home_is_confirmed_by_observing_homing_and_not_by_a_missed_or_skipped_entry() {
+    // Homing visible for one read, then settled to idle: the entry was observed.
+    let mut board = FakeFibre::compatible();
+    board.settle_after_one_read.insert(11, 1);
+    let mut transient = verified(commissioned(), board);
+    transient.submit(1, LinkCommand::Home, Priority::Ordinary);
+    transient.run_for(5);
+    assert_eq!(transient.result(1), Some(CommandResult::Completed));
+
+    // The board never shows homing (refused, or finished before the first read).
+    let mut board = FakeFibre::compatible();
+    board.ignore_state_requests.push(11);
+    let mut unobserved = verified(commissioned(), board);
+    unobserved.submit(1, LinkCommand::Home, Priority::Ordinary);
+    unobserved.run_for(150);
+    assert!(
+        matches!(unobserved.result(1), Some(CommandResult::NotConfirmed { ref observed }) if observed.contains("current_state 1")),
+        "{:?}",
+        unobserved.result(1)
+    );
+    assert!(!status_has_fault(&unobserved));
 }

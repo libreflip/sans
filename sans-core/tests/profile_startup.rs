@@ -489,3 +489,43 @@ fn lift_axis_limits_above_software_policy_caps_are_reported() {
         );
     }
 }
+
+#[test]
+fn limits_that_convert_to_zero_or_infinity_are_reported() {
+    let cases = [
+        // 1e-10 mm/s over 3e38 mm per turn underflows to zero turns per second.
+        (
+            vec![
+                ("mm_per_turn = 8.0", "mm_per_turn = 3.0e38"),
+                ("velocity_limit_mm_s = 8.0", "velocity_limit_mm_s = 1.0e-10"),
+            ],
+            "odrive.lift_axis.velocity_limit_mm_s must convert to a positive finite motor value",
+        ),
+        // A subnormal mm per turn overflows the conversion to infinity.
+        (
+            vec![("mm_per_turn = 8.0", "mm_per_turn = 1.0e-45")],
+            "odrive.lift_axis.acceleration_limit_mm_s2 must convert to a positive finite motor value",
+        ),
+    ];
+    for (index, (replacements, expected)) in cases.into_iter().enumerate() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile_path = temp.path().join(format!("conversion-{index}.toml"));
+        let table = replacements
+            .iter()
+            .fold(LIFT_AXIS_TABLE.to_string(), |table, (from, to)| {
+                let replaced = table.replacen(from, to, 1);
+                assert_ne!(replaced, table, "{from}");
+                replaced
+            });
+        fs::write(&profile_path, format!("{VALID_PROFILE}{table}")).unwrap();
+
+        let message = prepare_machine_profile(Some(&profile_path))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            message.contains(expected),
+            "expected {expected:?} in {message:?}"
+        );
+    }
+}
