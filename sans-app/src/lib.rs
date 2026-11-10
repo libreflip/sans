@@ -5,6 +5,7 @@
 //! can drive the same application headlessly.
 
 mod preview;
+mod screen;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,8 @@ use sans_core::{
     StartupError,
 };
 
-use crate::preview::{render_capture_preview, sync_preview_textures, PreviewTextures};
+use crate::preview::{show_capture_preview, sync_preview_textures, PreviewTextures};
+use crate::screen::Header;
 
 /// Initial size hint, used only when no window manager honours the maximize request.
 const PORTRAIT_SIZE_HINT: [f32; 2] = [600.0, 1_024.0];
@@ -76,6 +78,8 @@ impl SansApp {
     /// Configure the egui context and show the first screen for `startup`.
     pub fn new(context: &egui::Context, startup: Startup) -> Self {
         context.set_visuals(egui::Visuals::dark());
+        // A drag that starts on selectable text selects it instead of scrolling.
+        context.all_styles_mut(|style| style.interaction.selectable_labels = false);
         let startup = match startup {
             Startup::Fatal(message) => StartupView::Fatal(message),
             Startup::Controller(handle) => StartupView::Controller {
@@ -94,36 +98,28 @@ impl SansApp {
 impl eframe::App for SansApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Sans");
-
-            match &mut self.startup {
-                StartupView::Fatal(message) => render_fatal(ui, &context, message),
-                StartupView::Controller {
-                    handle,
-                    latest,
-                    exit_requested_at,
-                } => {
-                    while let Ok(snapshot) = handle.try_snapshot() {
-                        *latest = Some(snapshot);
-                    }
-                    let latest_pair = latest.as_ref().and_then(latest_complete_pair);
-                    sync_preview_textures(
-                        &context,
-                        &mut self.preview_textures,
-                        latest_pair.cloned(),
-                    );
-                    render_controller(
-                        ui,
-                        &context,
-                        handle,
-                        latest.as_ref(),
-                        exit_requested_at,
-                        self.preview_textures.as_ref(),
-                    );
+        match &mut self.startup {
+            StartupView::Fatal(message) => show_fatal(ui, &context, message),
+            StartupView::Controller {
+                handle,
+                latest,
+                exit_requested_at,
+            } => {
+                while let Ok(snapshot) = handle.try_snapshot() {
+                    *latest = Some(snapshot);
                 }
+                let latest_pair = latest.as_ref().and_then(latest_complete_pair);
+                sync_preview_textures(&context, &mut self.preview_textures, latest_pair.cloned());
+                show_controller(
+                    ui,
+                    &context,
+                    handle,
+                    latest.as_ref(),
+                    exit_requested_at,
+                    self.preview_textures.as_ref(),
+                );
             }
-        });
+        }
     }
 }
 
@@ -134,17 +130,22 @@ fn latest_complete_pair(snapshot: &ControllerSnapshot) -> Option<&Arc<CapturePai
     }
 }
 
-fn render_fatal(ui: &mut egui::Ui, context: &egui::Context, message: &str) {
-    ui.colored_label(egui::Color32::LIGHT_RED, "Fatal startup error");
-    ui.add_space(16.0);
-    ui.label(message);
-    ui.add_space(24.0);
-    if large_button(ui, "Close Sans").clicked() {
-        context.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
+fn show_fatal(ui: &mut egui::Ui, context: &egui::Context, message: &str) {
+    screen::show(
+        ui,
+        Header::new("Fatal startup error", egui::Color32::LIGHT_RED),
+        |ui| {
+            if screen::action_button(ui, "Close Sans").clicked() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        },
+        |ui, _| {
+            ui.label(message);
+        },
+    );
 }
 
-fn render_controller(
+fn show_controller(
     ui: &mut egui::Ui,
     context: &egui::Context,
     handle: &ControllerHandle,
@@ -152,42 +153,61 @@ fn render_controller(
     exit_requested_at: &mut Option<Instant>,
     textures: Option<&PreviewTextures>,
 ) {
-    match snapshot.map(|snapshot| &snapshot.screen) {
-        None => {
-            ui.spinner();
-            ui.label("Checking Camera readiness...");
-            context.request_repaint_after(Duration::from_millis(16));
-        }
-        Some(MachineScreen::Setup(SetupState::Blocked { reasons })) => {
-            ui.colored_label(egui::Color32::YELLOW, "Setup blocked");
-            ui.label("Scanning is disabled. Camera diagnostics remain available.");
-            ui.add_space(12.0);
-            for reason in reasons {
-                ui.label(format!("• {}", reason.summary));
-            }
-        }
-        Some(MachineScreen::CapturePreview(preview)) => {
-            if render_capture_preview(ui, context, handle, preview, textures).is_err() {
-                context.send_viewport_cmd(egui::ViewportCommand::Close);
-                return;
-            }
-        }
-        Some(MachineScreen::Exited) => {
-            context.send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
+    let screen = snapshot.map(|snapshot| &snapshot.screen);
+    if matches!(screen, Some(MachineScreen::Exited)) {
+        context.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
     }
-
-    ui.add_space(16.0);
     if let Some(requested_at) = *exit_requested_at {
         if exit_fallback_elapsed(requested_at, Instant::now()) {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        ui.spinner();
-        ui.label("Exiting Sans...");
         context.request_repaint_after(Duration::from_millis(16));
-    } else if large_button(ui, "Exit").clicked() {
+    }
+    let exit = |ui: &mut egui::Ui| show_exit_action(ui, context, handle, exit_requested_at);
+
+    match screen {
+        None | Some(MachineScreen::Exited) => {
+            context.request_repaint_after(Duration::from_millis(16));
+            screen::show(
+                ui,
+                Header::new("Checking Camera readiness...", egui::Color32::GRAY).busy(),
+                exit,
+                |_, _| {},
+            );
+        }
+        Some(MachineScreen::Setup(SetupState::Blocked { reasons })) => {
+            screen::show(
+                ui,
+                Header::new("Setup blocked", egui::Color32::YELLOW),
+                exit,
+                |ui, _| {
+                    ui.label("Scanning is disabled. Camera diagnostics remain available.");
+                    ui.add_space(12.0);
+                    for reason in reasons {
+                        ui.label(format!("• {}", reason.summary));
+                    }
+                },
+            );
+        }
+        Some(MachineScreen::CapturePreview(preview)) => {
+            if show_capture_preview(ui, context, handle, preview, textures, exit).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+}
+
+fn show_exit_action(
+    ui: &mut egui::Ui,
+    context: &egui::Context,
+    handle: &ControllerHandle,
+    exit_requested_at: &mut Option<Instant>,
+) {
+    if exit_requested_at.is_some() {
+        screen::action_indicator(ui, "Exiting Sans...");
+    } else if screen::action_button(ui, "Exit").clicked() {
         if handle.send(ControllerIntent::Exit).is_ok() {
             *exit_requested_at = Some(Instant::now());
             context.request_repaint();
@@ -195,10 +215,6 @@ fn render_controller(
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
-}
-
-fn large_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized([240.0, 56.0], egui::Button::new(label))
 }
 
 fn exit_fallback_elapsed(requested_at: Instant, now: Instant) -> bool {
