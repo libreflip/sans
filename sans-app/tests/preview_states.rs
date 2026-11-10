@@ -6,7 +6,7 @@
 
 mod support;
 
-use support::cameras::{Gate, Step};
+use support::cameras::Step;
 use support::fixtures::{portrait_full_frame, portrait_without_left_detail};
 use support::session::{Session, MATRIX_AND_MINIMUM, MINIMUM, T1};
 
@@ -80,17 +80,7 @@ fn ready_state_with_a_pair_is_usable() {
 
 #[test]
 fn a_held_capture_finishes_when_the_test_lets_go_of_it() {
-    let (left, right) = portrait_full_frame();
-    let (gate, release) = Gate::closed();
-    let mut session = Session::cameras(
-        vec![
-            Step::Frame(left.frame.clone()),
-            Step::Gated(left.frame, gate),
-        ],
-        vec![Step::Frame(right.frame)],
-        MINIMUM,
-    );
-    session.capture_pair();
+    let (mut session, release) = Session::with_held_next_capture(MINIMUM);
     session.tap_label("Capture pair");
     session.wait_for_label("Capturing...");
 
@@ -103,17 +93,7 @@ fn a_held_capture_finishes_when_the_test_lets_go_of_it() {
 #[test]
 fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
     for viewport in MATRIX_AND_MINIMUM {
-        let (left, right) = portrait_full_frame();
-        let (gate, release) = Gate::closed();
-        let mut session = Session::cameras(
-            vec![
-                Step::Frame(left.frame.clone()),
-                Step::Gated(left.frame, gate),
-            ],
-            vec![Step::Frame(right.frame)],
-            viewport,
-        );
-        session.capture_pair();
+        let (mut session, release) = Session::with_held_next_capture(viewport);
         session.tap_label("Capture pair");
         session.wait_for_label("Capturing...");
 

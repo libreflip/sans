@@ -5,7 +5,7 @@ mod support;
 use std::collections::BTreeSet;
 
 use eframe::egui;
-use support::cameras::{Gate, Step};
+use support::cameras::Step;
 use support::fixtures::portrait_full_frame;
 use support::pixels::{renderer, rgb};
 use support::session::{Session, SCROLLING};
@@ -211,17 +211,7 @@ fn dragging_the_scroll_bar_down_scrolls_toward_the_end() {
 #[test]
 fn the_body_keeps_its_scroll_position_through_a_capture() {
     for viewport in SCROLLING {
-        let (left, right) = portrait_full_frame();
-        let (gate, release) = Gate::closed();
-        let mut session = Session::cameras(
-            vec![
-                Step::Frame(left.frame.clone()),
-                Step::Gated(left.frame, gate),
-            ],
-            vec![Step::Frame(right.frame)],
-            viewport,
-        );
-        session.capture_pair();
+        let (mut session, release) = Session::with_held_next_capture(viewport);
         session.wheel(100_000.0);
         session.wheel(-3.5);
         let scrolled = session.rect("Right 100% preview");

@@ -17,12 +17,12 @@ use sans::{SansApp, Startup};
 use sans_core::bootstrap;
 use tempfile::TempDir;
 
-use super::cameras::{CaptureCalls, FixtureFactory, Step};
-use super::fixtures::Fixture;
+use super::cameras::{CaptureCalls, FixtureFactory, Gate, GateRelease, Step};
+use super::fixtures::{portrait_full_frame, Fixture};
 
 const VALID_PROFILE: &str = include_str!("../../../sans-core/tests/fixtures/valid-sans.toml");
 const WAIT_LIMIT: Duration = Duration::from_secs(10);
-/// Most frames [`Session::settle`] steps.
+/// Most frames [`Session::settle`] and the harness's own runs step.
 const SETTLE_LIMIT: usize = 600;
 /// Unchanged frames after which [`Session::settle`] treats the screen as still.
 const STILL_FRAMES: usize = 5;
@@ -137,6 +137,26 @@ impl Session {
         Self::with_pair_rendered(pair, viewport, None)
     }
 
+    /// Show a first pair, with the Left Camera's next capture held at a gate.
+    ///
+    /// The session is left on the ready preview. Tapping Capture pair starts a
+    /// capture that stays in Capturing until the returned release is opened
+    /// or dropped.
+    pub fn with_held_next_capture(viewport: Viewport) -> (Self, GateRelease) {
+        let (left, right) = portrait_full_frame();
+        let (gate, release) = Gate::closed();
+        let mut session = Self::cameras(
+            vec![
+                Step::Frame(left.frame.clone()),
+                Step::Gated(left.frame, gate),
+            ],
+            vec![Step::Frame(right.frame)],
+            viewport,
+        );
+        session.capture_pair();
+        (session, release)
+    }
+
     /// Like [`Session::with_pair`], rendering through `renderer`.
     pub fn with_pair_rendered(
         (left, right): (Fixture, Fixture),
@@ -193,7 +213,7 @@ impl Session {
             // Frames shorter than the application's 16 ms snapshot polling, so a
             // poll is a future repaint and an idle screen lets the run settle.
             .with_step_dt(0.01)
-            .with_max_steps(600);
+            .with_max_steps(SETTLE_LIMIT as u64);
         if let Some(renderer) = renderer {
             builder = builder.renderer(renderer);
         }
@@ -230,7 +250,8 @@ impl Session {
     /// would spend the whole step limit after every action on a busy screen.
     /// The screen counts as settled once the accessibility layout has stayed
     /// the same for several frames with no wheel input left to apply, which
-    /// still lets scroll animations finish.
+    /// still lets scroll animations finish. A screen that never settles within
+    /// [`SETTLE_LIMIT`] frames fails the test.
     pub fn settle(&mut self) {
         let mut previous = self.labelled_rects();
         let mut still_frames = 0;
@@ -250,6 +271,10 @@ impl Session {
                 previous = current;
             }
         }
+        panic!(
+            "the screen did not settle within {SETTLE_LIMIT} frames at {}",
+            self.viewport.name
+        );
     }
 
     /// Step frames until a node labelled `label` exists.
