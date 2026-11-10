@@ -8,7 +8,7 @@ mod support;
 
 use support::cameras::{Gate, Step};
 use support::fixtures::portrait_full_frame;
-use support::session::{Session, MATRIX};
+use support::session::{Session, MATRIX_AND_MINIMUM};
 
 /// Assert `actions` stay put, nothing overflows sideways, and the node whose
 /// label contains `last` can be scrolled until its bottom is in the body.
@@ -46,7 +46,7 @@ fn assert_usable(session: &mut Session, actions: &[&str], last: &str) {
 
 #[test]
 fn machine_ready_shows_capture_pair_and_diagnostics_without_scrolling() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let (left, right) = portrait_full_frame();
         let mut session = Session::cameras(
             vec![Step::Frame(left.frame)],
@@ -67,7 +67,7 @@ fn machine_ready_shows_capture_pair_and_diagnostics_without_scrolling() {
 
 #[test]
 fn ready_state_with_a_pair_is_usable() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let mut session = Session::with_pair(portrait_full_frame(), viewport);
 
         assert_usable(
@@ -80,7 +80,7 @@ fn ready_state_with_a_pair_is_usable() {
 
 #[test]
 fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let (left, right) = portrait_full_frame();
         let gate = Gate::default();
         let mut session = Session::cameras(
@@ -109,7 +109,7 @@ fn capturing_keeps_the_previous_pair_visible_and_scrollable() {
 
 #[test]
 fn warning_state_marks_the_unavailable_100_percent_preview() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let (left, right) = portrait_full_frame();
         let left = left.without_native_detail("fixture detail allocation failed");
         let mut session = Session::with_pair((left, right), viewport);
@@ -145,7 +145,7 @@ fn long_reason() -> String {
 
 #[test]
 fn blocked_state_without_a_pair_keeps_retry_capture_on_screen() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let (_, right) = portrait_full_frame();
         let mut session = Session::cameras(
             vec![Step::Fail(long_reason())],
@@ -165,7 +165,7 @@ fn blocked_state_without_a_pair_keeps_retry_capture_on_screen() {
 
 #[test]
 fn blocked_state_with_a_previous_pair_keeps_retry_capture_on_screen() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let (left, right) = portrait_full_frame();
         let mut session = Session::cameras(
             vec![Step::Frame(left.frame), Step::Fail(long_reason())],
@@ -187,7 +187,7 @@ fn blocked_state_with_a_previous_pair_keeps_retry_capture_on_screen() {
 
 #[test]
 fn setup_blocked_scrolls_through_many_reasons_with_exit_fixed() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let reasons = (1..=40)
             .map(|reason| format!("Fixture Setup blocker number {reason}"))
             .collect();
@@ -199,7 +199,7 @@ fn setup_blocked_scrolls_through_many_reasons_with_exit_fixed() {
 
 #[test]
 fn fatal_screen_scrolls_a_long_message_with_close_sans_fixed() {
-    for viewport in MATRIX {
+    for viewport in MATRIX_AND_MINIMUM {
         let message = (1..=60)
             .map(|line| format!("Startup diagnostic line {line}: profile field is invalid."))
             .collect::<Vec<_>>()

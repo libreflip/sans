@@ -67,6 +67,14 @@ pub const T4: Viewport = Viewport {
 
 /// Every viewport in the matrix.
 pub const MATRIX: [Viewport; 5] = [T0, T1, T2, T3, T4];
+/// The smallest window Sans accepts, `MINIMUM_INNER_SIZE` in the application.
+pub const MINIMUM: Viewport = Viewport {
+    name: "minimum 280x240",
+    size: egui::vec2(280.0, 240.0),
+    pixels_per_point: 1.0,
+};
+/// The matrix plus the minimum window.
+pub const MATRIX_AND_MINIMUM: [Viewport; 6] = [T0, T1, T2, T3, T4, MINIMUM];
 /// Viewports where a complete Capture pair overflows the body.
 pub const SCROLLING: [Viewport; 3] = [T2, T3, T4];
 

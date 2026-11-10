@@ -16,12 +16,14 @@ use egui_kittest::Harness;
 use super::{action_button, show, Header};
 
 /// Viewport sizes in points and scale factors, matching the application tests.
-const MATRIX: [([f32; 2], f32); 5] = [
+/// The last entry is the minimum window the application accepts.
+const MATRIX: [([f32; 2], f32); 6] = [
     ([600.0, 1_024.0], 1.0),
     ([600.0, 952.0], 1.0),
     ([600.0, 640.0], 1.0),
     ([400.0, 634.0], 1.5),
     ([300.0, 476.0], 2.0),
+    ([280.0, 240.0], 1.0),
 ];
 
 #[derive(Default)]
@@ -162,8 +164,9 @@ fn stop_stays_put_and_pressable_while_the_body_scrolls() {
     }
 }
 
+/// The target display's area at scale factor 2, the smallest viewport Sans is laid out for.
 #[test]
-fn the_body_keeps_a_third_of_the_smallest_viewport_with_two_actions() {
+fn the_body_keeps_a_third_of_the_target_area_at_scale_2_with_two_actions() {
     let (size, pixels_per_point) = MATRIX[4];
     let mut harness = stand_in_screen(size, pixels_per_point);
     harness.run();
@@ -175,5 +178,23 @@ fn the_body_keeps_a_third_of_the_smallest_viewport_with_two_actions() {
         "body is {} of {} points",
         body.height(),
         size[1]
+    );
+}
+
+/// The minimum window only keeps the window manager inside the work area.
+/// There the body must still show and scroll a few lines of text.
+#[test]
+fn the_body_still_shows_three_lines_at_the_minimum_window_with_two_actions() {
+    let (size, pixels_per_point) = MATRIX[5];
+    let mut harness = stand_in_screen(size, pixels_per_point);
+    harness.run();
+
+    let body = rect(&harness, "Screen body");
+    let line = rect(&harness, "Instruction 0").height();
+
+    assert!(
+        body.height() >= 3.0 * line,
+        "body is {} points for {line} point lines",
+        body.height()
     );
 }
