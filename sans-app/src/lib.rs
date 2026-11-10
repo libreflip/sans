@@ -65,7 +65,7 @@ enum StartupView {
     Fatal(String),
     Controller {
         handle: ControllerHandle,
-        latest: Option<ControllerSnapshot>,
+        latest: Option<Box<ControllerSnapshot>>,
         exit_requested_at: Option<Instant>,
     },
 }
@@ -108,15 +108,15 @@ impl eframe::App for SansApp {
                 exit_requested_at,
             } => {
                 while let Ok(snapshot) = handle.try_snapshot() {
-                    *latest = Some(snapshot);
+                    *latest = Some(Box::new(snapshot));
                 }
-                let latest_pair = latest.as_ref().and_then(latest_complete_pair);
+                let latest_pair = latest.as_deref().and_then(latest_complete_pair);
                 sync_preview_textures(&context, &mut self.preview_textures, latest_pair.cloned());
                 show_controller(
                     ui,
                     &context,
                     handle,
-                    latest.as_ref(),
+                    latest.as_deref(),
                     exit_requested_at,
                     self.preview_textures.as_ref(),
                 );
