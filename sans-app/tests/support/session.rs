@@ -216,10 +216,33 @@ impl Session {
 
     /// Tap Capture pair and wait until the new pair is shown and Cameras are ready.
     pub fn capture_pair(&mut self) {
-        self.tap_label("Capture pair");
-        self.wait_until("a captured pair", |session| {
-            session.has("Cameras ready") && session.has("Left Full-page preview")
-        });
+        self.tap_and_wait_for_capture("Capture pair");
+    }
+
+    /// Tap `action` and wait until a capture it started has finished and Cameras are ready.
+    ///
+    /// The controller publishes Capturing before it calls either camera. Both
+    /// call counts are read before a frame steps, so once they have advanced,
+    /// that frame drains at least the Capturing snapshot and a Ready status it
+    /// shows belongs to the new capture, not to the one before the tap.
+    pub fn tap_and_wait_for_capture(&mut self, action: &str) {
+        let (left, right) = (self.calls.left(), self.calls.right());
+        self.tap_label(action);
+        let deadline = Instant::now() + WAIT_LIMIT;
+        loop {
+            let cameras_called = self.calls.left() > left && self.calls.right() > right;
+            self.harness.step();
+            if cameras_called && self.has("Cameras ready") && self.has("Left Full-page preview") {
+                self.harness.run_ok();
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {action} to capture at {}",
+                self.viewport.name
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Whether a node labelled exactly `label` exists.

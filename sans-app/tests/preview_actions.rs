@@ -74,8 +74,7 @@ fn tapping_retry_capture_captures_once_from_the_blocked_state() {
         session.wheel(100_000.0);
         let (left, right) = (session.calls.left(), session.calls.right());
 
-        session.tap_label("Retry Capture");
-        session.wait_for_label("Cameras ready");
+        session.tap_and_wait_for_capture("Retry Capture");
 
         assert_eq!(
             (session.calls.left(), session.calls.right()),
