@@ -37,10 +37,25 @@ pub trait FibreOpener: Send + 'static {
 pub trait PacketReader: Send + 'static {
     /// Wait up to `timeout` for one packet. `Ok(None)` means none arrived.
     fn read_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String>;
+
+    /// Cancel anything still pending and wait at most `bound` until this half
+    /// holds nothing that keeps the device claimed. `Ok` is proof that dropping
+    /// the half releases its share of the device at once; `Err` means it may
+    /// still be held, and the caller must not report it released.
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        let _ = bound;
+        Ok(())
+    }
 }
 
 /// The sending half of a packet transport.
 pub trait PacketWriter: Send + 'static {
     /// Send one whole packet, giving up after `timeout`.
     fn write_packet(&mut self, packet: &[u8], timeout: Duration) -> Result<(), String>;
+
+    /// As [`PacketReader::shutdown`].
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        let _ = bound;
+        Ok(())
+    }
 }

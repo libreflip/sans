@@ -88,7 +88,9 @@ pub enum Priority {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LinkCommand {
     /// Write `requested_state` idle; confirmed when `current_state` reads idle,
-    /// otherwise the link faults. Accepted whenever endpoints are resolved.
+    /// otherwise the link faults. Accepted whenever endpoints are resolved,
+    /// including on a faulted link. Accepting it revokes every arm, Home or
+    /// move write that has not left the host yet.
     Disarm,
     /// Write `requested_state` closed-loop control; confirmed when
     /// `current_state` reads closed-loop control.
@@ -359,6 +361,11 @@ impl DispatchToken {
         Self(Arc::new(AtomicU8::new(DISPATCH_QUEUED)))
     }
 
+    /// Whether the writer claimed the packet, so it may have left the host.
+    fn was_sent(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == DISPATCH_SENT
+    }
+
     /// Revoke the packet. True when it never left the host.
     fn revoke(&self) -> bool {
         match self.0.compare_exchange(
@@ -550,6 +557,22 @@ impl InFlight {
     fn is_first_packet(&self) -> bool {
         matches!(self.spec, RequestSpec::Write(..) | RequestSpec::Call(_))
     }
+
+    fn is_energizing(&self) -> bool {
+        is_energizing(self.spec)
+    }
+}
+
+/// Writes that can energize the motor: Arm, Home and Move.
+fn is_energizing(spec: RequestSpec) -> bool {
+    matches!(
+        spec,
+        RequestSpec::Write(Endpoint::InputPos, _)
+            | RequestSpec::Write(
+                Endpoint::RequestedState,
+                WireValue::I32(AXIS_STATE_CLOSED_LOOP_CONTROL | AXIS_STATE_HOMING)
+            )
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -952,6 +975,10 @@ impl LinkEngine {
             Priority::Urgent => match self.plan(now, command) {
                 Err(reason) => self.finish(ticket, command, CommandResult::Rejected { reason }),
                 Ok((write, confirm)) => {
+                    if command == LinkCommand::Disarm {
+                        // A disarm supersedes energizing writes still waiting to leave.
+                        self.revoke_unsent_energizing();
+                    }
                     let op = Operation {
                         ticket,
                         command,
@@ -1224,7 +1251,7 @@ impl LinkEngine {
             connection.fault = Some(reason);
         }
         self.retire_queue();
-        self.revoke_ordinary_command();
+        self.revoke_unsent_energizing();
     }
 
     fn retire_queue(&mut self) {
@@ -1314,14 +1341,7 @@ impl LinkEngine {
                 self.config.request_deadline
             };
         // An energizing write is valid only while its accepting sample is fresh.
-        let energizing = matches!(
-            spec,
-            RequestSpec::Write(Endpoint::InputPos, _)
-                | RequestSpec::Write(
-                    Endpoint::RequestedState,
-                    WireValue::I32(AXIS_STATE_CLOSED_LOOP_CONTROL | AXIS_STATE_HOMING)
-                )
-        );
+        let energizing = is_energizing(spec);
         let valid_until = match self.connection.as_ref().and_then(|c| c.latest.as_ref()) {
             Some(sample) if energizing => deadline.min(sample.taken_at + self.config.max_age),
             None if energizing => now,
@@ -1695,6 +1715,23 @@ impl LinkEngine {
             self.note_unmatched("a reply after its connection ended");
             return;
         }
+        let never_sent = connection
+            .ordinary
+            .as_ref()
+            .map(|(in_flight, _)| in_flight)
+            .into_iter()
+            .chain(
+                connection
+                    .urgent
+                    .iter()
+                    .filter_map(|lane| lane.in_flight.as_ref()),
+            )
+            .any(|in_flight| in_flight.sequence == sequence && !in_flight.token.was_sent());
+        if never_sent {
+            // A request still waiting for the writer cannot have been answered.
+            self.note_unmatched("a reply to a request that was never sent");
+            return;
+        }
         if connection
             .ordinary
             .as_ref()
@@ -1760,6 +1797,59 @@ impl LinkEngine {
         self.clock = Some(now);
         self.note_unmatched("a packet from an ended connection");
         self.publish_status();
+    }
+
+    /// Revoke every energizing write (Arm, Home, Move) that has not left the
+    /// host, in the ordinary slot and in every urgent lane, retiring each
+    /// command as not transmitted. Packets already sent keep their outcome, and
+    /// disarm, clear-errors and read packets are untouched, so a new disarm
+    /// stays possible. Used on link faults and when a disarm is accepted.
+    fn revoke_unsent_energizing(&mut self) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        let mut retired = Vec::new();
+        let mut released = Vec::new();
+        if connection
+            .ordinary
+            .as_ref()
+            .is_some_and(|(in_flight, owner)| {
+                *owner == OrdinaryOwner::Command
+                    && in_flight.is_energizing()
+                    && in_flight.token.revoke()
+            })
+        {
+            let (in_flight, _) = connection.ordinary.take().expect("checked");
+            released.push(in_flight.sequence);
+            if let Some(op) = connection.active.take() {
+                retired.push((op.ticket, op.command));
+            }
+        }
+        let mut index = 0;
+        while index < connection.urgent.len() {
+            let revoked = connection.urgent[index]
+                .in_flight
+                .as_ref()
+                .is_some_and(|in_flight| in_flight.is_energizing() && in_flight.token.revoke());
+            if revoked {
+                let lane = connection.urgent.remove(index);
+                released.push(lane.in_flight.expect("checked").sequence);
+                retired.push((lane.op.ticket, lane.op.command));
+            } else {
+                index += 1;
+            }
+        }
+        for sequence in released {
+            // The number never left the host, so it can be handed out again.
+            self.sequences.complete(sequence);
+        }
+        for (ticket, command) in retired {
+            self.finish(
+                ticket,
+                command,
+                CommandResult::Retired { transmitted: false },
+            );
+        }
     }
 
     /// Revoke the ordinary command packet in flight if it has not left the

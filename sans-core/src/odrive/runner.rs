@@ -143,36 +143,132 @@ fn sequence_seed() -> u16 {
     hasher.finish() as u16
 }
 
+/// How long one shutdown attempt may wait for a half's pending transfers.
+const RELEASE_SLICE: Duration = Duration::from_millis(100);
+
+/// Counts the device halves of one connection not yet proven released. It is
+/// shared, so a reconnect that gives up waiting does not lose it: every later
+/// attempt waits on the same barrier until the device is truly let go.
+struct ReleaseBarrier {
+    live: Mutex<usize>,
+    released: Condvar,
+}
+
+impl ReleaseBarrier {
+    fn new(halves: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: Mutex::new(halves),
+            released: Condvar::new(),
+        })
+    }
+
+    fn half_released(&self) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        *live = live.saturating_sub(1);
+        self.released.notify_all();
+    }
+
+    /// Wait at most `bound` for every half to be released.
+    fn wait(&self, bound: Duration) -> bool {
+        let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        let (live, _) = self
+            .released
+            .wait_timeout_while(live, bound, |live| *live > 0)
+            .unwrap_or_else(PoisonError::into_inner);
+        *live == 0
+    }
+}
+
+/// A transport half that can prove it no longer holds the device.
+trait DeviceHalf: Send + 'static {
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String>;
+}
+
+impl DeviceHalf for Box<dyn PacketReader> {
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        PacketReader::shutdown(self.as_mut(), bound)
+    }
+}
+
+impl DeviceHalf for Box<dyn PacketWriter> {
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        PacketWriter::shutdown(self.as_mut(), bound)
+    }
+}
+
+/// Owns one half for its I/O thread. On every exit it shuts the half down and
+/// drops it before counting it released. If shutdown cannot prove release
+/// within [`RELEASE_SLICE`], a background reaper keeps trying and only then
+/// counts it; release is never reported early.
+struct ReleaseOnExit<T: DeviceHalf> {
+    half: Option<T>,
+    barrier: Arc<ReleaseBarrier>,
+}
+
+impl<T: DeviceHalf> ReleaseOnExit<T> {
+    fn new(half: T, barrier: &Arc<ReleaseBarrier>) -> Self {
+        Self {
+            half: Some(half),
+            barrier: Arc::clone(barrier),
+        }
+    }
+
+    fn half(&mut self) -> &mut T {
+        self.half.as_mut().expect("present until drop")
+    }
+}
+
+impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
+    fn drop(&mut self) {
+        let Some(mut half) = self.half.take() else {
+            return;
+        };
+        if half.shutdown(RELEASE_SLICE).is_ok() {
+            drop(half);
+            self.barrier.half_released();
+            return;
+        }
+        let barrier = Arc::clone(&self.barrier);
+        let reaper = thread::Builder::new()
+            .name("sans-odrive-reap".into())
+            .spawn(move || {
+                while let Err(reason) = half.shutdown(RELEASE_SLICE) {
+                    log::warn!("ODrive transport still held: {reason}");
+                }
+                drop(half);
+                barrier.half_released();
+            });
+        if reaper.is_err() {
+            log::error!("cannot start the ODrive release reaper; the device stays claimed");
+        }
+    }
+}
+
 struct ActiveTransport {
     epoch: u64,
     stop: Arc<AtomicBool>,
     writer: Arc<WriterQueue>,
-    /// Disconnects once the reader and writer threads have both exited and
-    /// dropped their halves of the device.
-    released: Receiver<()>,
+    released: Arc<ReleaseBarrier>,
 }
 
 impl ActiveTransport {
-    /// Ask both I/O threads to stop and return the signal of their exit.
-    fn close(self) -> Receiver<()> {
+    /// Ask both I/O threads to stop and return the barrier of their release.
+    fn close(self) -> Arc<ReleaseBarrier> {
         self.stop.store(true, Ordering::SeqCst);
         self.writer.close();
         self.released
     }
 }
 
-/// Wait, on the open thread, until the previous connection's I/O threads have
-/// released the device, so a reopen never races the old claim.
-fn await_release(released: Option<Receiver<()>>, bound: Duration) -> Result<(), String> {
-    let Some(released) = released else {
-        return Ok(());
-    };
-    match released.recv_timeout(bound) {
-        Err(RecvTimeoutError::Disconnected) | Ok(()) => Ok(()),
-        Err(RecvTimeoutError::Timeout) => Err(format!(
+/// Wait, on the open thread, until the previous connection has released the
+/// device, so a reopen never races the old claim.
+fn await_release(released: Option<Arc<ReleaseBarrier>>, bound: Duration) -> Result<(), String> {
+    match released {
+        Some(barrier) if !barrier.wait(bound) => Err(format!(
             "the previous ODrive connection did not release the device within {} ms",
             bound.as_millis()
         )),
+        _ => Ok(()),
     }
 }
 
@@ -184,8 +280,9 @@ struct EngineThread<E> {
     events: Sender<E>,
     shared: Arc<Mutex<Shared>>,
     active: Option<ActiveTransport>,
-    /// Exit signal of the most recently closed connection's I/O threads.
-    releasing: Option<Receiver<()>>,
+    /// Release barrier of the most recently closed connection. Kept, not
+    /// taken, so an attempt that times out waiting leaves it for the next.
+    releasing: Option<Arc<ReleaseBarrier>>,
 }
 
 impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
@@ -249,7 +346,7 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         let request = OpenRequest {
             usb_serial: self.config.usb_serial().to_owned(),
         };
-        let released = self.releasing.take();
+        let released = self.releasing.clone();
         let release_bound = self.config.gate_deadline();
         let spawned = thread::Builder::new()
             .name("sans-odrive-open".into())
@@ -306,25 +403,22 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         } = connection;
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(WriterQueue::default());
-        let (release_guard, released) = mpsc::channel::<()>();
-        let started = spawn_reader(
-            epoch,
-            reader,
-            Arc::clone(&stop),
-            self.loopback.clone(),
-            release_guard.clone(),
-        )
-        .and_then(|()| {
-            spawn_writer(
-                epoch,
-                writer,
-                Arc::clone(&queue),
-                self.loopback.clone(),
-                self.config.request_deadline(),
-                self.config.urgent_deadline(),
-                release_guard,
-            )
-        });
+        let released = ReleaseBarrier::new(2);
+        let reader = ReleaseOnExit::new(reader, &released);
+        let writer = ReleaseOnExit::new(writer, &released);
+        // A half whose thread cannot start is shut down and released by its
+        // guard's destructor, so the barrier always completes.
+        let started = spawn_reader(epoch, reader, Arc::clone(&stop), self.loopback.clone())
+            .and_then(|()| {
+                spawn_writer(
+                    epoch,
+                    writer,
+                    Arc::clone(&queue),
+                    self.loopback.clone(),
+                    self.config.request_deadline(),
+                    self.config.urgent_deadline(),
+                )
+            });
         self.active = Some(ActiveTransport {
             epoch,
             stop,
@@ -396,21 +490,16 @@ fn drain(reader: &mut dyn PacketReader) {
 
 fn spawn_reader(
     epoch: u64,
-    reader: Box<dyn PacketReader>,
+    mut reader: ReleaseOnExit<Box<dyn PacketReader>>,
     stop: Arc<AtomicBool>,
     loopback: Sender<Input>,
-    release_guard: Sender<()>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("sans-odrive-read".into())
         .spawn(move || {
-            // Locals drop in reverse order, and before captured variables: the
-            // device half is bound after the guard so it is destroyed first and
-            // the release signal fires only once the device is let go.
-            let _release_guard = release_guard;
-            let mut reader = reader;
+            // `reader` shuts its half down and reports release on every exit.
             while !stop.load(Ordering::SeqCst) {
-                match reader.read_packet(READ_SLICE) {
+                match reader.half().read_packet(READ_SLICE) {
                     Ok(Some(packet)) => {
                         if loopback.send(Input::Packet(epoch, packet)).is_err() {
                             return;
@@ -485,19 +574,16 @@ impl WriterQueue {
 
 fn spawn_writer(
     epoch: u64,
-    writer: Box<dyn PacketWriter>,
+    mut writer: ReleaseOnExit<Box<dyn PacketWriter>>,
     queue: Arc<WriterQueue>,
     loopback: Sender<Input>,
     request_deadline: Duration,
     urgent_deadline: Duration,
-    release_guard: Sender<()>,
 ) -> io::Result<()> {
     thread::Builder::new()
         .name("sans-odrive-write".into())
         .spawn(move || {
-            // See `spawn_reader`: the device half drops before the guard.
-            let _release_guard = release_guard;
-            let mut writer = writer;
+            // `writer` shuts its half down and reports release on every exit.
             while let Some(transmit) = queue.pop() {
                 // The claim is the dispatch point: a packet the engine revoked,
                 // or one past its deadline or readiness horizon, never leaves.
@@ -510,7 +596,7 @@ fn spawn_writer(
                 } else {
                     request_deadline
                 };
-                if let Err(reason) = writer.write_packet(&packet, timeout) {
+                if let Err(reason) = writer.half().write_packet(&packet, timeout) {
                     let _ = loopback.send(Input::TransportFailed(epoch, reason));
                     return;
                 }

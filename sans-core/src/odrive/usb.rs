@@ -4,7 +4,7 @@
 //! automated test; its first real exercise is supervised work in #60. It never
 //! touches the CDC interfaces, which stay with the kernel.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Bulk, In, Out, TransferError};
@@ -129,6 +129,40 @@ fn check_vendor_interface(device: &nusb::Device) -> Result<(), String> {
     Ok(())
 }
 
+/// How long a timed-out write waits for its cancelled transfer to come back.
+const CANCEL_REAP: Duration = Duration::from_millis(50);
+
+/// Cancel every pending transfer and reap the completions, at most `bound`.
+///
+/// In `nusb` 0.2.9 on Linux, dropping an endpoint with a pending transfer only
+/// requests cancellation; the cancelled URB keeps the interface alive until the
+/// event thread reaps it, and the interface is released
+/// (`USBDEVFS_RELEASEINTERFACE`) only when its last reference drops. Once
+/// `pending()` is zero, dropping both endpoints releases the interface
+/// synchronously. That is the proof this returns.
+fn cancel_and_reap<Dir: nusb::transfer::EndpointDirection>(
+    endpoint: &mut Endpoint<Bulk, Dir>,
+    bound: Duration,
+) -> Result<(), String> {
+    if endpoint.pending() == 0 {
+        return Ok(());
+    }
+    endpoint.cancel_all();
+    let deadline = Instant::now() + bound;
+    while endpoint.pending() > 0 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{} USB transfer(s) on endpoint {:#04x} still pending after cancellation",
+                endpoint.pending(),
+                endpoint.endpoint_address()
+            ));
+        }
+        let _ = endpoint.wait_next_complete(remaining);
+    }
+    Ok(())
+}
+
 struct UsbReader {
     endpoint: Endpoint<Bulk, In>,
 }
@@ -150,6 +184,10 @@ impl PacketReader for UsbReader {
         packet.truncate(completion.actual_len);
         Ok(Some(packet))
     }
+
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        cancel_and_reap(&mut self.endpoint, bound)
+    }
 }
 
 struct UsbWriter {
@@ -158,9 +196,22 @@ struct UsbWriter {
 
 impl PacketWriter for UsbWriter {
     fn write_packet(&mut self, packet: &[u8], timeout: Duration) -> Result<(), String> {
+        // A transfer cancelled earlier must be reaped before another is queued.
+        cancel_and_reap(&mut self.endpoint, CANCEL_REAP)?;
         let mut buffer = Buffer::new(packet.len());
         buffer.extend_from_slice(packet);
-        let completion = self.endpoint.transfer_blocking(buffer, timeout);
+        // Unlike `transfer_blocking`, which retries cancellation without bound,
+        // both waits here are bounded; a transfer that does not come back stays
+        // pending and is reaped by `shutdown` before release is reported.
+        self.endpoint.submit(buffer);
+        let Some(completion) = self.endpoint.wait_next_complete(timeout) else {
+            self.endpoint.cancel_all();
+            let _ = self.endpoint.wait_next_complete(CANCEL_REAP);
+            return Err(format!(
+                "USB write did not complete within {} ms",
+                timeout.as_millis()
+            ));
+        };
         match completion.status {
             Ok(()) => Ok(()),
             Err(TransferError::Cancelled) => Err(format!(
@@ -169,5 +220,9 @@ impl PacketWriter for UsbWriter {
             )),
             Err(error) => Err(format!("USB write failed: {error}")),
         }
+    }
+
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        cancel_and_reap(&mut self.endpoint, bound)
     }
 }

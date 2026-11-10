@@ -353,6 +353,10 @@ pub struct FakeOpener {
     /// When `true`, the next open claims the device and then waits here until
     /// [`FakeOpener::release_open`], like an open that is still draining.
     pub hold_open: Arc<(Mutex<bool>, Condvar)>,
+    /// Like `nusb`, the reader always has an IN transfer pending. Cancelling it
+    /// takes this long to be reaped. A reader dropped without a successful
+    /// `shutdown` keeps the claim in the background for this long.
+    pub reap_delay: Arc<Mutex<Duration>>,
 }
 
 impl FakeOpener {
@@ -375,12 +379,24 @@ impl FakeOpener {
 struct Claim {
     claimed: Arc<AtomicUsize>,
     release_delay: Duration,
+    /// Time for a pending transfer to be reaped after cancellation; zero when
+    /// nothing is pending or the owner's `shutdown` already reaped it.
+    unreaped: Duration,
 }
 
 impl Drop for Claim {
     fn drop(&mut self) {
-        std::thread::sleep(self.release_delay);
-        self.claimed.fetch_sub(1, Ordering::SeqCst);
+        if self.unreaped.is_zero() {
+            std::thread::sleep(self.release_delay);
+            self.claimed.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+        // Dropped with a transfer still pending: the claim outlives the half.
+        let (claimed, delay) = (Arc::clone(&self.claimed), self.unreaped);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            claimed.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 }
 
@@ -397,6 +413,7 @@ impl FakeOpener {
             busy_refusals: Arc::new(AtomicUsize::new(0)),
             claim_release_delay: Arc::new(Mutex::new(Duration::ZERO)),
             hold_open: Arc::new((Mutex::new(false), Condvar::new())),
+            reap_delay: Arc::new(Mutex::new(Duration::ZERO)),
         }
     }
 
@@ -435,9 +452,11 @@ impl FibreOpener for FakeOpener {
         }
         self.claimed.store(2, Ordering::SeqCst);
         let release_delay = *self.claim_release_delay.lock().unwrap();
-        let claim = || Claim {
+        let reap_delay = *self.reap_delay.lock().unwrap();
+        let claim = |unreaped| Claim {
             claimed: Arc::clone(&self.claimed),
             release_delay,
+            unreaped,
         };
         {
             let (held, wake) = &*self.hold_open;
@@ -455,7 +474,8 @@ impl FibreOpener for FakeOpener {
                 inbox,
                 _keep_open: replies.clone(),
                 cut: Arc::clone(&self.cut),
-                _claim: claim(),
+                shutdown_started: None,
+                _claim: claim(reap_delay),
             }),
             writer: Box::new(FakeWriter {
                 board: Arc::clone(&self.board),
@@ -463,7 +483,7 @@ impl FibreOpener for FakeOpener {
                 cut: Arc::clone(&self.cut),
                 gate: Arc::clone(&self.write_gate),
                 held: Arc::clone(&self.writes_held),
-                _claim: claim(),
+                _claim: claim(Duration::ZERO),
             }),
         })
     }
@@ -475,6 +495,7 @@ struct FakeReader {
     /// after the writer is gone, holding the claim until it returns.
     _keep_open: mpsc::Sender<Vec<u8>>,
     cut: Arc<Mutex<bool>>,
+    shutdown_started: Option<std::time::Instant>,
     _claim: Claim,
 }
 
@@ -487,6 +508,21 @@ impl PacketReader for FakeReader {
             Ok(packet) => Ok(Some(packet)),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err("fake writer gone".into()),
+        }
+    }
+
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+        let started = *self
+            .shutdown_started
+            .get_or_insert_with(std::time::Instant::now);
+        let remaining = self._claim.unreaped.saturating_sub(started.elapsed());
+        if remaining <= bound {
+            std::thread::sleep(remaining);
+            self._claim.unreaped = Duration::ZERO;
+            Ok(())
+        } else {
+            std::thread::sleep(bound);
+            Err("fake IN transfer not reaped yet".into())
         }
     }
 }

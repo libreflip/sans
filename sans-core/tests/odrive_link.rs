@@ -1489,3 +1489,126 @@ fn ignored_reply_count_changes_are_coalesced_but_phase_changes_are_not() {
         Some(LinkEvent::Status(status)) if status.phase == LinkPhase::Disconnected
     ));
 }
+
+// ----- third review round -----------------------------------------------------
+
+/// Arm a link, hold one telemetry read in flight, then submit an urgent
+/// energizing command whose write the writer has not claimed yet.
+fn held_urgent_energizing(command: LinkCommand) -> (Harness, Vec<u8>, sans_core::Transmit) {
+    let mut link = armed(commissioned());
+    let read = hold_next_telemetry_read(&mut link);
+    link.engine
+        .submit(link.now, Ticket(1), command, Priority::Urgent);
+    let mut held = link.take_unclaimed();
+    assert_eq!(held.len(), 1, "{command:?}");
+    (link, read, held.remove(0))
+}
+
+#[test]
+fn malformed_early_reply_revokes_every_unsent_urgent_energizing_write() {
+    for command in [
+        LinkCommand::Arm,
+        LinkCommand::Home,
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+    ] {
+        let (mut link, read, held) = held_urgent_energizing(command);
+        assert!(
+            link.engine.fresh_sample(link.now).is_some(),
+            "the sample is still fresh"
+        );
+
+        // A padded reply to the outstanding telemetry read, at the same instant.
+        let mut reply = link.board.handle(&read).unwrap();
+        reply.push(0);
+        link.engine.receive(link.now, &reply);
+        link.drain_events();
+
+        assert!(status_has_fault(&link), "{command:?}");
+        assert_eq!(
+            link.result(1),
+            Some(CommandResult::Retired { transmitted: false }),
+            "{command:?}"
+        );
+        assert!(
+            !held.claim_for_send(link.now),
+            "{command:?} left after the fault"
+        );
+        // A new disarm is still possible.
+        link.submit(2, LinkCommand::Disarm, Priority::Urgent);
+        link.run_for(5);
+        assert_eq!(
+            link.result(2),
+            Some(CommandResult::Completed),
+            "{command:?}"
+        );
+        assert!(link.board.writes_to(INPUT_POS).is_empty());
+        assert_eq!(link.board.requested_states(), vec![1, 8, 1], "{command:?}");
+    }
+}
+
+#[test]
+fn fault_keeps_the_outcome_of_an_energizing_write_already_sent() {
+    let mut link = armed(commissioned());
+    let read = hold_next_telemetry_read(&mut link);
+    link.engine.submit(
+        link.now,
+        Ticket(1),
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Urgent,
+    );
+    let sent = link.transmit_only();
+    assert_eq!(sent.len(), 1, "the writer claimed the move");
+
+    let mut reply = link.board.handle(&read).unwrap();
+    reply.push(0);
+    link.engine.receive(link.now, &reply);
+    link.drain_events();
+    assert!(status_has_fault(&link));
+    assert_eq!(
+        link.result(1),
+        None,
+        "a sent write is not retired as unsent"
+    );
+
+    let ack = link.board.handle(&sent[0].2).unwrap();
+    link.engine.receive(link.now, &ack);
+    link.exchange();
+    assert_eq!(link.result(1), Some(CommandResult::Completed));
+}
+
+#[test]
+fn disarm_supersedes_unsent_urgent_energizing_writes() {
+    let (mut link, read, held) =
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+
+    link.engine
+        .submit(link.now, Ticket(2), LinkCommand::Disarm, Priority::Urgent);
+    let sent = link.transmit_only();
+
+    assert_eq!(
+        link.result(1),
+        Some(CommandResult::Retired { transmitted: false })
+    );
+    assert!(!held.claim_for_send(link.now));
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1.endpoint, REQUESTED_STATE);
+    assert_eq!(sent[0].1.payload, 1_i32.to_le_bytes());
+    drop(read);
+}
+
+#[test]
+fn reply_to_a_request_never_sent_advances_nothing() {
+    let (mut link, _read, held) =
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+    let sequence = decode_request(&held.packet).sequence;
+    let unmatched = link.engine.status().unmatched_replies;
+
+    link.engine
+        .receive(link.now, &(sequence | 0x8000).to_le_bytes());
+    link.drain_events();
+
+    assert_eq!(link.engine.status().unmatched_replies, unmatched + 1);
+    assert_eq!(link.result(1), None);
+    assert!(link.take_unclaimed().is_empty(), "no readback was queued");
+    assert!(!status_has_fault(&link));
+}

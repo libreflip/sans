@@ -30,6 +30,10 @@ deceleration_limit_mm_s2 = 2.0
 
 /// Widest timing the profile bounds allow, so emulated CI is not timing-bound.
 fn config() -> LinkConfig {
+    config_with_open_ms(60_000)
+}
+
+fn config_with_open_ms(device_open_ms: u64) -> LinkConfig {
     let profile = format!("{VALID_PROFILE}{LIFT_AXIS}")
         .replacen("poll_interval_ms = 20", "poll_interval_ms = 100", 1)
         .replacen(
@@ -39,7 +43,11 @@ fn config() -> LinkConfig {
         )
         .replacen("request_deadline_ms = 100", "request_deadline_ms = 250", 1)
         .replacen("urgent_deadline_ms = 50", "urgent_deadline_ms = 100", 1)
-        .replacen("device_open_ms = 5000", "device_open_ms = 60000", 1);
+        .replacen(
+            "device_open_ms = 5000",
+            &format!("device_open_ms = {device_open_ms}"),
+            1,
+        );
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("sans.toml");
     fs::write(&path, profile).unwrap();
@@ -55,8 +63,12 @@ struct Link {
 
 impl Link {
     fn start(opener: &FakeOpener) -> Self {
+        Self::start_with(opener, config())
+    }
+
+    fn start_with(opener: &FakeOpener, config: LinkConfig) -> Self {
         let (sender, events) = mpsc::channel();
-        let (handle, runner) = spawn_link(config(), Box::new(opener.clone()), sender).unwrap();
+        let (handle, runner) = spawn_link(config, Box::new(opener.clone()), sender).unwrap();
         Self {
             handle,
             _runner: runner,
@@ -262,6 +274,95 @@ fn superseded_open_is_destroyed_before_the_next_open() {
     opener.release_open();
     link.wait_for_phase(2, LinkPhase::Verified);
 
+    assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(*opener.opens.lock().unwrap(), 2);
+}
+
+#[test]
+fn disarm_supersedes_an_urgent_move_still_waiting_in_the_writer() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    let mut link = Link::start(&opener);
+    link.wait_for_phase(1, LinkPhase::Verified);
+    let arm = link.handle.submit(LinkCommand::Arm, Priority::Ordinary);
+    assert_eq!(link.result(arm), CommandResult::Completed);
+    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
+
+    opener.block_writes();
+    let held = opener.writes_held.load(Ordering::SeqCst);
+    let clear = link
+        .handle
+        .submit(LinkCommand::ClearErrors, Priority::Urgent);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while opener.writes_held.load(Ordering::SeqCst) == held {
+        assert!(
+            Instant::now() < deadline,
+            "the writer never picked up the urgent packet"
+        );
+        std::thread::yield_now();
+    }
+    // An urgent move queues behind the stuck packet, then a disarm follows.
+    let movement = link.handle.submit(
+        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        Priority::Urgent,
+    );
+    let disarm = link.handle.submit(LinkCommand::Disarm, Priority::Urgent);
+    let move_result = link.result(movement);
+    opener.release_writes();
+
+    assert_eq!(move_result, CommandResult::Retired { transmitted: false });
+    assert_eq!(link.result(disarm), CommandResult::Completed);
+    let _ = link.result(clear);
+    let board = opener.board.lock().unwrap();
+    assert!(
+        board.writes_to(INPUT_POS).is_empty(),
+        "a superseded move reached the board"
+    );
+    assert_eq!(board.requested_states(), vec![1, 8, 1]);
+}
+
+#[test]
+fn release_is_reported_only_after_pending_transfers_are_reaped() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    // Longer than one shutdown slice, so the background reaper is exercised.
+    *opener.reap_delay.lock().unwrap() = Duration::from_millis(250);
+    let mut link = Link::start(&opener);
+    link.wait_for_phase(1, LinkPhase::Verified);
+
+    link.handle.reconnect();
+    link.wait_for_phase(2, LinkPhase::Verified);
+
+    assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn release_barrier_survives_an_attempt_that_gave_up_waiting() {
+    // An empty descriptor blocks each gate at once while the transport stays open.
+    let opener = FakeOpener::new(FakeFibre::compatible().with_descriptor(b"[]".to_vec()));
+    // Releasing takes far longer than one 300 ms gate budget.
+    *opener.claim_release_delay.lock().unwrap() = Duration::from_millis(1_000);
+    let mut link = Link::start_with(&opener, config_with_open_ms(300));
+    link.wait_for_phase(1, LinkPhase::Blocked);
+
+    link.handle.reconnect();
+    link.wait_for_phase(2, LinkPhase::Blocked);
+    // The very next attempt must wait on the same barrier, not open at once.
+    link.handle.reconnect();
+    link.wait_for_phase(3, LinkPhase::Blocked);
+    assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
+    assert_eq!(*opener.opens.lock().unwrap(), 1);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while opener.claimed.load(Ordering::SeqCst) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the old connection never released"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    link.handle.reconnect();
+    link.wait_for(|event| {
+        matches!(event, LinkEvent::Status(status) if status.epoch == 4 && status.discovery.is_some())
+    });
     assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
     assert_eq!(*opener.opens.lock().unwrap(), 2);
 }
