@@ -1,0 +1,130 @@
+{
+  "capabilities": {
+    "axis0.clear_errors": {
+      "id": 299,
+      "type": "function"
+    },
+    "axis0.controller.config.homing_speed": {
+      "access": "rw",
+      "id": 219,
+      "type": "float"
+    },
+    "axis0.controller.trajectory_done": {
+      "access": "r",
+      "id": 200,
+      "type": "bool"
+    },
+    "axis0.is_homed": {
+      "access": "rw",
+      "id": 77,
+      "type": "bool"
+    },
+    "axis0.motor.current_control.Iq_measured": {
+      "access": "rw",
+      "id": 150,
+      "type": "float"
+    },
+    "axis0.motor.current_control.Iq_setpoint": {
+      "access": "r",
+      "id": 149,
+      "type": "float"
+    },
+    "axis0.requested_state": {
+      "access": "rw",
+      "id": 74,
+      "type": "int32"
+    },
+    "axis0.watchdog_feed": {
+      "id": 298,
+      "type": "function"
+    },
+    "axis1.clear_errors": {
+      "id": 528,
+      "type": "function"
+    },
+    "axis1.controller.config.homing_speed": {
+      "access": "rw",
+      "id": 448,
+      "type": "float"
+    },
+    "axis1.controller.trajectory_done": {
+      "access": "r",
+      "id": 429,
+      "type": "bool"
+    },
+    "axis1.is_homed": {
+      "access": "rw",
+      "id": 306,
+      "type": "bool"
+    },
+    "axis1.motor.current_control.Iq_measured": {
+      "access": "rw",
+      "id": 379,
+      "type": "float"
+    },
+    "axis1.motor.current_control.Iq_setpoint": {
+      "access": "r",
+      "id": 378,
+      "type": "float"
+    },
+    "axis1.requested_state": {
+      "access": "rw",
+      "id": 303,
+      "type": "int32"
+    },
+    "axis1.watchdog_feed": {
+      "id": 527,
+      "type": "function"
+    }
+  },
+  "endpoint_count": 535,
+  "identity": {
+    "fw_version_major": 0,
+    "fw_version_minor": 0,
+    "fw_version_revision": 0,
+    "fw_version_unreleased": 1,
+    "hw_version_major": 3,
+    "hw_version_minor": 6,
+    "hw_version_variant": 56,
+    "serial_number": 54310774846261
+  },
+  "interpretation": {
+    "firmware": "Reports 0.0.0, unreleased=1. Exact installed factory build is not established. Schema fingerprint is not a firmware image hash.",
+    "readiness": "Identity/capability evidence only. No motion readiness, contact detection, Stop behavior or timing qualification. Axis error 0x1000 retained; is_homed=false.",
+    "schema_sha256_format": "SHA-256 of flattened endpoint schema serialized as UTF-8 JSON with sorted keys and compact separators.",
+    "transport": "Native USB discovery and selected property reads succeeded. ASCII enablement was read from configuration; ASCII transport was not exercised."
+  },
+  "missing": [],
+  "observed_at_utc": "2026-11-10T19:57:30.667487+00:00",
+  "reads": {
+    "axis0.config.startup_closed_loop_control": false,
+    "axis0.config.startup_homing": false,
+    "axis0.controller.error": 0,
+    "axis0.controller.trajectory_done": true,
+    "axis0.current_state": 1,
+    "axis0.encoder.config.cpr": 24,
+    "axis0.encoder.config.mode": 1,
+    "axis0.encoder.error": 0,
+    "axis0.encoder.is_ready": true,
+    "axis0.encoder.pos_estimate": 0.12294654548168182,
+    "axis0.encoder.vel_estimate": 0.0,
+    "axis0.error": 4096,
+    "axis0.is_homed": false,
+    "axis0.min_endstop.endstop_state": true,
+    "axis0.motor.config.current_lim": 4.800000190734863,
+    "axis0.motor.config.pole_pairs": 4,
+    "axis0.motor.current_control.Iq_measured": 0.0,
+    "axis0.motor.current_control.Iq_setpoint": 0.0,
+    "axis0.motor.error": 0,
+    "config.enable_ascii_protocol_on_usb": true
+  },
+  "schema_crc": 39744,
+  "schema_sha256": "a36d84437bd2bf5925c0119a1df53d88de8ebe1aa8df0a338d2f6dd56fd5e52b",
+  "scope": "Read-only USB discovery, native endpoint schema discovery, and selected property GETs. No writes, remote function calls, motion, calibration, reset or firmware changes.",
+  "usb": {
+    "product": "ODrive 3.6 CDC Interface",
+    "product_id": "0x0d32",
+    "serial": "316536713335",
+    "vendor_id": "0x1209"
+  }
+}
