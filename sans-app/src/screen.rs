@@ -9,6 +9,10 @@
 //!   stacked vertically at touch height. It never scrolls and cannot be resized.
 //! - The body fills the space between them and scrolls vertically by pointer
 //!   drag, mouse wheel, or a solid scroll bar when its content is taller.
+//!   Every screen scrolls the same way: the bar is always solid and shown
+//!   whenever the body overflows, and the body edges never fade. A floating
+//!   bar is invisible on a touchscreen, and a fade would dim 100% preview
+//!   pixels; one policy for all screens keeps them consistent.
 //!
 //! Contract for later screens: anything that must stay reachable goes in the
 //! action bar. Stop comes first of all. Body content may scroll out of view at
@@ -72,8 +76,7 @@ pub(crate) fn show(
 ) {
     let scroll = &mut ui.style_mut().spacing.scroll;
     *scroll = egui::style::ScrollStyle::solid();
-    // The solid bar already shows that more content exists. A fade would dim
-    // 100% preview pixels near the body edges.
+    // The scroll policy in the module documentation: solid bar, no edge fade.
     scroll.fade.strength = 0.0;
 
     egui::Panel::top("screen-header")
