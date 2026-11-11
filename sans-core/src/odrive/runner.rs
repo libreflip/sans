@@ -12,7 +12,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,9 @@ pub struct LinkClosed;
 
 impl LinkHandle {
     /// Queue a typed command and return its ticket at once.
+    ///
+    /// `Ok` means queued. Dropping the runner can discard work still in its
+    /// inbox; callers must stop submitting before teardown.
     pub fn submit(&self, command: LinkCommand, priority: Priority) -> Result<Ticket, LinkClosed> {
         let ticket = Ticket(self.tickets.fetch_add(1, Ordering::Relaxed));
         self.inputs
@@ -182,20 +185,26 @@ impl ReleaseBarrier {
             .push(half);
     }
 
-    /// Retry each held half once, counting those proven released. True when
-    /// none remain held.
-    fn reap_held(&self) -> bool {
-        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut still_held = Vec::new();
-        for mut half in held.drain(..) {
-            if half.shutdown(RELEASE_SLICE).is_ok() {
-                drop(half);
+    /// Retry held halves within the deadline, without waiting behind another reaper.
+    fn reap_held(&self, deadline: Instant) -> bool {
+        let mut held = match self.held.try_lock() {
+            Ok(held) => held,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
+        let mut index = 0;
+        while index < held.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            if held[index].shutdown(remaining.min(RELEASE_SLICE)).is_ok() {
+                drop(held.remove(index));
                 self.half_released();
             } else {
-                still_held.push(half);
+                index += 1;
             }
         }
-        *held = still_held;
         held.is_empty()
     }
 
@@ -211,13 +220,23 @@ impl ReleaseBarrier {
 
     /// Wait at most `bound` for every half to be released.
     fn wait(&self, bound: Duration) -> bool {
-        self.reap_held();
-        let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        let (live, _) = self
-            .released
-            .wait_timeout_while(live, bound, |live| *live > 0)
-            .unwrap_or_else(PoisonError::into_inner);
-        *live == 0
+        let deadline = Instant::now() + bound;
+        loop {
+            self.reap_held(deadline);
+            let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+            if *live == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // Retry locally even if no background reaper could start.
+            let _ = self
+                .released
+                .wait_timeout(live, remaining.min(RELEASE_SLICE))
+                .unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -278,7 +297,7 @@ impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
         let reaper = thread::Builder::new()
             .name("sans-odrive-reap".into())
             .spawn(move || {
-                while !barrier.reap_held() {
+                while !barrier.reap_held(Instant::now() + RELEASE_SLICE) {
                     thread::sleep(RELEASE_SLICE);
                 }
             });
@@ -707,6 +726,51 @@ mod tests {
             !barrier.wait(Duration::ZERO),
             "release is not reported early"
         );
-        assert!(barrier.wait(Duration::ZERO), "the next attempt reaps it");
+        assert!(
+            barrier.wait(Duration::from_secs(5)),
+            "the next attempt reaps it"
+        );
+    }
+
+    struct BudgetHalf(Arc<Mutex<Vec<Duration>>>);
+
+    impl DeviceHalf for BudgetHalf {
+        fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
+            self.0.lock().unwrap().push(bound);
+            thread::sleep(bound);
+            Err("still pending".into())
+        }
+    }
+
+    #[test]
+    fn zero_release_budget_never_starts_a_shutdown() {
+        let barrier = ReleaseBarrier::new();
+        barrier.register_connection();
+        barrier.half_released();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        barrier.hold(Box::new(BudgetHalf(Arc::clone(&calls))));
+        assert!(!barrier.wait(Duration::ZERO));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shutdown_retry_receives_only_the_remaining_wait_budget() {
+        let barrier = ReleaseBarrier::new();
+        barrier.register_connection();
+        barrier.half_released();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        barrier.hold(Box::new(BudgetHalf(Arc::clone(&calls))));
+        let budget = Duration::from_millis(20);
+        assert!(!barrier.wait(budget));
+        let calls = calls.lock().unwrap();
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|bound| *bound <= budget));
+    }
+    #[test]
+    fn release_wait_does_not_wait_for_another_reapers_mutex() {
+        let barrier = ReleaseBarrier::new();
+        barrier.register_connection();
+        let _held_by_reaper = barrier.held.lock().unwrap();
+        assert!(!barrier.wait(Duration::ZERO));
     }
 }
