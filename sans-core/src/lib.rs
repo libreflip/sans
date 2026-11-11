@@ -4,6 +4,7 @@ mod camera;
 mod config;
 mod controller;
 mod hardware;
+mod odrive;
 
 #[cfg(target_os = "linux")]
 pub use crate::camera::{
@@ -16,17 +17,23 @@ pub use crate::camera::{
 };
 pub use crate::config::{
     prepare_machine_profile, resolve_machine_profile_path, BoardProfile, CameraProfiles,
-    CameraRoleProfile, CropGeometry, MachineProfile, MotionProfile, PageWidthProfile,
-    PickupProfile, PreparedMachineProfile, ProfileSaveError, StartupError, TimeoutProfile,
-    MACHINE_PROFILE_TEMPLATE,
+    CameraRoleProfile, CropGeometry, LiftAxisProfile, LiftDirection, MachineProfile, MotionProfile,
+    OdriveProfile, PageWidthProfile, PickupProfile, PreparedMachineProfile, ProfileSaveError,
+    StartupError, TimeoutProfile, MACHINE_PROFILE_TEMPLATE,
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, MachineFactory, MachineScreen, SetupBlocker,
-    SetupDiagnostic, SetupState,
+    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineFactory, MachineScreen,
+    ScanReadiness, SetupBlocker, SetupDiagnostic, SetupState, TelemetrySummary,
 };
 pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
     MonospaceEventKind, MonospaceEvents, MonospaceFault, MonospaceUrgentWriter,
     MONOSPACE_BAUD_RATE,
+};
+pub use crate::odrive::{
+    spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,
+    LinkClosed, LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkHandle, LinkPhase, LinkRunner,
+    LinkStatus, OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample,
+    TelemetryValues, Ticket, Transmit, UsbFibreOpener,
 };

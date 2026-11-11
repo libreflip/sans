@@ -33,6 +33,8 @@ Use `cargo run -p sans -- --config /path/to/sans.toml` for an explicit developme
 
 On first start, Sans writes the parseable [sans.example.toml](sans.example.toml) template to the selected path and opens a fatal screen naming that path. Close Sans, fill every `<...>` placeholder, commission both zero page-width bounds, then restart. A relative `data_root` is resolved against the profile location and must be writable.
 
+The profile is schema version 2. A version 1 profile is rejected at startup: remove `boards.ligature_path`, add the `[odrive]` section and set `schema_version = 2`. Move the old file aside and restart Sans to compare against a freshly generated template. There is no rewrite tool, because the new values do not exist in a version 1 file.
+
 The active production workspace contains `sans-app/` and `sans-core/`. The old HTTP server, worker, remote CLI, shared-types crate, and processing stubs are not production workspace members.
 
 ## Run on a Raspberry Pi over SSH
@@ -64,6 +66,24 @@ Use the command only during supervised hardware testing. Stop any other Sans ins
 ## Machine profile limits
 
 The profile is a complete, versioned commissioning file; the scan workflow never edits it. Protocol baud rates and the 3840×2160 MJPEG camera profile stay fixed in code. Structural validation rejects unstable Camera identities, invalid crops or rotations, nonpositive or unordered fields, and commissioned actuation values above the resolved Issue #15 starting anchors. Those 50% Touchdown-press and seven Lift-percentage values are immutable software maxima; profile edits may only lower them. The separately decided Stop-terminal deadline has an immutable 500 ms maximum, and profiles may lower it. Saves are direct truncating complete-file writes and report errors; they make no atomic replacement or storage-synchronization claim.
+
+The `[odrive]` section names the lift-axis board by USB serial. Its polling interval, telemetry age and request deadlines are provisional, unmeasured values inside immutable bounds in code. The optional `[odrive.lift_axis]` table holds the mechanism values; while it is absent the lift axis stays blocked and Sans substitutes no default. Commissioned limits are bounded by software policy caps of 4.8 A, 1 motor turn per second, and 1 motor turn per second squared for acceleration and deceleration. **These caps are arbitrary conservative host policy, not physical safety qualification.** They are not derived from the mechanism or measured; the 4.8 A figure only matches the current limit observed on the board on 2026-11-10. #60 reviews all three. The caps are in motor units, so a wrong `mm_per_turn` cannot raise motor speed or current. Production scanning stays disabled whatever the profile says.
+
+## ODrive lift axis
+
+Sans talks to the MKS ODrive Mini over its native Fibre USB vendor interface (interface 2, bulk `0x03`/`0x83`) and leaves the CDC serial interfaces to the kernel. On each connection it checks the board's USB serial and `serial_number` against the profile, checks that every endpoint Sans uses exists with the right type and access, commands the axis idle, and writes and reads back the commissioned limits. Other endpoints may differ between firmware builds without blocking the link. Sans never saves, erases, reboots or flashes the board, and never changes its control or input mode. The Setup screens show the lift-axis status, the discovered identity and descriptor CRC, with a reconnect action in the action bar; the capture preview keeps its full body for the camera views.
+
+Reconnection happens only from the touchscreen's reconnect button. A new connection opens only after the previous one has released the device: each USB half cancels its pending transfers and waits for `nusb` to reap them, and a background reaper keeps trying without reporting release early. Each attempt waits at most the connection gate deadline for that release. The USB open itself is not interrupted; on Linux it only reads sysfs and cached descriptors and claims the interface, and an attempt that does not finish within the gate deadline is reported as blocked.
+
+An urgent command overtakes ordinary commands that have not left the host, so a queued move cannot follow a disarm. A command packet never leaves after its deadline, and an arm, Home or move write never leaves after a link fault, after a disarm is accepted, or once the sample it was accepted on is stale; such commands are retired as not transmitted. A new disarm is always possible while the device is open. Non-finite telemetry faults the link. Ignored replies are counted on the panel and logged to standard error, and a shown sample's age keeps updating, so a silent link never looks fresh.
+
+The Pi user running Sans needs access to the USB device. A udev rule such as the following, in `/etc/udev/rules.d/70-odrive.rules`, grants it to the `plugdev` group:
+
+```text
+SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0d32", MODE="0660", GROUP="plugdev"
+```
+
+Automated tests run the link against a fake Fibre device served from the captured schema. They show host behaviour against upstream `fw-v0.5.1` semantics, not what the vendor build does on real hardware; the first supervised board run belongs to #60.
 
 ## Direct diagnostics
 

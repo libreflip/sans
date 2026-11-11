@@ -43,6 +43,10 @@ impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<Ca
 impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<CameraFactory> {
     type Machine = BootstrapMachine<CameraFactory::Machine>;
 
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        self.cameras.odrive_opener()
+    }
+
     fn open(
         self,
         profile: &PreparedMachineProfile,
@@ -135,6 +139,10 @@ impl ControllerMachine for UnsupportedCameraMachine {
 #[cfg(not(target_os = "linux"))]
 impl MachineFactory for UnsupportedCameraFactory {
     type Machine = UnsupportedCameraMachine;
+
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(sans_core::UsbFibreOpener)
+    }
 
     fn open(
         self,

@@ -4,20 +4,102 @@ use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 use crate::camera::{CapturePair, CapturePairError};
+use crate::odrive::{
+    spawn_link, DiscoveryRecord, FibreOpener, LinkConfig, LinkEvent, LinkHandle, LinkPhase,
+    LinkRunner, LinkStatus, TelemetrySample, TelemetryValues,
+};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
-/// The complete set of UI-to-controller actions in the Capture-pair slice.
+/// Telemetry-only snapshot changes publish at most four times a second.
+const TELEMETRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// The complete set of UI-to-controller actions.
+///
+/// No intent arms, homes, moves or clears errors on the lift axis.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerIntent {
     /// Acquire one complete stationary Capture pair.
     CapturePair,
+    /// End the current lift-axis connection and run the connection gate once more.
+    ReconnectLiftAxis,
     /// Terminate the controller without starting more Machine work.
     Exit,
+}
+
+/// Lift-axis link state projected into every snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiftAxisStatus {
+    /// Connection epoch; 0 before the first attempt.
+    pub epoch: u64,
+    /// Disconnected, connecting, blocked, verified or faulted.
+    pub phase: LinkPhase,
+    /// Every reason the lift axis is not verified.
+    pub blockers: Vec<String>,
+    /// What the current connection discovered, for commissioning notes.
+    pub discovery: Option<DiscoveryRecord>,
+    /// Latest current-epoch telemetry and its freshness.
+    pub telemetry: Option<TelemetrySummary>,
+    /// Replies that matched no pending request.
+    pub unmatched_replies: u64,
+}
+
+impl LiftAxisStatus {
+    fn starting() -> Self {
+        Self {
+            epoch: 0,
+            phase: LinkPhase::Disconnected,
+            blockers: vec!["the lift-axis link has not started".into()],
+            discovery: None,
+            telemetry: None,
+            unmatched_replies: 0,
+        }
+    }
+
+    fn unavailable(reason: String) -> Self {
+        Self {
+            blockers: vec![reason],
+            ..Self::starting()
+        }
+    }
+}
+
+/// The latest telemetry sample as presented, with its age when published.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelemetrySummary {
+    /// Decoded values. Display only; consumers needing evidence use the link handle.
+    pub values: TelemetryValues,
+    /// Sample age in milliseconds when this snapshot was published.
+    pub age_ms: u64,
+    /// Whether the sample was within the profile's maximum age when published.
+    pub fresh: bool,
+    /// Measured duration of the sample's telemetry cycle in milliseconds.
+    pub cycle_ms: u64,
+}
+
+/// Whether an operator can start a Scan session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScanReadiness {
+    /// Production scanning is disabled in this build whatever the lift-axis
+    /// phase or the profile says.
+    Disabled {
+        /// Why scanning is unavailable.
+        reason: String,
+    },
+}
+
+impl ScanReadiness {
+    fn current() -> Self {
+        Self::Disabled {
+            reason: "production scanning is not available in this build; a verified lift axis \
+                     enables diagnostics only"
+                .into(),
+        }
+    }
 }
 
 /// One operator-facing reason live Machine setup cannot proceed.
@@ -107,12 +189,16 @@ pub enum MachineScreen {
 }
 
 /// A revisioned projection of controller-owned state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ControllerSnapshot {
     /// Monotonically increasing controller-state revision.
     pub revision: u64,
     /// The authoritative workflow projection for presentation.
     pub screen: MachineScreen,
+    /// Lift-axis link status, independent of the Camera screen.
+    pub lift_axis: LiftAxisStatus,
+    /// Scanning stays disabled in this build.
+    pub scan_readiness: ScanReadiness,
 }
 
 /// Controller-thread-owned Machine behavior.
@@ -125,6 +211,11 @@ pub trait ControllerMachine: 'static {
 pub trait MachineFactory: Send + 'static {
     /// Live Machine resources retained exclusively by the controller thread.
     type Machine: ControllerMachine;
+
+    /// Hand over the ODrive device opener. Called once on the controller
+    /// thread, only after the profile passed validation; no USB device is
+    /// touched before then. Production returns the USB opener.
+    fn odrive_opener(&mut self) -> Box<dyn FibreOpener>;
 
     /// Open live resources after structural startup checks and report nonfatal Setup blockers.
     fn open(
@@ -208,7 +299,7 @@ impl LatestSnapshot {
 
 /// An intent channel that also exposes the latest controller projection.
 pub struct ControllerHandle {
-    intents: Sender<ControllerIntent>,
+    intents: Sender<Inbox>,
     snapshots: Arc<LatestSnapshot>,
     accepting_intents: Arc<Mutex<bool>>,
     controller_thread: Option<JoinHandle<()>>,
@@ -227,7 +318,7 @@ impl ControllerHandle {
         if intent == ControllerIntent::Exit {
             *accepting_intents = false;
         }
-        self.intents.send(intent).map_err(|_| {
+        self.intents.send(Inbox::Intent(intent)).map_err(|_| {
             *accepting_intents = false;
             ControllerClosed
         })
@@ -281,11 +372,27 @@ pub fn bootstrap(
     spawn_controller(profile, factory)
 }
 
+/// One controller inbox for intents and lift-axis link events.
+enum Inbox {
+    Intent(ControllerIntent),
+    Link(LinkEvent),
+}
+
+impl From<LinkEvent> for Inbox {
+    fn from(event: LinkEvent) -> Self {
+        Self::Link(event)
+    }
+}
+
+/// How often the controller polls live Machine resources for Setup failures.
+const SETUP_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 fn spawn_controller<Factory: MachineFactory>(
     profile: PreparedMachineProfile,
-    factory: Factory,
+    mut factory: Factory,
 ) -> Result<ControllerHandle, StartupError> {
-    let (intent_sender, intent_receiver) = mpsc::channel();
+    let (intent_sender, inbox) = mpsc::channel();
+    let link_events = intent_sender.clone();
     let snapshots = Arc::new(LatestSnapshot::default());
     let snapshot_sender = Arc::clone(&snapshots);
     let accepting_intents = Arc::new(Mutex::new(true));
@@ -307,99 +414,97 @@ fn spawn_controller<Factory: MachineFactory>(
 
             let _closed_on_return =
                 MarkControllerClosed(worker_accepting_intents, Arc::clone(&snapshot_sender));
+            // The ODrive opener is requested only after the profile validated,
+            // and before live Camera and board resources are opened.
+            let mut lift = LiftAxis::start(&profile, factory.odrive_opener(), link_events);
             let (setup, mut active_machine) = match factory.open(&profile) {
                 Ok((machine, diagnostics)) => (SetupState::Ready { diagnostics }, Some(machine)),
                 Err(reasons) => (SetupState::Blocked { reasons }, None),
             };
-            if snapshot_sender
-                .send(ControllerSnapshot {
-                    revision: 0,
-                    screen: MachineScreen::Setup(setup),
-                })
-                .is_err()
-            {
+            let mut state = Projection {
+                revision: 0,
+                screen: MachineScreen::Setup(setup),
+                latest_complete_pair: None,
+                snapshots: snapshot_sender,
+            };
+            if !state.publish(&mut lift) {
                 return;
             }
 
-            let mut revision = 0;
-            let mut latest_complete_pair = None;
             loop {
                 if let Some(machine) = active_machine.as_mut() {
                     if let Some(blocker) = Factory::poll_setup(machine) {
-                        revision += 1;
-                        if snapshot_sender
-                            .send(ControllerSnapshot {
-                                revision,
-                                screen: MachineScreen::Setup(SetupState::Blocked {
-                                    reasons: vec![blocker],
-                                }),
-                            })
-                            .is_err()
-                        {
+                        state.screen = MachineScreen::Setup(SetupState::Blocked {
+                            reasons: vec![blocker],
+                        });
+                        if !state.publish(&mut lift) {
                             return;
                         }
                         active_machine = None;
                     }
                 }
 
-                let intent = if active_machine.is_some() {
-                    match intent_receiver.recv_timeout(Duration::from_millis(16)) {
-                        Ok(intent) => intent,
-                        Err(RecvTimeoutError::Timeout) => continue,
-                        Err(RecvTimeoutError::Disconnected) => return,
-                    }
-                } else {
-                    match intent_receiver.recv() {
-                        Ok(intent) => intent,
+                // Wake for whichever comes first: the next Setup poll of a live
+                // Machine, or the next refresh of a shown sample, so its age
+                // and freshness keep moving even if the link has gone silent.
+                let setup_poll = active_machine.is_some().then_some(SETUP_POLL_INTERVAL);
+                let wait = setup_poll
+                    .into_iter()
+                    .chain(lift.refresh_wait(Instant::now()))
+                    .min();
+                let message = match wait {
+                    None => match inbox.recv() {
+                        Ok(message) => message,
                         Err(_) => return,
-                    }
+                    },
+                    Some(wait) => match inbox.recv_timeout(wait) {
+                        Ok(message) => message,
+                        Err(RecvTimeoutError::Timeout) => {
+                            if lift.refresh_due(Instant::now()) && !state.publish(&mut lift) {
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    },
                 };
-
-                match intent {
-                    ControllerIntent::CapturePair => {
+                match message {
+                    Inbox::Intent(ControllerIntent::CapturePair) => {
                         let Some(machine) = active_machine.as_mut() else {
                             continue;
                         };
-                        revision += 1;
-                        if snapshot_sender
-                            .send(ControllerSnapshot {
-                                revision,
-                                screen: capture_preview(
-                                    CaptureStatus::Capturing,
-                                    latest_complete_pair.clone(),
-                                ),
-                            })
-                            .is_err()
-                        {
+                        state.screen = capture_preview(
+                            CaptureStatus::Capturing,
+                            state.latest_complete_pair.clone(),
+                        );
+                        if !state.publish(&mut lift) {
                             return;
                         }
-                        revision += 1;
                         let status = match machine.capture_pair() {
                             Ok(pair) => {
-                                latest_complete_pair = Some(Arc::new(pair));
+                                state.latest_complete_pair = Some(Arc::new(pair));
                                 CaptureStatus::Ready
                             }
                             Err(error) => CaptureStatus::Blocked {
                                 reason: error.to_string(),
                             },
                         };
-                        if snapshot_sender
-                            .send(ControllerSnapshot {
-                                revision,
-                                screen: capture_preview(status, latest_complete_pair.clone()),
-                            })
-                            .is_err()
-                        {
+                        state.screen = capture_preview(status, state.latest_complete_pair.clone());
+                        if !state.publish(&mut lift) {
                             return;
                         }
                     }
-                    ControllerIntent::Exit => {
-                        revision += 1;
-                        let _ = snapshot_sender.send(ControllerSnapshot {
-                            revision,
-                            screen: MachineScreen::Exited,
-                        });
+                    Inbox::Intent(ControllerIntent::ReconnectLiftAxis) => lift.reconnect(),
+                    Inbox::Intent(ControllerIntent::Exit) => {
+                        state.screen = MachineScreen::Exited;
+                        let _ = state.publish(&mut lift);
                         return;
+                    }
+                    Inbox::Link(event) => {
+                        let publish = lift.apply(event) || lift.refresh_due(Instant::now());
+                        if publish && !state.publish(&mut lift) {
+                            return;
+                        }
                     }
                 }
             }
@@ -412,6 +517,135 @@ fn spawn_controller<Factory: MachineFactory>(
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
+}
+
+struct Projection {
+    revision: u64,
+    screen: MachineScreen,
+    latest_complete_pair: Option<Arc<CapturePair>>,
+    snapshots: Arc<LatestSnapshot>,
+}
+
+impl Projection {
+    /// Replace the pending snapshot with the current projection.
+    fn publish(&mut self, lift: &mut LiftAxis) -> bool {
+        let snapshot = ControllerSnapshot {
+            revision: self.revision,
+            screen: self.screen.clone(),
+            lift_axis: lift.status(Instant::now()),
+            scan_readiness: ScanReadiness::current(),
+        };
+        self.revision += 1;
+        self.snapshots.send(snapshot).is_ok()
+    }
+}
+
+/// The controller's view of the lift-axis link. The link runs on its own
+/// threads; this only folds its events into the next snapshot.
+struct LiftAxis {
+    link: Option<(LinkHandle, LinkRunner)>,
+    status: LiftAxisStatus,
+    latest: Option<TelemetrySample>,
+    /// When a snapshot last carried this projection.
+    last_publish: Option<Instant>,
+}
+
+impl LiftAxis {
+    fn start(
+        profile: &PreparedMachineProfile,
+        opener: Box<dyn FibreOpener>,
+        events: Sender<Inbox>,
+    ) -> Self {
+        let mut lift = Self {
+            link: None,
+            status: LiftAxisStatus::starting(),
+            latest: None,
+            last_publish: None,
+        };
+        let config = match LinkConfig::from_profile(profile.profile()) {
+            Ok(config) => config,
+            Err(problems) => {
+                lift.status = LiftAxisStatus::unavailable(problems.join("; "));
+                return lift;
+            }
+        };
+        match spawn_link(config, opener, events) {
+            Ok(link) => lift.link = Some(link),
+            Err(error) => {
+                lift.status =
+                    LiftAxisStatus::unavailable(format!("cannot start the lift-axis link: {error}"))
+            }
+        }
+        lift
+    }
+
+    fn reconnect(&self) {
+        if let Some((handle, _)) = &self.link {
+            handle.reconnect();
+        }
+    }
+
+    /// Fold one link event in; true when a snapshot should be published.
+    fn apply(&mut self, event: LinkEvent) -> bool {
+        match event {
+            LinkEvent::Status(LinkStatus {
+                epoch,
+                phase,
+                blockers,
+                discovery,
+                unmatched_replies,
+            }) => {
+                // A sample never outlives its connection on screen.
+                if epoch != self.status.epoch || phase == LinkPhase::Disconnected {
+                    self.latest = None;
+                }
+                self.status = LiftAxisStatus {
+                    epoch,
+                    phase,
+                    blockers,
+                    discovery,
+                    telemetry: None,
+                    unmatched_replies,
+                };
+                true
+            }
+            LinkEvent::Telemetry(sample) => {
+                // Published by `refresh_due` at most four times a second.
+                self.latest = Some(sample);
+                false
+            }
+            LinkEvent::CommandResult { .. } => false,
+        }
+    }
+
+    /// How long the controller may wait before the next refresh, if a sample is shown.
+    fn refresh_wait(&self, now: Instant) -> Option<Duration> {
+        self.latest.as_ref()?;
+        Some(self.last_publish.map_or(Duration::ZERO, |last| {
+            TELEMETRY_PUBLISH_INTERVAL.saturating_sub(now.saturating_duration_since(last))
+        }))
+    }
+
+    /// A sample is shown and the last snapshot is at least 250 ms old.
+    fn refresh_due(&self, now: Instant) -> bool {
+        self.refresh_wait(now).is_some_and(|wait| wait.is_zero())
+    }
+
+    fn status(&mut self, now: Instant) -> LiftAxisStatus {
+        self.last_publish = Some(now);
+        let mut status = self.status.clone();
+        status.telemetry = self
+            .latest
+            .as_ref()
+            .filter(|sample| sample.epoch() == status.epoch)
+            .map(|sample| TelemetrySummary {
+                values: sample.display_values().clone(),
+                age_ms: sample.age(now).as_millis() as u64,
+                fresh: sample.fresh_values(now).is_some(),
+                cycle_ms: sample.cycle_duration().as_millis() as u64,
+            });
+        status
+    }
 }
 
 fn capture_preview(
@@ -447,7 +681,7 @@ mod tests {
 
     use super::{
         capture_preview, CaptureStatus, ControllerClosed, ControllerSnapshot, LatestSnapshot,
-        MachineScreen, RecvTimeoutError, TryRecvError,
+        LiftAxisStatus, MachineScreen, RecvTimeoutError, ScanReadiness, TryRecvError,
     };
     use crate::{CameraRole, CapturePair, CapturedFrame, CropGeometry};
 
@@ -483,12 +717,16 @@ mod tests {
             .send(ControllerSnapshot {
                 revision: 1,
                 screen: capture_preview(CaptureStatus::Ready, Some(first)),
+                lift_axis: LiftAxisStatus::starting(),
+                scan_readiness: ScanReadiness::current(),
             })
             .unwrap();
         let latest = pair(2);
         let expected = ControllerSnapshot {
             revision: 2,
             screen: capture_preview(CaptureStatus::Ready, Some(latest)),
+            lift_axis: LiftAxisStatus::starting(),
+            scan_readiness: ScanReadiness::current(),
         };
         snapshots.send(expected.clone()).unwrap();
 
@@ -509,6 +747,8 @@ mod tests {
         let exited = ControllerSnapshot {
             revision: 3,
             screen: MachineScreen::Exited,
+            lift_axis: LiftAxisStatus::starting(),
+            scan_readiness: ScanReadiness::current(),
         };
         snapshots.send(exited.clone()).unwrap();
         snapshots.close();

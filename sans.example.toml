@@ -2,12 +2,41 @@
 # Copy this file to the normal config path or let Sans generate it there.
 # Every <...> value and zero page-width bound must be commissioned before use.
 
-schema_version = 1
+schema_version = 2
 data_root = "scans"
 
 [boards]
-ligature_path = "<set-stable-ligature-device-path>"
 monospace_path = "<set-stable-monospace-device-path>"
+
+[odrive]
+# MKS ODrive Mini lift axis over native Fibre USB (1209:0d32).
+# usb_serial is the USB serial-number string in hex, as shown by `lsusb -v`
+# or on the Sans lift-axis panel after a connection attempt.
+usb_serial = "<set-odrive-usb-serial-hex>"
+axis = 0
+# Provisional, unmeasured timing values inside immutable bounds; #60 reviews them.
+# poll 5-100 ms; max age >= 2x poll and <= 250 ms; request 1-250 ms;
+# urgent 1-100 ms and not above the request deadline.
+poll_interval_ms = 20
+telemetry_max_age_ms = 100
+request_deadline_ms = 100
+urgent_deadline_ms = 50
+
+# The lift axis stays blocked until this table is commissioned. Sans never
+# substitutes a default mechanism value. Limits are bounded by software policy
+# caps of 4.8 A, 1 motor turn per second and 1 motor turn per second squared.
+# Those caps are arbitrary conservative host policy, not measured or physically
+# qualified limits; #60 reviews them. Commissioning does not enable scanning.
+#
+# [odrive.lift_axis]
+# direction = "<normal-or-reversed>"
+# mm_per_turn = <positive>
+# travel_minimum_mm = <lower-soft-bound>
+# travel_maximum_mm = <upper-soft-bound>
+# current_limit_a = <at-most-4.8>
+# velocity_limit_mm_s = <at-most-1-turn-per-second>
+# acceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
+# deceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
 
 [cameras.left]
 identity = "<set-/dev/v4l/by-id-or-by-path-identity>"

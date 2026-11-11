@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -41,6 +43,10 @@ struct RecordingFactory {
 impl MachineFactory for RecordingFactory {
     type Machine = NoCaptureMachine;
 
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
+
     fn open(
         self,
         _profile: &PreparedMachineProfile,
@@ -58,6 +64,10 @@ struct NonSendMachineFactory;
 
 impl MachineFactory for NonSendMachineFactory {
     type Machine = NonSendMachine;
+
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
 
     fn open(
         self,
@@ -123,6 +133,10 @@ impl ControllerMachine for PollingMachine {
 impl MachineFactory for PollingFactory {
     type Machine = PollingMachine;
 
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
+
     fn open(
         self,
         _profile: &PreparedMachineProfile,
@@ -176,9 +190,13 @@ fn assert_polling_controller_blocks(
     failure: &str,
 ) {
     fault_sender.send(SetupBlocker::new(failure)).unwrap();
-    let blocked = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    // Lift-axis status snapshots keep the Ready screen; wait for the Setup change.
+    let blocked = support::recv_until(controller, |snapshot| {
+        !matches!(
+            snapshot.screen,
+            MachineScreen::Setup(SetupState::Ready { .. })
+        )
+    });
     assert_eq!(
         blocked.screen,
         MachineScreen::Setup(SetupState::Blocked {
@@ -190,6 +208,10 @@ fn assert_polling_controller_blocks(
 impl MachineFactory for PanickingFactory {
     type Machine = NoCaptureMachine;
 
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
+
     fn open(
         self,
         _profile: &PreparedMachineProfile,
@@ -200,6 +222,10 @@ impl MachineFactory for PanickingFactory {
 
 impl MachineFactory for BlockingDropFactory {
     type Machine = BlockingDropMachine;
+
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
 
     fn open(
         self,
@@ -218,6 +244,10 @@ impl MachineFactory for BlockingDropFactory {
 impl MachineFactory for BlockingFactory {
     type Machine = NoCaptureMachine;
 
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
+
     fn open(
         self,
         _profile: &PreparedMachineProfile,
@@ -234,7 +264,7 @@ fn invalid_profile_never_invokes_the_machine_factory() {
     let profile_path = temp.path().join("sans.toml");
     fs::write(
         &profile_path,
-        VALID_PROFILE.replace("schema_version = 1", "schema_version = 2"),
+        VALID_PROFILE.replace("schema_version = 2", "schema_version = 3"),
     )
     .unwrap();
     let open_threads = Arc::new(Mutex::new(Vec::new()));
@@ -258,7 +288,7 @@ fn typed_intent_drives_fake_backed_controller_thread_end_to_end() {
     let open_threads = Arc::new(Mutex::new(Vec::new()));
     let factory = RecordingFactory {
         open_threads: Arc::clone(&open_threads),
-        result: Err(vec![SetupBlocker::new("Ligature is not connected")]),
+        result: Err(vec![SetupBlocker::new("Left Camera is not connected")]),
     };
 
     let controller = bootstrap(Some(&profile_path), factory).unwrap();
@@ -269,7 +299,7 @@ fn typed_intent_drives_fake_backed_controller_thread_end_to_end() {
     assert_eq!(
         setup.screen,
         MachineScreen::Setup(SetupState::Blocked {
-            reasons: vec![SetupBlocker::new("Ligature is not connected")]
+            reasons: vec![SetupBlocker::new("Left Camera is not connected")]
         })
     );
     let opened_on = open_threads.lock().unwrap().clone();
@@ -278,9 +308,9 @@ fn typed_intent_drives_fake_backed_controller_thread_end_to_end() {
     assert_eq!(opened_on[0].1.as_deref(), Some("sans-controller"));
 
     controller.send(ControllerIntent::Exit).unwrap();
-    let exited = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let exited = support::recv_until(&controller, |snapshot| {
+        snapshot.screen == MachineScreen::Exited
+    });
     assert_eq!(exited.screen, MachineScreen::Exited);
 }
 
@@ -418,9 +448,9 @@ fn controller_rejects_intents_after_exit_is_accepted() {
         controller.send(ControllerIntent::CapturePair),
         Err(ControllerClosed)
     );
-    let exited = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let exited = support::recv_until(&controller, |snapshot| {
+        snapshot.screen == MachineScreen::Exited
+    });
     assert_eq!(exited.screen, MachineScreen::Exited);
     drop_started_receiver
         .recv_timeout(Duration::from_secs(1))

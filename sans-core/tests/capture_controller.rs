@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
@@ -50,6 +52,10 @@ impl ControllerMachine for FixtureMachine {
 
 impl MachineFactory for FixtureFactory {
     type Machine = FixtureMachine;
+
+    fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
+        Box::new(support::fake_fibre::FakeOpener::absent())
+    }
 
     fn open(
         self,
@@ -147,9 +153,7 @@ fn start_controller(
 }
 
 fn expect_ready(controller: &sans_core::ControllerHandle) {
-    let ready = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let ready = support::recv_until(controller, |_| true);
     assert!(matches!(
         ready.screen,
         MachineScreen::Setup(SetupState::Ready { ref diagnostics }) if diagnostics.is_empty()
@@ -161,17 +165,20 @@ fn capture_snapshots(
     release: &mpsc::Sender<()>,
 ) -> (sans_core::ControllerSnapshot, sans_core::ControllerSnapshot) {
     controller.send(ControllerIntent::CapturePair).unwrap();
-    let capturing = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
-    assert!(matches!(
-        capturing.screen,
-        MachineScreen::CapturePreview(ref preview) if preview.status == CaptureStatus::Capturing
-    ));
+    // Lift-axis snapshots repeat the current screen; wait for the capture ones.
+    let capturing = support::recv_until(controller, |snapshot| {
+        matches!(
+            snapshot.screen,
+            MachineScreen::CapturePreview(ref preview) if preview.status == CaptureStatus::Capturing
+        )
+    });
     release.send(()).unwrap();
-    let captured = controller
-        .recv_snapshot_timeout(Duration::from_secs(1))
-        .unwrap();
+    let captured = support::recv_until(controller, |snapshot| {
+        !matches!(
+            snapshot.screen,
+            MachineScreen::CapturePreview(ref preview) if preview.status == CaptureStatus::Capturing
+        )
+    });
     (capturing, captured)
 }
 

@@ -1,9 +1,16 @@
-schema_version = 1
+schema_version = 2
 data_root = "scan-data"
 
 [boards]
-ligature_path = "/dev/serial/by-id/ligature"
 monospace_path = "/dev/serial/by-id/monospace"
+
+[odrive]
+usb_serial = "316536713335"
+axis = 0
+poll_interval_ms = 20
+telemetry_max_age_ms = 100
+request_deadline_ms = 100
+urgent_deadline_ms = 50
 
 [cameras.left]
 identity = "/dev/v4l/by-id/left-camera"

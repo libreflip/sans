@@ -59,6 +59,10 @@ pub fn capture_configured_camera(
 impl MachineFactory for V4lCameraMachineFactory {
     type Machine = CapturePairMachine;
 
+    fn odrive_opener(&mut self) -> Box<dyn crate::FibreOpener> {
+        Box::new(crate::UsbFibreOpener)
+    }
+
     fn open(
         self,
         prepared: &PreparedMachineProfile,
