@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -237,9 +237,16 @@ impl FakeFibre {
         // The pinned dispatcher caps the reply at its 32-byte TX buffer.
         let limit = usize::from(expected).min(30);
         let output = if endpoint == 0 {
-            let offset = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
-            let end = (offset + limit).min(self.descriptor.len());
-            self.descriptor.get(offset..end).unwrap_or(&[]).to_vec()
+            // Like the pinned `endpoint0_handler`, a missing offset yields an
+            // empty reply rather than a dropped request.
+            match payload.get(..4) {
+                Some(offset) => {
+                    let offset = u32::from_le_bytes(offset.try_into().unwrap()) as usize;
+                    let end = (offset + limit).min(self.descriptor.len());
+                    self.descriptor.get(offset..end).unwrap_or(&[]).to_vec()
+                }
+                None => Vec::new(),
+            }
         } else if self.functions.contains(&endpoint) {
             self.writes.push((endpoint, payload));
             Vec::new()
@@ -337,6 +344,8 @@ pub struct FakeOpener {
     pub usb_serials: Arc<Mutex<Vec<String>>>,
     /// Set to cut the current connection.
     pub cut: Arc<Mutex<bool>>,
+    /// When `true`, each open returns a connection whose cable is already cut.
+    pub cut_on_open: Arc<AtomicBool>,
     pub opens: Arc<Mutex<usize>>,
     /// While `true`, the writer holds the packet it was given and does not
     /// deliver it; `writes_held` counts packets held so far.
@@ -406,6 +415,7 @@ impl FakeOpener {
             board: Arc::new(Mutex::new(board)),
             usb_serials: Arc::new(Mutex::new(vec!["316536713335".into()])),
             cut: Arc::new(Mutex::new(false)),
+            cut_on_open: Arc::new(AtomicBool::new(false)),
             opens: Arc::new(Mutex::new(0)),
             write_gate: Arc::new((Mutex::new(false), Condvar::new())),
             writes_held: Arc::new(AtomicUsize::new(0)),
@@ -465,7 +475,7 @@ impl FibreOpener for FakeOpener {
                 held = wake.wait(held).unwrap();
             }
         }
-        *self.cut.lock().unwrap() = false;
+        *self.cut.lock().unwrap() = self.cut_on_open.load(Ordering::SeqCst);
         *self.opens.lock().unwrap() += 1;
         let (replies, inbox) = mpsc::channel();
         Ok(FibreConnection {
@@ -537,6 +547,8 @@ struct FakeWriter {
 }
 
 impl PacketWriter for FakeWriter {
+    /// The write gate ignores `timeout` on purpose: it models a packet already
+    /// handed to USB, which no host-side deadline can recall.
     fn write_packet(&mut self, packet: &[u8], _timeout: Duration) -> Result<(), String> {
         {
             let (blocked, wake) = &*self.gate;
@@ -554,6 +566,11 @@ impl PacketWriter for FakeWriter {
         if let Some(reply) = self.board.lock().unwrap().handle(packet) {
             let _ = self.replies.send(reply);
         }
+        Ok(())
+    }
+
+    fn shutdown(&mut self, _bound: Duration) -> Result<(), String> {
+        // The fake writer never leaves a transfer pending.
         Ok(())
     }
 }

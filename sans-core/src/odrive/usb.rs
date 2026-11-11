@@ -170,6 +170,10 @@ struct UsbReader {
 impl PacketReader for UsbReader {
     fn read_packet(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, String> {
         // Keep one IN transfer pending across timeouts so no reply is lost.
+        // One full-speed packet (64 bytes) holds any reply: the firmware's
+        // `protocol.hpp` has `TX_BUF_SIZE = 32` and `protocol.cpp` clamps
+        // `expected_response_length` to `sizeof(tx_buf_) - 2`. A larger buffer
+        // would let one transfer span several replies.
         if self.endpoint.pending() == 0 {
             let length = self.endpoint.max_packet_size();
             self.endpoint.submit(Buffer::new(length));

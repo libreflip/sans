@@ -171,11 +171,12 @@ fn show_controller(
         // Keep draining snapshots so live connection faults reach the screen.
         context.request_repaint_after(Duration::from_millis(16));
     }
-    // The lift-axis status changes without operator input on every screen.
+    // The lift-axis status changes without operator input on every screen,
+    // including before its first status or sample arrives.
     let lift_axis = snapshot.map(|snapshot| &snapshot.lift_axis);
     if lift_axis.is_some_and(|status| status.phase == LinkPhase::Connecting) {
         context.request_repaint_after(Duration::from_millis(100));
-    } else if lift_axis.is_some_and(|status| status.telemetry.is_some()) {
+    } else if lift_axis.is_some() {
         context.request_repaint_after(Duration::from_millis(250));
     }
     // Shown on the Setup screens only: the four preview views must fit and

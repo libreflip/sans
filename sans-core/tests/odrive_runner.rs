@@ -34,20 +34,20 @@ fn config() -> LinkConfig {
 }
 
 fn config_with_open_ms(device_open_ms: u64) -> LinkConfig {
-    let profile = format!("{VALID_PROFILE}{LIFT_AXIS}")
-        .replacen("poll_interval_ms = 20", "poll_interval_ms = 100", 1)
-        .replacen(
-            "telemetry_max_age_ms = 100",
-            "telemetry_max_age_ms = 250",
-            1,
-        )
-        .replacen("request_deadline_ms = 100", "request_deadline_ms = 250", 1)
-        .replacen("urgent_deadline_ms = 50", "urgent_deadline_ms = 100", 1)
-        .replacen(
-            "device_open_ms = 5000",
-            &format!("device_open_ms = {device_open_ms}"),
-            1,
-        );
+    let device_open = format!("device_open_ms = {device_open_ms}");
+    let profile = [
+        ("poll_interval_ms = 20", "poll_interval_ms = 100"),
+        ("telemetry_max_age_ms = 100", "telemetry_max_age_ms = 250"),
+        ("request_deadline_ms = 100", "request_deadline_ms = 250"),
+        ("urgent_deadline_ms = 50", "urgent_deadline_ms = 100"),
+        ("device_open_ms = 5000", device_open.as_str()),
+    ]
+    .iter()
+    .fold(format!("{VALID_PROFILE}{LIFT_AXIS}"), |text, (from, to)| {
+        let replaced = text.replacen(from, to, 1);
+        assert_ne!(replaced, text, "fixture no longer contains {from:?}");
+        replaced
+    });
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("sans.toml");
     fs::write(&path, profile).unwrap();
@@ -92,6 +92,34 @@ impl Link {
         }
     }
 
+    fn submit(&self, command: LinkCommand, priority: Priority) -> Ticket {
+        self.handle
+            .submit(command, priority)
+            .expect("the link is open")
+    }
+
+    /// Arm, then hold an urgent ClearErrors in the writer so later packets
+    /// queue behind it. Returns the ClearErrors ticket.
+    fn stall_writer(&mut self, opener: &FakeOpener) -> Ticket {
+        self.wait_for_phase(1, LinkPhase::Verified);
+        let arm = self.submit(LinkCommand::Arm, Priority::Ordinary);
+        assert_eq!(self.result(arm), CommandResult::Completed);
+        // Act right after a sample so the ordinary slot is free.
+        self.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
+        opener.block_writes();
+        let held = opener.writes_held.load(Ordering::SeqCst);
+        let clear = self.submit(LinkCommand::ClearErrors, Priority::Urgent);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while opener.writes_held.load(Ordering::SeqCst) == held {
+            assert!(
+                Instant::now() < deadline,
+                "the writer never picked up the urgent packet"
+            );
+            std::thread::yield_now();
+        }
+        clear
+    }
+
     fn wait_for_phase(&mut self, epoch: u64, phase: LinkPhase) {
         self.wait_for(|event| {
             matches!(event, LinkEvent::Status(status) if status.epoch == epoch && status.phase == phase)
@@ -121,32 +149,13 @@ impl Link {
 fn urgent_disarm_withdraws_a_move_still_waiting_in_the_writer() {
     let opener = FakeOpener::new(FakeFibre::compatible());
     let mut link = Link::start(&opener);
-    link.wait_for_phase(1, LinkPhase::Verified);
-    let arm = link.handle.submit(LinkCommand::Arm, Priority::Ordinary);
-    assert_eq!(link.result(arm), CommandResult::Completed);
-    // Act right after a sample so the ordinary slot is free for the move.
-    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
-
-    opener.block_writes();
-    // An urgent packet occupies the writer, which holds it undelivered.
-    let held = opener.writes_held.load(Ordering::SeqCst);
-    let clear = link
-        .handle
-        .submit(LinkCommand::ClearErrors, Priority::Urgent);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while opener.writes_held.load(Ordering::SeqCst) == held {
-        assert!(
-            Instant::now() < deadline,
-            "the writer never picked up the urgent packet"
-        );
-        std::thread::yield_now();
-    }
+    let clear = link.stall_writer(&opener);
     // The move's write now waits in the writer queue behind the held packet.
-    let movement = link.handle.submit(
+    let movement = link.submit(
         LinkCommand::MoveAbsolute { position_mm: 40.0 },
         Priority::Ordinary,
     );
-    let disarm = link.handle.submit(LinkCommand::Disarm, Priority::Urgent);
+    let disarm = link.submit(LinkCommand::Disarm, Priority::Urgent);
     let move_result = link.result(movement);
     opener.release_writes();
 
@@ -193,25 +202,8 @@ fn ended_connection_leaves_no_fresh_sample_behind() {
 fn move_stuck_in_the_writer_past_its_deadline_never_reaches_the_board() {
     let opener = FakeOpener::new(FakeFibre::compatible());
     let mut link = Link::start(&opener);
-    link.wait_for_phase(1, LinkPhase::Verified);
-    let arm = link.handle.submit(LinkCommand::Arm, Priority::Ordinary);
-    assert_eq!(link.result(arm), CommandResult::Completed);
-    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
-
-    opener.block_writes();
-    let held = opener.writes_held.load(Ordering::SeqCst);
-    let clear = link
-        .handle
-        .submit(LinkCommand::ClearErrors, Priority::Urgent);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while opener.writes_held.load(Ordering::SeqCst) == held {
-        assert!(
-            Instant::now() < deadline,
-            "the writer never picked up the urgent packet"
-        );
-        std::thread::yield_now();
-    }
-    let movement = link.handle.submit(
+    let clear = link.stall_writer(&opener);
+    let movement = link.submit(
         LinkCommand::MoveAbsolute { position_mm: 40.0 },
         Priority::Ordinary,
     );
@@ -229,7 +221,7 @@ fn move_stuck_in_the_writer_past_its_deadline_never_reaches_the_board() {
         CommandResult::OutcomeUnknown { .. }
     ));
     // Disarm stays possible on the faulted link.
-    let disarm = link.handle.submit(LinkCommand::Disarm, Priority::Urgent);
+    let disarm = link.submit(LinkCommand::Disarm, Priority::Urgent);
     assert_eq!(link.result(disarm), CommandResult::Completed);
     let board = opener.board.lock().unwrap();
     assert!(
@@ -286,30 +278,13 @@ fn superseded_open_is_destroyed_before_the_next_open() {
 fn disarm_supersedes_an_urgent_move_still_waiting_in_the_writer() {
     let opener = FakeOpener::new(FakeFibre::compatible());
     let mut link = Link::start(&opener);
-    link.wait_for_phase(1, LinkPhase::Verified);
-    let arm = link.handle.submit(LinkCommand::Arm, Priority::Ordinary);
-    assert_eq!(link.result(arm), CommandResult::Completed);
-    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
-
-    opener.block_writes();
-    let held = opener.writes_held.load(Ordering::SeqCst);
-    let clear = link
-        .handle
-        .submit(LinkCommand::ClearErrors, Priority::Urgent);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while opener.writes_held.load(Ordering::SeqCst) == held {
-        assert!(
-            Instant::now() < deadline,
-            "the writer never picked up the urgent packet"
-        );
-        std::thread::yield_now();
-    }
+    let clear = link.stall_writer(&opener);
     // An urgent move queues behind the stuck packet, then a disarm follows.
-    let movement = link.handle.submit(
+    let movement = link.submit(
         LinkCommand::MoveAbsolute { position_mm: 40.0 },
         Priority::Urgent,
     );
-    let disarm = link.handle.submit(LinkCommand::Disarm, Priority::Urgent);
+    let disarm = link.submit(LinkCommand::Disarm, Priority::Urgent);
     let move_result = link.result(movement);
     opener.release_writes();
 
@@ -369,4 +344,53 @@ fn release_barrier_survives_an_attempt_that_gave_up_waiting() {
     });
     assert_eq!(opener.busy_refusals.load(Ordering::SeqCst), 0);
     assert_eq!(*opener.opens.lock().unwrap(), 2);
+}
+
+#[test]
+fn read_failure_while_draining_fails_the_open_and_releases_the_device() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    opener.cut_on_open.store(true, Ordering::SeqCst);
+    let mut link = Link::start(&opener);
+    let LinkEvent::Status(status) = link.wait_for(|event| {
+        matches!(event, LinkEvent::Status(status)
+            if status.blockers.iter().any(|blocker| blocker.contains("fake cable cut")))
+    }) else {
+        unreachable!()
+    };
+    assert_eq!(status.epoch, 1);
+    assert!(
+        status.discovery.is_none(),
+        "the gate must not start on a connection whose drain failed"
+    );
+    let deadline = Instant::now() + GATE_WAIT;
+    while opener.claimed.load(Ordering::SeqCst) != 0 {
+        assert!(Instant::now() < deadline, "the failed open kept the device");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn stopped_runner_rejects_commands_and_leaves_no_fresh_sample() {
+    let opener = FakeOpener::new(FakeFibre::compatible());
+    let mut link = Link::start(&opener);
+    link.wait_for_phase(1, LinkPhase::Verified);
+    link.wait_for(|event| matches!(event, LinkEvent::Telemetry(_)));
+    assert!(link.handle.fresh_sample(Instant::now()).is_some());
+
+    drop(link._runner);
+
+    let deadline = Instant::now() + GATE_WAIT;
+    while link
+        .handle
+        .submit(LinkCommand::Disarm, Priority::Urgent)
+        .is_ok()
+    {
+        assert!(Instant::now() < deadline, "the runner never stopped");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        link.handle.submit(LinkCommand::Disarm, Priority::Urgent),
+        Err(sans_core::LinkClosed)
+    );
+    assert!(link.handle.fresh_sample(Instant::now()).is_none());
 }

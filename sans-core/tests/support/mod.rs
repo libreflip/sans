@@ -33,6 +33,9 @@ pub fn recv_within(
     let mut last = None;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!("no matching snapshot before the deadline; last was {last:#?}");
+        }
         match controller.recv_snapshot_timeout(remaining) {
             Ok(snapshot) if predicate(&snapshot) => return snapshot,
             Ok(snapshot) => last = Some(snapshot),

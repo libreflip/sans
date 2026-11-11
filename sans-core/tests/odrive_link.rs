@@ -1614,10 +1614,17 @@ fn ordinary_disarm_supersedes_unsent_urgent_energizing_writes() {
         Some(CommandResult::Retired { transmitted: false })
     );
     assert!(!held.claim_for_send(link.now));
-    assert!(sent
-        .iter()
-        .all(|(_, request, _)| request.endpoint != INPUT_POS));
-    drop(read);
+    assert!(
+        sent.is_empty(),
+        "the ordinary disarm waits for the held read"
+    );
+    let reply = link.board.handle(&read).unwrap();
+    link.engine.receive(link.now, &reply);
+    link.exchange();
+    link.run_for(5);
+    assert_eq!(link.result(2), Some(CommandResult::Completed));
+    assert_eq!(link.board.requested_states(), vec![1, 8, 1]);
+    assert!(link.board.writes_to(INPUT_POS).is_empty());
 }
 
 #[test]

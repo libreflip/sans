@@ -33,7 +33,7 @@ pub use crate::hardware::{
 };
 pub use crate::odrive::{
     spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,
-    LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkHandle, LinkPhase, LinkRunner, LinkStatus,
-    OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample, TelemetryValues, Ticket,
-    Transmit, UsbFibreOpener,
+    LinkClosed, LinkCommand, LinkConfig, LinkEngine, LinkEvent, LinkHandle, LinkPhase, LinkRunner,
+    LinkStatus, OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample,
+    TelemetryValues, Ticket, Transmit, UsbFibreOpener,
 };

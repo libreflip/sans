@@ -2770,7 +2770,6 @@ dependencies = [
  "clap",
  "csv",
  "image",
- "log",
  "nusb",
  "rscam",
  "serde",

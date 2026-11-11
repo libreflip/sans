@@ -14,6 +14,6 @@ pub use self::engine::{
     AxisState, CommandResult, DiscoveryRecord, LinkCommand, LinkConfig, LinkEngine, LinkEvent,
     LinkPhase, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket, Transmit,
 };
-pub use self::runner::{spawn_link, LinkHandle, LinkRunner};
+pub use self::runner::{spawn_link, LinkClosed, LinkHandle, LinkRunner};
 pub use self::transport::{FibreConnection, FibreOpener, OpenRequest, PacketReader, PacketWriter};
 pub use self::usb::UsbFibreOpener;

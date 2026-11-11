@@ -57,12 +57,19 @@ pub struct LinkHandle {
     shared: Arc<Mutex<Shared>>,
 }
 
+/// The link's engine thread has stopped, so nothing more can be queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("the lift-axis link is closed")]
+pub struct LinkClosed;
+
 impl LinkHandle {
     /// Queue a typed command and return its ticket at once.
-    pub fn submit(&self, command: LinkCommand, priority: Priority) -> Ticket {
+    pub fn submit(&self, command: LinkCommand, priority: Priority) -> Result<Ticket, LinkClosed> {
         let ticket = Ticket(self.tickets.fetch_add(1, Ordering::Relaxed));
-        let _ = self.inputs.send(Input::Submit(ticket, command, priority));
-        ticket
+        self.inputs
+            .send(Input::Submit(ticket, command, priority))
+            .map_err(|_| LinkClosed)?;
+        Ok(ticket)
     }
 
     /// End the current epoch and start one new connection attempt.
@@ -153,6 +160,10 @@ const RELEASE_SLICE: Duration = Duration::from_millis(100);
 struct ReleaseBarrier {
     live: Mutex<usize>,
     released: Condvar,
+    /// Halves whose release is not yet proven. The reaper and every later
+    /// [`ReleaseBarrier::wait`] retry them, so a reaper that cannot start
+    /// delays the next open instead of stranding the barrier.
+    held: Mutex<Vec<Box<dyn DeviceHalf>>>,
 }
 
 impl ReleaseBarrier {
@@ -160,7 +171,32 @@ impl ReleaseBarrier {
         Arc::new(Self {
             live: Mutex::new(0),
             released: Condvar::new(),
+            held: Mutex::new(Vec::new()),
         })
+    }
+
+    fn hold(&self, half: Box<dyn DeviceHalf>) {
+        self.held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(half);
+    }
+
+    /// Retry each held half once, counting those proven released. True when
+    /// none remain held.
+    fn reap_held(&self) -> bool {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut still_held = Vec::new();
+        for mut half in held.drain(..) {
+            if half.shutdown(RELEASE_SLICE).is_ok() {
+                drop(half);
+                self.half_released();
+            } else {
+                still_held.push(half);
+            }
+        }
+        *held = still_held;
+        held.is_empty()
     }
 
     fn register_connection(&self) {
@@ -175,6 +211,7 @@ impl ReleaseBarrier {
 
     /// Wait at most `bound` for every half to be released.
     fn wait(&self, bound: Duration) -> bool {
+        self.reap_held();
         let live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         let (live, _) = self
             .released
@@ -203,8 +240,9 @@ impl DeviceHalf for Box<dyn PacketWriter> {
 
 /// Owns one half for its I/O thread. On every exit it shuts the half down and
 /// drops it before counting it released. If shutdown cannot prove release
-/// within [`RELEASE_SLICE`], a background reaper keeps trying and only then
-/// counts it; release is never reported early.
+/// within [`RELEASE_SLICE`], the barrier keeps the half; a background reaper
+/// and every later wait retry it and only then count it. Release is never
+/// reported early.
 struct ReleaseOnExit<T: DeviceHalf> {
     half: Option<T>,
     barrier: Arc<ReleaseBarrier>,
@@ -228,23 +266,24 @@ impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
         let Some(mut half) = self.half.take() else {
             return;
         };
-        if half.shutdown(RELEASE_SLICE).is_ok() {
+        if let Err(reason) = half.shutdown(RELEASE_SLICE) {
+            eprintln!("ODrive transport still held, retrying its release: {reason}");
+        } else {
             drop(half);
             self.barrier.half_released();
             return;
         }
+        self.barrier.hold(Box::new(half));
         let barrier = Arc::clone(&self.barrier);
         let reaper = thread::Builder::new()
             .name("sans-odrive-reap".into())
             .spawn(move || {
-                while let Err(reason) = half.shutdown(RELEASE_SLICE) {
-                    log::warn!("ODrive transport still held: {reason}");
+                while !barrier.reap_held() {
+                    thread::sleep(RELEASE_SLICE);
                 }
-                drop(half);
-                barrier.half_released();
             });
         if reaper.is_err() {
-            log::error!("cannot start the ODrive release reaper; the device stays claimed");
+            eprintln!("cannot start the ODrive release reaper; the next connection attempt retries the release");
         }
     }
 }
@@ -343,6 +382,9 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
         }
         self.attempt_epoch.store(0, Ordering::SeqCst);
         self.close_transport();
+        // A retained handle must not keep reading the last sample as fresh.
+        let mut shared = self.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.ended = true;
     }
 
     fn is_current(&self, epoch: u64) -> bool {
@@ -386,10 +428,12 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
                 if attempt_epoch.load(Ordering::SeqCst) != epoch {
                     return;
                 }
-                let result = opener.open(&request).map(|connection| {
+                let result = opener.open(&request).and_then(|connection| {
+                    // A read failure while draining fails the open; the guard
+                    // still releases the device.
                     let mut connection = GuardedConnection::new(connection, &release);
-                    drain(connection.reader.half().as_mut());
-                    connection
+                    drain(connection.reader.half().as_mut())?;
+                    Ok(connection)
                 });
                 let (accepted, acknowledgement) = mpsc::channel();
                 if loopback
@@ -505,13 +549,14 @@ impl<E: From<LinkEvent> + Send + 'static> EngineThread<E> {
     }
 }
 
-fn drain(reader: &mut dyn PacketReader) {
+/// Discard packets already waiting on the IN endpoint before the gate sends.
+fn drain(reader: &mut dyn PacketReader) -> Result<(), String> {
     for _ in 0..DRAIN_LIMIT {
-        match reader.read_packet(DRAIN_SLICE) {
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => return,
+        if reader.read_packet(DRAIN_SLICE)?.is_none() {
+            break;
         }
     }
+    Ok(())
 }
 
 fn spawn_reader(
@@ -629,4 +674,39 @@ fn spawn_writer(
             }
         })
         .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fails its first `failures` shutdowns, then proves release.
+    struct SlowHalf {
+        failures: usize,
+    }
+
+    impl DeviceHalf for SlowHalf {
+        fn shutdown(&mut self, _bound: Duration) -> Result<(), String> {
+            if self.failures == 0 {
+                return Ok(());
+            }
+            self.failures -= 1;
+            Err("transfer still pending".into())
+        }
+    }
+
+    #[test]
+    fn held_half_is_retried_by_the_next_wait_when_no_reaper_runs() {
+        let barrier = ReleaseBarrier::new();
+        barrier.register_connection();
+        barrier.half_released();
+        // As if the reaper thread could not start: only the barrier holds it.
+        barrier.hold(Box::new(SlowHalf { failures: 1 }));
+
+        assert!(
+            !barrier.wait(Duration::ZERO),
+            "release is not reported early"
+        );
+        assert!(barrier.wait(Duration::ZERO), "the next attempt reaps it");
+    }
 }

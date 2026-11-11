@@ -48,12 +48,16 @@ def whole(v):
     return "[" + ",".join(emit(m, v) for m in ms) + "]"
 
 target = 39744
+matched = False
 for fn in (0,):
     for order in (["name","id","type","access"],):
         s = whole({"prop": order, "fn": fn}).encode()
         for init in (1, 0x1337, 0):
             for tail in (b"", b"\0"):
                 c = crc16(s + tail, init)
+                matched |= c == target
                 print(fn, order, init, tail, len(s), c, c == target)
+if not matched:
+    sys.exit("no reconstruction matches descriptor CRC %d; recon.json not written" % target)
 open("recon.json","wb").write(whole({"prop":["name","id","type","access"],"fn":0}).encode())
 print(whole({"prop":["name","id","type","access"],"fn":0})[:400])

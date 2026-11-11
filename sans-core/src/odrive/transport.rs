@@ -27,6 +27,12 @@ pub struct FibreConnection {
 /// profile's USB serial.
 ///
 /// Missing and duplicate matches are errors with an operator-facing reason.
+///
+/// `open` must return promptly. The runner cannot cancel it: it runs on its own
+/// thread, the engine reports an attempt that outlasts the gate deadline as
+/// blocked, and a later attempt waits for this one to return. The `nusb` open
+/// on Linux issues no USB transfers; it reads sysfs and the kernel's cached
+/// descriptors and claims the interface.
 pub trait FibreOpener: Send + 'static {
     /// Open and claim the device. Implementations discard nothing; the runner
     /// drains packets already waiting before the engine sends anything.
@@ -41,11 +47,9 @@ pub trait PacketReader: Send + 'static {
     /// Cancel anything still pending and wait at most `bound` until this half
     /// holds nothing that keeps the device claimed. `Ok` is proof that dropping
     /// the half releases its share of the device at once; `Err` means it may
-    /// still be held, and the caller must not report it released.
-    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
-        let _ = bound;
-        Ok(())
-    }
+    /// still be held, and the caller must not report it released. There is no
+    /// default: every transport must prove its own release.
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String>;
 }
 
 /// The sending half of a packet transport.
@@ -54,8 +58,5 @@ pub trait PacketWriter: Send + 'static {
     fn write_packet(&mut self, packet: &[u8], timeout: Duration) -> Result<(), String>;
 
     /// As [`PacketReader::shutdown`].
-    fn shutdown(&mut self, bound: Duration) -> Result<(), String> {
-        let _ = bound;
-        Ok(())
-    }
+    fn shutdown(&mut self, bound: Duration) -> Result<(), String>;
 }

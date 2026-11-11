@@ -594,6 +594,21 @@ enum GateStep {
     FirstCycle,
 }
 
+impl GateStep {
+    /// Short step name for diagnostics.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Opening => "Opening",
+            Self::Descriptor { .. } => "Descriptor",
+            Self::Identity { .. } => "Identity",
+            Self::IdleWrite => "IdleWrite",
+            Self::IdleRead { .. } => "IdleRead",
+            Self::Limit { .. } => "Limit",
+            Self::FirstCycle => "FirstCycle",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Confirm {
     /// Read `current_state` until it equals the value or the window closes.
@@ -1365,12 +1380,12 @@ impl LinkEngine {
             if !connection.usable() || connection.ordinary.is_some() {
                 return;
             }
-            if let Some(step) = connection.gate.clone() {
+            if let Some(step) = connection.gate.as_ref() {
                 if !matches!(step, GateStep::FirstCycle) {
-                    if matches!(step, GateStep::IdleRead { not_before } if now < not_before) {
+                    if matches!(step, GateStep::IdleRead { not_before } if now < *not_before) {
                         return;
                     }
-                    if let Some(spec) = self.gate_request(&step) {
+                    if let Some(spec) = self.gate_request(step) {
                         self.send_ordinary(now, spec, OrdinaryOwner::Gate);
                     }
                     return;
@@ -1752,7 +1767,7 @@ impl LinkEngine {
         self.unmatched_replies += 1;
         let count = self.unmatched_replies;
         if count <= 8 || count.is_power_of_two() {
-            log::warn!("ODrive link ignored {what} ({count} ignored so far)");
+            eprintln!("ODrive link ignored {what} ({count} ignored so far)");
         }
     }
 
@@ -1886,6 +1901,11 @@ impl LinkEngine {
         }
     }
 
+    /// Wait for the first sample started after `now` to confirm `op`.
+    ///
+    /// The urgent deadline bounds dispatch, not confirmation: an urgent clear
+    /// waits up to one poll interval plus the telemetry age limit like any
+    /// other command.
     fn await_sample(&mut self, now: Instant, op: Operation) {
         let until = now + self.config.poll_interval + self.config.max_age;
         if let Some(connection) = self.connection.as_mut() {
@@ -1949,24 +1969,29 @@ impl LinkEngine {
     }
 
     fn on_gate_reply(&mut self, now: Instant, reply: Reply) {
+        // Descriptor chunks append in place; cloning the growing buffer per
+        // chunk would make the download quadratic.
+        if let (Some(GateStep::Descriptor { buffer }), Reply::Chunk(chunk)) = (
+            self.connection.as_mut().and_then(|c| c.gate.as_mut()),
+            &reply,
+        ) {
+            if chunk.is_empty() {
+                let descriptor = std::mem::take(buffer);
+                self.finish_descriptor(&descriptor);
+                return;
+            }
+            buffer.extend_from_slice(chunk);
+            if buffer.len() > MAX_DESCRIPTOR_BYTES {
+                self.fail_gate(Some(format!(
+                    "descriptor exceeds {MAX_DESCRIPTOR_BYTES} bytes"
+                )));
+            }
+            return;
+        }
         let Some(step) = self.connection.as_ref().and_then(|c| c.gate.clone()) else {
             return;
         };
         match (step, reply) {
-            (GateStep::Descriptor { mut buffer }, Reply::Chunk(chunk)) => {
-                if chunk.is_empty() {
-                    self.finish_descriptor(&buffer);
-                    return;
-                }
-                buffer.extend_from_slice(&chunk);
-                if buffer.len() > MAX_DESCRIPTOR_BYTES {
-                    self.fail_gate(Some(format!(
-                        "descriptor exceeds {MAX_DESCRIPTOR_BYTES} bytes"
-                    )));
-                    return;
-                }
-                self.set_gate(GateStep::Descriptor { buffer });
-            }
             (GateStep::Identity { next, mut reads }, Reply::Value(value)) => {
                 if let Err(reason) = reads.record(IDENTITY_READS[next], value) {
                     self.fail_gate(Some(reason));
@@ -2228,11 +2253,10 @@ impl LinkEngine {
             .as_ref()
             .filter(|_| now >= connection.gate_until)
         {
-            let step = format!("{gate:?}");
-            let step = step.split([' ', '{']).next().unwrap_or("").to_owned();
             let reason = format!(
-                "connection gate did not finish within {} ms (stopped at {step})",
-                self.config.gate_deadline.as_millis()
+                "connection gate did not finish within {} ms (stopped at {})",
+                self.config.gate_deadline.as_millis(),
+                gate.name()
             );
             self.fail_gate(Some(reason));
         }
