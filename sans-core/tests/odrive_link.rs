@@ -26,6 +26,16 @@ current_limit_a = 4.0
 velocity_limit_mm_s = 6.0
 acceleration_limit_mm_s2 = 4.0
 deceleration_limit_mm_s2 = 2.0
+position_tolerance_mm = 0.5
+stationary_velocity_mm_s = 0.2
+move_timeout_ms = 2000
+home_timeout_ms = 3000
+cancel_timeout_ms = 1000
+touchdown_grace_ms = 100
+touchdown_dwell_ms = 100
+touchdown_no_progress_mm = 1.0
+touchdown_saturation_percent = 90.0
+touchdown_hold_depth_mm = 2.0
 "#;
 
 fn config_from(profile: &str) -> LinkConfig {
@@ -460,6 +470,35 @@ fn differing_limit_readback_blocks_the_lift_axis() {
         Some(CommandResult::Rejected { .. })
     ));
     assert_eq!(link.board.requested_states(), vec![1]);
+}
+
+#[test]
+fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_unsent() {
+    let mut link = verified(commissioned(), FakeFibre::compatible());
+    let gate_writes = link.board.writes_to(CURRENT_LIM).len();
+
+    link.submit(
+        1,
+        LinkCommand::SetCurrentLimit { amps: 2.0 },
+        Priority::Ordinary,
+    );
+    link.submit(
+        2,
+        LinkCommand::SetCurrentLimit { amps: 4.01 },
+        Priority::Ordinary,
+    );
+    link.run_for(5);
+
+    assert_eq!(link.result(1), Some(CommandResult::Completed));
+    assert!(
+        matches!(link.result(2), Some(CommandResult::Rejected { .. })),
+        "{:?}",
+        link.result(2)
+    );
+    let writes = link.board.writes_to(CURRENT_LIM);
+    assert_eq!(writes.len(), gate_writes + 1);
+    assert_eq!(writes.last().unwrap(), &2.0_f32.to_le_bytes().to_vec());
+    assert_eq!(link.board.f32_value(CURRENT_LIM), 2.0);
 }
 
 fn verified(config: LinkConfig, board: FakeFibre) -> Harness {

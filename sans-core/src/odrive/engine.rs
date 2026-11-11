@@ -111,6 +111,15 @@ pub enum LinkCommand {
         /// Target in millimetres, inside the commissioned travel bounds.
         position_mm: f32,
     },
+    /// Write `motor.config.current_lim`; confirmed when it reads back the
+    /// written value. Accepted only on a verified, unfaulted, commissioned
+    /// link, for a finite positive value at most the commissioned current
+    /// limit; any other value is rejected, never clamped. Not an energizing
+    /// write.
+    SetCurrentLimit {
+        /// Motor current limit in amps.
+        amps: f32,
+    },
     /// Call `clear_errors`; confirmed by the next telemetry sample. Accepted
     /// only once this connection passed the capability and
     /// identity checks and read the axis back idle.
@@ -1614,6 +1623,29 @@ impl LinkEngine {
                         expected: AXIS_STATE_HOMING,
                         fault_on_miss: false,
                     },
+                ))
+            }
+            LinkCommand::SetCurrentLimit { amps } => {
+                let Some(lift_axis) = self.config.lift_axis.as_ref() else {
+                    return Err("the lift axis is uncommissioned".into());
+                };
+                if !(amps.is_finite() && amps > 0.0 && amps <= lift_axis.current_limit_a) {
+                    return Err(format!(
+                        "current limit {amps} A is not positive, finite and at most the commissioned {} A",
+                        lift_axis.current_limit_a
+                    ));
+                }
+                let connection = self.connection.as_ref().expect("checked by caller");
+                if let Some(fault) = &connection.fault {
+                    return Err(format!("link fault is latched: {fault}"));
+                }
+                if !connection.verified {
+                    return Err("the link is not verified on this connection".into());
+                }
+                let amps = WireValue::F32(amps);
+                Ok((
+                    RequestSpec::Write(Endpoint::CurrentLimit, amps),
+                    Confirm::Readback(Endpoint::CurrentLimit, amps),
                 ))
             }
             LinkCommand::MoveAbsolute { position_mm } => {
