@@ -213,7 +213,8 @@ impl Rig {
             .set_f32(POS_ESTIMATE, self.sign * position_mm / 8.0);
         self.board
             .set_f32(VEL_ESTIMATE, self.sign * velocity_mm_s / 8.0);
-        self.board.set_f32(IQ_MEASURED, iq_a);
+        // Native current is signed with motor turns, like position.
+        self.board.set_f32(IQ_MEASURED, self.sign * iq_a);
     }
 
     fn trajectory_done(&mut self) {
@@ -286,7 +287,11 @@ fn finish_home(rig: &mut Rig) {
 }
 
 fn homed() -> Rig {
-    let mut rig = Rig::new(LIFT_AXIS);
+    homed_with(LIFT_AXIS)
+}
+
+fn homed_with(lift_axis: &str) -> Rig {
+    let mut rig = Rig::new(lift_axis);
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
     finish_home(&mut rig);
@@ -296,7 +301,11 @@ fn homed() -> Rig {
 }
 
 fn armed() -> Rig {
-    let mut rig = homed();
+    armed_with(LIFT_AXIS)
+}
+
+fn armed_with(lift_axis: &str) -> Rig {
+    let mut rig = homed_with(lift_axis);
     let id = rig.start(Arm, Unknown).unwrap();
     rig.run_for(25);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
@@ -331,6 +340,17 @@ fn touched_down() -> Rig {
         "{:?}",
         rig.outcome(id)
     );
+    rig
+}
+
+/// A completed Touchdown followed by an upward move that ends the hold,
+/// leaving the press limit applied.
+fn lifted_away() -> Rig {
+    let mut rig = touched_down();
+    let id = rig.start(MoveTo { position_mm: 100.0 }, Unknown).unwrap();
+    arrive(&mut rig);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.ops.status().live_hold_mm, None);
     rig
 }
 
@@ -423,10 +443,11 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
 
 #[test]
 fn idle_without_clean_evidence_is_home_failed() {
-    let spoils: [fn(&mut Rig); 3] = [
+    let spoils: [fn(&mut Rig); 4] = [
         |rig| rig.board.set_i32(AXIS_ERROR, 0x800),
         |rig| rig.axis(3.0, 0.0, 0.0),
         |rig| rig.board.set_bool(IS_HOMED, false),
+        |rig| rig.board.set_bool(ENCODER_IS_READY, false),
     ];
     for spoil in spoils {
         let mut rig = Rig::new(LIFT_AXIS);
@@ -599,7 +620,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
 
 #[test]
 fn a_move_sets_its_limit_first_and_completes_only_on_later_evidence() {
-    let mut rig = touched_down();
+    let mut rig = lifted_away();
     let mark = rig.board.writes.len();
     // The board already reads at the target with its trajectory done, and a
     // telemetry cycle is in progress when the move is requested.
@@ -940,14 +961,7 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
 #[test]
 fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
     let lift_axis = LIFT_AXIS.replace("travel_minimum_mm = 0.0", "travel_minimum_mm = 20.0");
-    let mut rig = Rig::new(&lift_axis);
-    let home = rig.start(Home, Unknown).unwrap();
-    rig.run_for(5);
-    finish_home(&mut rig);
-    rig.run_for(25);
-    assert_eq!(rig.outcome(home), Some(LiftOutcome::Completed(None)));
-    rig.start(Arm, Unknown).unwrap();
-    rig.run_for(25);
+    let mut rig = armed_with(&lift_axis);
 
     let request = Touchdown {
         post_turn_page_width_mm: None,
@@ -1055,17 +1069,173 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
 
 #[test]
 fn reversed_direction_negates_the_native_target() {
-    let lift_axis = LIFT_AXIS.replace("direction = \"normal\"", "direction = \"reversed\"");
-    let mut rig = Rig::new(&lift_axis);
-    let home = rig.start(Home, Unknown).unwrap();
-    rig.run_for(5);
-    finish_home(&mut rig);
-    rig.run_for(25);
-    assert_eq!(rig.outcome(home), Some(LiftOutcome::Completed(None)));
-    rig.start(Arm, Unknown).unwrap();
-    rig.run_for(25);
+    let mut rig = armed_with(&reversed());
 
     rig.start(MoveTo { position_mm: 80.0 }, Off).unwrap();
 
     assert_eq!(rig.f32_writes(INPUT_POS), vec![-10.0]);
+}
+
+fn reversed() -> String {
+    LIFT_AXIS.replace("direction = \"normal\"", "direction = \"reversed\"")
+}
+
+#[test]
+fn reversed_direction_touchdown_detects_contact_from_descent_current_only() {
+    let mut rig = armed_with(&reversed());
+    let id = rig
+        .start(
+            Touchdown {
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.run_for(150);
+    // Saturated torque opposing the descent is never contact.
+    rig.axis(100.0, 0.0, -PRESS_A);
+    rig.run_for(200);
+    assert_eq!(rig.moves(), vec![298.0]);
+    assert_eq!(rig.outcome(id), None);
+
+    rig.axis(200.0, 0.0, PRESS_A);
+    rig.run_until(300, |rig| rig.moves().len() == 2);
+    assert_eq!(rig.moves()[1], 202.0);
+    assert_eq!(rig.f32_writes(INPUT_POS)[1], -202.0 / 8.0);
+    rig.axis(200.4, 0.0, 1.9);
+    rig.run_for(150);
+    assert_eq!(
+        rig.outcome(id),
+        Some(LiftOutcome::Completed(Some(TouchdownHold {
+            position_mm: 200.4,
+            press_current_a: PRESS_A,
+            hold_target_mm: 202.0,
+        })))
+    );
+}
+
+#[test]
+fn stationary_stop_evidence_is_withdrawn_by_contradiction_or_link_loss() {
+    let mut contradicted = armed();
+    contradicted.stop();
+    contradicted.run_for(25);
+    assert_eq!(
+        contradicted.ops.status().stop_evidence,
+        Some(StopEvidence::Stationary)
+    );
+    contradicted.axis(0.0, 1.0, 0.0);
+    contradicted.run_for(25);
+    assert_eq!(
+        contradicted.ops.status().stop_evidence,
+        Some(StopEvidence::Unconfirmed)
+    );
+
+    let mut reconnected = armed();
+    reconnected.stop();
+    reconnected.run_for(25);
+    assert_eq!(
+        reconnected.ops.status().stop_evidence,
+        Some(StopEvidence::Stationary)
+    );
+    reconnected.connect();
+    // Idle stationary samples in the new epoch reuse no earlier confirmation.
+    reconnected.run_for(100);
+    assert_eq!(
+        reconnected.ops.status().stop_evidence,
+        Some(StopEvidence::Unconfirmed)
+    );
+}
+
+#[test]
+fn losing_position_trust_stops_pending_and_active_motion_once() {
+    // A sample reporting is_homed false arrives while the move's current
+    // limit is still being written and read back.
+    let mut rig = lifted_away();
+    rig.board.set_bool(IS_HOMED, false);
+    rig.board.fault_next(INPUT_MODE, ReplyFault::Hold);
+    let mark = rig.board.requests.len();
+    rig.run_until(25, |rig| {
+        rig.board.requests[mark..]
+            .iter()
+            .any(|request| request.endpoint == INPUT_MODE)
+    });
+    let moves = rig.moves();
+    let id = rig.start(MoveTo { position_mm: 10.0 }, Unknown).unwrap();
+    for reply in rig.board.take_held() {
+        rig.engine.receive(rig.now, &reply);
+    }
+    rig.settle();
+    rig.run_for(50);
+    assert_eq!(rig.moves(), moves, "no deferred motion");
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.finishes(id).len(), 1);
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
+
+    // The same loss during a confirmed move.
+    let mut rig = armed();
+    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
+    rig.axis(40.0, 3.0, 0.5);
+    rig.run_for(25);
+    rig.board.set_bool(IS_HOMED, false);
+    rig.run_for(50);
+    assert_eq!(rig.moves(), vec![100.0]);
+    assert_eq!(rig.finishes(id).len(), 1);
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
+    assert!(!rig.ops.status().position_trusted);
+}
+
+// ----- 9. Leaving the hold ------------------------------------------------------
+
+#[test]
+fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
+    let mut rig = touched_down();
+    assert_eq!(rig.ops.status().live_hold_mm, Some(200.4));
+    let writes = rig.board.writes.len();
+    let wire = rig.wire.len();
+
+    assert_eq!(rig.start(Home, Off), Err(LiftRejection::InHold));
+    assert_eq!(
+        rig.start(MoveTo { position_mm: 250.0 }, Off),
+        Err(LiftRejection::InHold)
+    );
+    let touchdown = Touchdown {
+        post_turn_page_width_mm: None,
+    };
+    assert_eq!(rig.start(touchdown, Off), Err(LiftRejection::InHold));
+    rig.settle();
+    assert_eq!(rig.board.writes.len(), writes);
+    assert!(
+        rig.wire[wire..]
+            .iter()
+            .all(|(_, request)| request.payload.is_empty()),
+        "only telemetry reads"
+    );
+
+    let leg = rig
+        .start(
+            Leg {
+                leg: PageTurnLeg::ToWiggleStart,
+                page_width_mm: 150.0,
+            },
+            Unknown,
+        )
+        .unwrap();
+    assert_eq!(rig.write_order_since(writes), vec![INPUT_POS]);
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
+    arrive(&mut rig);
+    assert_eq!(rig.outcome(leg), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.ops.status().live_hold_mm, None);
+
+    let mark = rig.board.writes.len();
+    let park = rig.start(MoveTo { position_mm: 50.0 }, Unknown).unwrap();
+    assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    arrive(&mut rig);
+    assert_eq!(rig.outcome(park), Some(LiftOutcome::Completed(None)));
 }

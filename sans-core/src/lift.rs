@@ -50,7 +50,7 @@
 //!   entry by observing the homing state.
 //! - Home completion (reference): the first fresh sample after that
 //!   confirmation that reads idle. Success needs all four error words zero,
-//!   `is_homed` true, trajectory done, stationary velocity and position within
+//!   `is_homed` true, encoder ready, trajectory done, stationary velocity and position within
 //!   the position tolerance of 0. An idle sample without that evidence is a
 //!   clean `HomeFailed`; any other state or the Home timeout is Stop. Upstream
 //!   clears `is_homed` on entry and sets it true on every exit, including
@@ -78,10 +78,30 @@
 //!   and stop time before this is relied on.
 //! - Current limit (reference): upstream reads the configured limit every
 //!   control cycle, so a runtime write takes effect at once. Units are amps.
-//! - Touchdown contact (host policy): saturated current, stationary velocity
+//! - Touchdown contact (host policy): saturated current in the descent
+//!   direction (measured current signed by the commissioned direction, so
+//!   opposite torque never counts), stationary velocity
 //!   and no progress for a whole dwell window, after a startup grace, with
 //!   the travel bound checked first. Whether a stalled hold stays saturated
 //!   at the press current is unverified (#60).
+//! - Trajectory done (reference) is planned-time upstream: it reads true
+//!   when the planned trajectory time has elapsed, not when the axis
+//!   arrives, so it is never taken alone as physical arrival. A contact so
+//!   late that the planned time runs out before the dwell completes is
+//!   `TravelExhausted`; that fails closed, and #60 checks how close to the
+//!   descent limit a real contact can be.
+//! - Live hold (host policy): after a completed Touchdown the setpoint still
+//!   presses into the book, limited only by the press current. Until a
+//!   `Completed` or `Cancelled` operation ends stationary above the hold's
+//!   settled position by more than the position tolerance, or Stop or a new
+//!   epoch ends it, no current limit is written and Home and every descent
+//!   are rejected. The first upward move therefore runs at the press limit,
+//!   and the next motion restores the commissioned limit first. A routine
+//!   cancel keeps the press limit and the hold. The hold is independent of
+//!   Position trust; without trust the only way out is Stop. Unverified:
+//!   #60 must check that the press current can lift the loaded suction box
+//!   off the book. If it cannot, the lift-away stalls, the move times out
+//!   and becomes Stop, which fails closed.
 //! - Stop (reference): a Disarm, which floats the motor phases upstream. What
 //!   the vertical axis does unpowered is a physical question for #60 and #25.
 //! - Stale telemetry: only fresh current-epoch samples count as evidence.
@@ -89,7 +109,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::config::{LiftAxisProfile, MotionProfile};
+use crate::config::{LiftAxisProfile, LiftDirection, MotionProfile};
 use crate::odrive::{
     AxisState, CommandResult, LinkCommand, LinkEvent, LinkPhase, LinkStatus, Priority,
     TelemetrySample, TelemetryValues, Ticket,
@@ -178,6 +198,8 @@ pub enum LiftRejection {
     NotAtWiggleStart,
     /// The Touchdown descent limit is outside travel or not below the axis.
     NoDescentRoom,
+    /// A Touchdown hold is live: Home and descents wait for a lift-away or Stop.
+    InHold,
     /// Clearing the fault needs a fresh sample reading idle.
     NotIdle,
 }
@@ -263,7 +285,9 @@ pub enum StopEvidence {
     Pending,
     /// A confirmed Disarm and a later fresh idle stationary sample.
     Stationary,
-    /// The Disarm was not confirmed or the link is no longer verified.
+    /// The Disarm was not confirmed, the link left the verified phase or
+    /// changed epoch, or a later sample was not idle and stationary. Final
+    /// until the next Stop or a cleared fault.
     Unconfirmed,
 }
 
@@ -280,6 +304,8 @@ pub struct LiftStatus {
     pub active: Option<OperationId>,
     /// The recorded Touchdown position.
     pub touchdown_mm: Option<f32>,
+    /// The settled position of a live Touchdown hold.
+    pub live_hold_mm: Option<f32>,
     /// Axis evidence since the last Stop.
     pub stop_evidence: Option<StopEvidence>,
 }
@@ -296,6 +322,8 @@ pub struct LiftOperations {
     latest: Option<TelemetrySample>,
     trusted: bool,
     touchdown_mm: Option<f32>,
+    /// A live hold's own reference, kept apart from trust and `touchdown_mm`.
+    live_hold_mm: Option<f32>,
     applied_limit_a: Option<f32>,
     latch: Option<StopCause>,
     stop_disarm: Option<Ticket>,
@@ -383,6 +411,7 @@ impl LiftOperations {
             latest: None,
             trusted: false,
             touchdown_mm: None,
+            live_hold_mm: None,
             applied_limit_a: None,
             latch: None,
             stop_disarm: None,
@@ -437,6 +466,25 @@ impl LiftOperations {
                 window: None,
             },
         };
+        if self.live_hold_mm.is_some() {
+            let position = self.fresh(now).and_then(|values| values.position_mm);
+            let descent = match phase {
+                Phase::Move { target_mm } => {
+                    matches!(
+                        request,
+                        LiftRequest::PageTurnLeg {
+                            leg: PageTurnLeg::Wiggle,
+                            ..
+                        }
+                    ) || position.is_none_or(|p| target_mm > p + axis.position_tolerance_mm)
+                }
+                Phase::Home | Phase::Descend { .. } => true,
+                _ => false,
+            };
+            if descent {
+                return Err(LiftRejection::InHold);
+            }
+        }
         let timeout = match phase {
             Phase::Home => axis.home_timeout_ms,
             _ => axis.move_timeout_ms,
@@ -477,6 +525,8 @@ impl LiftOperations {
     /// Always accepted.
     pub fn stop(&mut self, cause: StopCause, link: &mut Port<'_>) {
         self.lose_trust();
+        // The latch and the Arm needed after it reset the pressing setpoint.
+        self.live_hold_mm = None;
         self.finish(LiftOutcome::Fault(LiftFault::Stopped(cause.clone())));
         self.latch.get_or_insert(cause);
         self.stop_disarm = link(LinkCommand::Disarm, Priority::Urgent);
@@ -563,6 +613,7 @@ impl LiftOperations {
             latch: self.latch.clone(),
             active: self.active.as_ref().map(|active| active.id),
             touchdown_mm: self.touchdown_mm,
+            live_hold_mm: self.live_hold_mm,
             stop_evidence: self.stop_evidence,
         }
     }
@@ -703,6 +754,10 @@ impl LiftOperations {
         let Some(active) = self.active.as_mut() else {
             return;
         };
+        if needs_trust(&active.phase) && !self.trusted {
+            let cause = StopCause::Uncertain("Position trust lost before motion".into());
+            return self.stop(cause, link);
+        }
         let commissioned_a = self.axis.as_ref().expect("commissioned").current_limit_a;
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
@@ -722,7 +777,8 @@ impl LiftOperations {
             _ => return,
         };
         match wanted_a {
-            Some(amps) if self.applied_limit_a != Some(amps) => {
+            // A live hold's setpoint still presses: never raise the limit under it.
+            Some(amps) if self.applied_limit_a != Some(amps) && self.live_hold_mm.is_none() => {
                 active.limit_a = Some(amps);
                 self.applied_limit_a = None;
                 self.submit(
@@ -801,12 +857,17 @@ impl LiftOperations {
                 let reason = format!("link epoch {} is {:?}", status.epoch, status.phase);
                 self.stop(StopCause::LinkLost(reason), link);
             }
-            if self.stop_evidence == Some(StopEvidence::Pending) {
+            if self.stop_evidence.is_some() {
                 self.stop_evidence = Some(StopEvidence::Unconfirmed);
             }
             self.lose_trust();
         }
         if epoch_changed {
+            // A new epoch never reuses the previous one's Disarm confirmation.
+            self.stop_disarm = None;
+            self.stop_confirmed_at = None;
+            // The new gate idles the axis, and Arm resets the setpoint.
+            self.live_hold_mm = None;
             self.latest = None;
             self.applied_limit_a = None;
         }
@@ -880,6 +941,10 @@ impl LiftOperations {
         if values.encoder_error != 0 || !values.encoder_ready || !values.is_homed {
             self.lose_trust();
         }
+        if !self.trusted && self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)) {
+            let cause = StopCause::Uncertain("Position trust lost during motion".into());
+            return self.stop(cause, link);
+        }
         let (Some(position), Some(velocity)) = (values.position_mm, values.velocity_mm_s) else {
             return;
         };
@@ -894,6 +959,10 @@ impl LiftOperations {
             && stationary
         {
             self.stop_evidence = Some(StopEvidence::Stationary);
+        } else if self.stop_evidence == Some(StopEvidence::Stationary)
+            && !(values.axis_state == AxisState::Idle && stationary)
+        {
+            self.stop_evidence = Some(StopEvidence::Unconfirmed);
         }
         let Some(active) = self.active.as_mut() else {
             return;
@@ -936,6 +1005,23 @@ impl LiftOperations {
 
     // ----- outcomes ------------------------------------------------------------
 
+    /// End a live hold on a stationary sample above its reference by more than the tolerance.
+    fn end_hold_on_lift_away(&mut self) {
+        let (Some(reference), Some(axis), Some(sample)) =
+            (self.live_hold_mm, self.axis.as_ref(), self.latest.as_ref())
+        else {
+            return;
+        };
+        let values = sample.display_values();
+        if let (Some(position), Some(velocity)) = (values.position_mm, values.velocity_mm_s) {
+            if velocity.abs() <= axis.stationary_velocity_mm_s
+                && position < reference - axis.position_tolerance_mm
+            {
+                self.live_hold_mm = None;
+            }
+        }
+    }
+
     fn lose_trust(&mut self) {
         self.trusted = false;
         self.touchdown_mm = None;
@@ -957,7 +1043,14 @@ impl LiftOperations {
             }
             if let Some(hold) = hold {
                 self.touchdown_mm = Some(hold.position_mm);
+                self.live_hold_mm = Some(hold.position_mm);
             }
+        }
+        if matches!(
+            outcome,
+            LiftOutcome::Completed(None) | LiftOutcome::Cancelled { .. }
+        ) {
+            self.end_hold_on_lift_away();
         }
         self.events.push_back(LiftEvent::Finished {
             id: active.id,
@@ -965,6 +1058,14 @@ impl LiftOperations {
             outcome,
         });
     }
+}
+
+/// Phases whose motion targets depend on Position trust.
+fn needs_trust(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Move { .. } | Phase::Descend { .. } | Phase::Hold { .. } | Phase::Cancel { .. }
+    )
 }
 
 fn phase_name(phase: &Phase) -> &'static str {
@@ -1005,8 +1106,13 @@ fn sample_step(
         ))
     };
     let dwell = Duration::from_millis(axis.touchdown_dwell_ms);
+    // Measured current in the descent direction; opposite torque never counts.
+    let descent_iq_a = match axis.direction {
+        LiftDirection::Normal => values.iq_measured_a,
+        LiftDirection::Reversed => -values.iq_measured_a,
+    };
     let stalled = |press_a: f32| {
-        values.iq_measured_a >= axis.touchdown_saturation_percent / 100.0 * press_a && stationary
+        descent_iq_a >= axis.touchdown_saturation_percent / 100.0 * press_a && stationary
     };
     // Advance a stall window; returns it once it has lasted the dwell.
     let advance = |window: &mut Option<Window>, stalled: bool| -> Option<Window> {
@@ -1033,6 +1139,7 @@ fn sample_step(
             AxisState::Idle => {
                 if errors_zero
                     && values.is_homed
+                    && values.encoder_ready
                     && values.trajectory_done
                     && stationary
                     && position.abs() <= tolerance
