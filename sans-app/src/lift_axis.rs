@@ -19,6 +19,8 @@ pub(crate) fn reconnect_action(
 ) -> Result<(), ControllerClosed> {
     if screen::action_button(ui, "Reconnect lift axis").clicked() {
         handle.send(ControllerIntent::ReconnectLiftAxis)?;
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(16));
     }
     Ok(())
 }
