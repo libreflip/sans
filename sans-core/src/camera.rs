@@ -13,7 +13,8 @@ use std::fs;
 #[cfg(any(target_os = "linux", test))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::thread;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 
@@ -449,6 +450,34 @@ pub enum CapturePairError {
         /// Right Camera failure.
         right: CameraCaptureError,
     },
+    /// The capture light could not be switched around the acquisition.
+    #[error("complete Capture pair rejected: capture light {0}")]
+    Light(String),
+}
+
+/// How long the capture light settles before a lit pair is acquired.
+pub const CAPTURE_LIGHT_SETTLE: Duration = Duration::from_millis(200);
+
+/// Acquire a pair with the capture light on, then switch the light back off.
+///
+/// The light turns on, `settle` elapses, `capture` runs, and the light is
+/// switched off whether or not the capture succeeded. A light failure rejects
+/// the pair; a Camera failure takes precedence over a later light-off failure.
+pub fn capture_lit_pair<E: fmt::Display>(
+    mut set_light: impl FnMut(bool) -> Result<(), E>,
+    settle: Duration,
+    capture: impl FnOnce() -> Result<CapturePair, CapturePairError>,
+) -> Result<CapturePair, CapturePairError> {
+    if let Err(error) = set_light(true) {
+        let _ = set_light(false);
+        return Err(CapturePairError::Light(format!("did not turn on: {error}")));
+    }
+    thread::sleep(settle);
+    let pair = capture();
+    let off = set_light(false);
+    let pair = pair?;
+    off.map_err(|error| CapturePairError::Light(format!("did not turn off: {error}")))?;
+    Ok(pair)
 }
 
 /// Controller-owned adapters for the two stable Camera roles.
@@ -575,8 +604,110 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::SystemTime;
 
-    use super::{resolve_live_camera_identities, CameraRole, CapturedFrame};
+    use std::time::Duration;
+
+    use super::{
+        capture_lit_pair, resolve_live_camera_identities, CameraCaptureError, CameraRole,
+        CapturePair, CapturePairError, CapturedFrame,
+    };
     use crate::CropGeometry;
+
+    fn test_frame(role: CameraRole) -> CapturedFrame {
+        CapturedFrame::from_unrotated_rgb8(
+            role,
+            1,
+            1,
+            vec![0, 0, 0],
+            SystemTime::UNIX_EPOCH,
+            0,
+            CropGeometry {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_pair() -> CapturePair {
+        CapturePair {
+            left: test_frame(CameraRole::Left),
+            right: test_frame(CameraRole::Right),
+        }
+    }
+
+    #[test]
+    fn lit_pair_turns_light_on_captures_then_turns_it_off() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        let pair = capture_lit_pair(
+            |on| {
+                events.borrow_mut().push(if on { "on" } else { "off" });
+                Ok::<_, String>(())
+            },
+            Duration::ZERO,
+            || {
+                events.borrow_mut().push("capture");
+                Ok(test_pair())
+            },
+        );
+
+        assert!(pair.is_ok());
+        assert_eq!(*events.borrow(), ["on", "capture", "off"]);
+    }
+
+    #[test]
+    fn lit_pair_tries_light_off_on_every_failure_path() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let camera_error = CameraCaptureError::acquisition(CameraRole::Left, "no frame");
+
+        let error = capture_lit_pair(
+            |on| {
+                events.borrow_mut().push(on);
+                Err::<(), _>("serial gone")
+            },
+            Duration::ZERO,
+            || unreachable!("capture must not run without the light"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            CapturePairError::Light("did not turn on: serial gone".into())
+        );
+        assert_eq!(*events.borrow(), [true, false]);
+
+        let error = capture_lit_pair(
+            |_| Ok::<_, String>(()),
+            Duration::ZERO,
+            || Err(camera_error.clone().into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, CapturePairError::Camera(camera_error.clone()));
+
+        let error = capture_lit_pair(
+            |on| if on { Ok(()) } else { Err("timeout") },
+            Duration::ZERO,
+            || Err(camera_error.clone().into()),
+        )
+        .unwrap_err();
+        assert_eq!(error, CapturePairError::Camera(camera_error));
+    }
+
+    #[test]
+    fn lit_pair_is_rejected_when_the_light_stays_on() {
+        let error = capture_lit_pair(
+            |on| if on { Ok(()) } else { Err("timeout") },
+            Duration::ZERO,
+            || Ok(test_pair()),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CapturePairError::Light("did not turn off: timeout".into())
+        );
+    }
 
     #[test]
     fn half_turn_rotation_returns_owned_post_rotation_pixels() {

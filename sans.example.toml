@@ -55,6 +55,8 @@ urgent_deadline_ms = 50
 [cameras.left]
 identity = "<set-/dev/v4l/by-id-or-by-path-identity>"
 rotation_degrees = 90
+# Fixed manual exposure in 100 µs units; omit to keep the Camera's own exposure mode.
+# exposure_100us = <positive>
 
 [cameras.left.crop]
 x = 0
@@ -65,6 +67,7 @@ height = 3840
 [cameras.right]
 identity = "<set-distinct-/dev/v4l/by-id-or-by-path-identity>"
 rotation_degrees = 270
+# exposure_100us = <positive>
 
 [cameras.right.crop]
 x = 0

@@ -3,7 +3,10 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use rscam::{Camera, Config, IntervalInfo, ResolutionInfo};
+use rscam::{
+    Camera, Config, CtrlData, IntervalInfo, ResolutionInfo, CID_EXPOSURE_ABSOLUTE,
+    CID_EXPOSURE_AUTO, EXPOSURE_MANUAL,
+};
 use thiserror::Error;
 
 use super::{
@@ -126,6 +129,9 @@ impl V4lRoleCamera {
             ))
         })?;
         verify_fixed_profile(role, path, &backend)?;
+        if let Some(exposure) = profile.exposure_100us {
+            set_fixed_exposure(role, path, &backend, exposure)?;
+        }
         let interval = select_interval(role, path, &backend)?;
         backend.start(&capture_config(interval)).map_err(|error| {
             SetupBlocker::new(format!(
@@ -235,6 +241,38 @@ fn verify_fixed_profile(
         )));
     }
     Ok(())
+}
+
+fn set_fixed_exposure(
+    role: CameraRole,
+    path: &Path,
+    backend: &Camera,
+    exposure_100us: u32,
+) -> Result<(), SetupBlocker> {
+    let blocker = |detail: String| {
+        SetupBlocker::new(format!("{role} Camera device {} {detail}", path.display()))
+    };
+    let control = backend
+        .get_control(CID_EXPOSURE_ABSOLUTE)
+        .map_err(|error| blocker(format!("has no absolute exposure control: {error}")))?;
+    if let CtrlData::Integer {
+        minimum, maximum, ..
+    } = control.data
+    {
+        let in_range = i32::try_from(exposure_100us)
+            .is_ok_and(|exposure| (minimum..=maximum).contains(&exposure));
+        if !in_range {
+            return Err(blocker(format!(
+                "accepts exposure_100us from {minimum} to {maximum}, not {exposure_100us}"
+            )));
+        }
+    }
+    backend
+        .set_control(CID_EXPOSURE_AUTO, EXPOSURE_MANUAL)
+        .map_err(|error| blocker(format!("rejected manual exposure mode: {error}")))?;
+    backend
+        .set_control(CID_EXPOSURE_ABSOLUTE, exposure_100us)
+        .map_err(|error| blocker(format!("rejected exposure_100us {exposure_100us}: {error}")))
 }
 
 fn resolution_supported(info: &ResolutionInfo, requested: (u32, u32)) -> bool {

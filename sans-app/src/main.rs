@@ -8,9 +8,9 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, CapturePair, CapturePairError, ControllerMachine, MachineFactory, MonospaceClient,
-    MonospaceConnection, MonospaceEventKind, MonospaceFault, PreparedMachineProfile, SetupBlocker,
-    SetupDiagnostic,
+    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineFactory,
+    MonospaceClient, MonospaceConnection, MonospaceEventKind, MonospaceFault,
+    PreparedMachineProfile, SetupBlocker, SetupDiagnostic, CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{CameraCaptureError, CameraRole};
@@ -36,7 +36,13 @@ struct BootstrapMachine<CameraMachine> {
 
 impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
     fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
-        self.cameras.capture_pair()
+        let light = &mut self.monospace.client;
+        let cameras = &mut self.cameras;
+        capture_lit_pair(
+            |on| light.set_light(on),
+            CAPTURE_LIGHT_SETTLE,
+            || cameras.capture_pair(),
+        )
     }
 }
 
