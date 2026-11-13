@@ -57,6 +57,10 @@ identity = "<set-/dev/v4l/by-id-or-by-path-identity>"
 rotation_degrees = 90
 # Fixed manual exposure in 100 µs units; omit to keep the Camera's own exposure mode.
 # exposure_100us = <positive>
+# Fixed manual white balance in Kelvin; omit to keep the Camera's own white-balance mode.
+# white_balance_kelvin = <positive>
+# Fixed gain in the Camera's own units; omit to keep the Camera's own gain.
+# gain = <non-negative>
 
 [cameras.left.crop]
 x = 0
@@ -68,6 +72,8 @@ height = 3840
 identity = "<set-distinct-/dev/v4l/by-id-or-by-path-identity>"
 rotation_degrees = 270
 # exposure_100us = <positive>
+# white_balance_kelvin = <positive>
+# gain = <non-negative>
 
 [cameras.right.crop]
 x = 0

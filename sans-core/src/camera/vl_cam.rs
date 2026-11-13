@@ -1,11 +1,13 @@
 //! Linux V4L2 adapters for the fixed Sans Camera profile.
 
+use std::io;
 use std::path::Path;
 use std::time::SystemTime;
 
 use rscam::{
-    Camera, Config, CtrlData, IntervalInfo, ResolutionInfo, CID_EXPOSURE_ABSOLUTE,
-    CID_EXPOSURE_AUTO, EXPOSURE_MANUAL,
+    Camera, Config, CtrlData, IntervalInfo, ResolutionInfo, CID_AUTOGAIN, CID_AUTO_WHITE_BALANCE,
+    CID_EXPOSURE_ABSOLUTE, CID_EXPOSURE_AUTO, CID_GAIN, CID_WHITE_BALANCE_TEMPERATURE,
+    EXPOSURE_MANUAL,
 };
 use thiserror::Error;
 
@@ -129,9 +131,7 @@ impl V4lRoleCamera {
             ))
         })?;
         verify_fixed_profile(role, path, &backend)?;
-        if let Some(exposure) = profile.exposure_100us {
-            set_fixed_exposure(role, path, &backend, exposure)?;
-        }
+        apply_fixed_controls(role, path, &backend, profile)?;
         let interval = select_interval(role, path, &backend)?;
         backend.start(&capture_config(interval)).map_err(|error| {
             SetupBlocker::new(format!(
@@ -243,36 +243,111 @@ fn verify_fixed_profile(
     Ok(())
 }
 
-fn set_fixed_exposure(
+/// Fixes the image controls the profile names; omitted ones keep the Camera's own behaviour.
+///
+/// Every value is checked against its control's reported type, range and step before any control
+/// is written, so a value outside what the Camera reports leaves all of its controls as they were.
+/// A write the Camera still rejects blocks Setup after the controls before it have been set.
+fn apply_fixed_controls(
     role: CameraRole,
     path: &Path,
     backend: &Camera,
-    exposure_100us: u32,
+    profile: &CameraRoleProfile,
 ) -> Result<(), SetupBlocker> {
     let blocker = |detail: String| {
         SetupBlocker::new(format!("{role} Camera device {} {detail}", path.display()))
     };
-    let control = backend
-        .get_control(CID_EXPOSURE_ABSOLUTE)
-        .map_err(|error| blocker(format!("has no absolute exposure control: {error}")))?;
-    if let CtrlData::Integer {
-        minimum, maximum, ..
-    } = control.data
-    {
-        let in_range = i32::try_from(exposure_100us)
-            .is_ok_and(|exposure| (minimum..=maximum).contains(&exposure));
-        if !in_range {
-            return Err(blocker(format!(
-                "accepts exposure_100us from {minimum} to {maximum}, not {exposure_100us}"
-            )));
-        }
+    let check = |id: u32, control: &str, field: &str, value: u32| {
+        let control = backend
+            .get_control(id)
+            .map_err(|error| blocker(format!("has no {control} control: {error}")))?;
+        integer_value_problem(&control.data, field, value)
+            .map_or(Ok(()), |problem| Err(blocker(problem)))
+    };
+    let set = |id: u32, value: i64, what: &str| {
+        backend
+            .set_control(id, value)
+            .map_err(|error| blocker(format!("rejected {what}: {error}")))
+    };
+    // Turns an automatic mode off when the Camera has one; a Camera without it has nothing to
+    // override the fixed value.
+    let disable_if_present = |id: u32, what: &str| match backend.get_control(id) {
+        Ok(_) => set(id, 0, what),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(error) => Err(blocker(format!("cannot query {what}: {error}"))),
+    };
+
+    if let Some(exposure) = profile.exposure_100us {
+        check(
+            CID_EXPOSURE_ABSOLUTE,
+            "absolute exposure",
+            "exposure_100us",
+            exposure,
+        )?;
     }
-    backend
-        .set_control(CID_EXPOSURE_AUTO, EXPOSURE_MANUAL)
-        .map_err(|error| blocker(format!("rejected manual exposure mode: {error}")))?;
-    backend
-        .set_control(CID_EXPOSURE_ABSOLUTE, exposure_100us)
-        .map_err(|error| blocker(format!("rejected exposure_100us {exposure_100us}: {error}")))
+    if let Some(kelvin) = profile.white_balance_kelvin {
+        check(
+            CID_WHITE_BALANCE_TEMPERATURE,
+            "white balance temperature",
+            "white_balance_kelvin",
+            kelvin,
+        )?;
+    }
+    if let Some(gain) = profile.gain {
+        check(CID_GAIN, "gain", "gain", gain)?;
+    }
+
+    if let Some(exposure) = profile.exposure_100us {
+        set(
+            CID_EXPOSURE_AUTO,
+            i64::from(EXPOSURE_MANUAL),
+            "manual exposure mode",
+        )?;
+        set(
+            CID_EXPOSURE_ABSOLUTE,
+            i64::from(exposure),
+            &format!("exposure_100us {exposure}"),
+        )?;
+    }
+    if let Some(kelvin) = profile.white_balance_kelvin {
+        disable_if_present(CID_AUTO_WHITE_BALANCE, "automatic white balance")?;
+        set(
+            CID_WHITE_BALANCE_TEMPERATURE,
+            i64::from(kelvin),
+            &format!("white_balance_kelvin {kelvin}"),
+        )?;
+    }
+    if let Some(gain) = profile.gain {
+        disable_if_present(CID_AUTOGAIN, "automatic gain")?;
+        set(CID_GAIN, i64::from(gain), &format!("gain {gain}"))?;
+    }
+    Ok(())
+}
+
+/// Describes why `value` cannot be written to an integer control, or `None` when it can.
+fn integer_value_problem(data: &CtrlData, field: &str, value: u32) -> Option<String> {
+    let CtrlData::Integer {
+        minimum,
+        maximum,
+        step,
+        ..
+    } = *data
+    else {
+        return Some(format!("reports a non-integer control for {field}"));
+    };
+    let value = i64::from(value);
+    let (minimum, maximum, step) = (i64::from(minimum), i64::from(maximum), i64::from(step));
+    if !(minimum..=maximum).contains(&value) {
+        return Some(format!(
+            "accepts {field} from {minimum} to {maximum}, not {value}"
+        ));
+    }
+    if step > 1 && (value - minimum) % step != 0 {
+        return Some(format!(
+            "accepts {field} in steps of {step} from {minimum}, not {value}"
+        ));
+    }
+    None
 }
 
 fn resolution_supported(info: &ResolutionInfo, requested: (u32, u32)) -> bool {
@@ -319,9 +394,53 @@ fn select_interval(
 
 #[cfg(test)]
 mod tests {
-    use rscam::ResolutionInfo;
+    use rscam::{CtrlData, ResolutionInfo};
 
-    use super::resolution_supported;
+    use super::{integer_value_problem, resolution_supported};
+
+    fn integer(minimum: i32, maximum: i32, step: i32) -> CtrlData {
+        CtrlData::Integer {
+            value: minimum,
+            default: minimum,
+            minimum,
+            maximum,
+            step,
+        }
+    }
+
+    #[test]
+    fn fixed_control_values_must_fit_the_reported_range_and_step() {
+        let temperature = integer(2800, 6500, 10);
+        assert_eq!(
+            integer_value_problem(&temperature, "white_balance_kelvin", 4600),
+            None
+        );
+        assert_eq!(
+            integer_value_problem(&temperature, "white_balance_kelvin", 2700).as_deref(),
+            Some("accepts white_balance_kelvin from 2800 to 6500, not 2700")
+        );
+        assert_eq!(
+            integer_value_problem(&temperature, "white_balance_kelvin", 4605).as_deref(),
+            Some("accepts white_balance_kelvin in steps of 10 from 2800, not 4605")
+        );
+        assert_eq!(integer_value_problem(&integer(0, 100, 1), "gain", 0), None);
+        assert_eq!(
+            integer_value_problem(&integer(0, 100, 0), "gain", u32::MAX).as_deref(),
+            Some("accepts gain from 0 to 100, not 4294967295")
+        );
+        assert_eq!(
+            integer_value_problem(
+                &CtrlData::Boolean {
+                    value: false,
+                    default: false
+                },
+                "gain",
+                1
+            )
+            .as_deref(),
+            Some("reports a non-integer control for gain")
+        );
+    }
 
     #[test]
     fn fixed_resolution_must_be_explicitly_supported() {

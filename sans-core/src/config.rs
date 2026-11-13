@@ -239,6 +239,16 @@ pub struct CameraRoleProfile {
     /// When omitted, the Camera's own exposure mode is left unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposure_100us: Option<u32>,
+    /// Fixed manual white balance in V4L2 `white_balance_temperature` units of Kelvin.
+    ///
+    /// When omitted, the Camera's own white-balance mode is left unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub white_balance_kelvin: Option<u32>,
+    /// Fixed V4L2 `gain` in the Camera's own units.
+    ///
+    /// When omitted, the Camera's own gain is left unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gain: Option<u32>,
 }
 
 /// A post-rotation Camera crop rectangle in pixels.
@@ -806,6 +816,9 @@ fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<St
     };
     if camera.exposure_100us == Some(0) {
         problems.push(format!("{name}.exposure_100us must be positive"));
+    }
+    if camera.white_balance_kelvin == Some(0) {
+        problems.push(format!("{name}.white_balance_kelvin must be positive"));
     }
     if camera.crop.width == 0 || camera.crop.height == 0 {
         problems.push(format!("{name}.crop dimensions must be nonzero"));
