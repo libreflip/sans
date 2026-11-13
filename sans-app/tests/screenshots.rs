@@ -37,4 +37,14 @@ fn write_headless_fixture_renders() {
             }
         }
     }
+    // A latched Stop. The fixture Machine has no Monospace, so it is Unconfirmed.
+    let renderer = renderer("headless fixture renders")
+        .expect("SANS_SCREENSHOT_DIR is set but no wgpu adapter can render");
+    let mut session = Session::with_pair_rendered(portrait_full_frame(), T1, Some(renderer));
+    session.tap_label("Stop");
+    session.wait_for_label("UNCONFIRMED STOP: switch off machine power");
+    session
+        .render()
+        .save(directory.join("headless-fixture-T1-unconfirmed-stop.png"))
+        .unwrap();
 }
