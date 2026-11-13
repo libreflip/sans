@@ -57,7 +57,11 @@ fn logger(verbose: u8, rust_log: Option<&str>) -> env_logger::Builder {
 
 fn init_logging(verbose: u8) {
     let rust_log = std::env::var("RUST_LOG").ok();
-    logger(verbose, rust_log.as_deref()).init();
+    let mut logger = logger(verbose, rust_log.as_deref());
+    if let Ok(style) = std::env::var("RUST_LOG_STYLE") {
+        logger.parse_write_style(&style);
+    }
+    logger.init();
 }
 
 /// One Monospace connection, shared by the controller's board and the

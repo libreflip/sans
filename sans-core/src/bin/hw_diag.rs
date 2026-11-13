@@ -37,6 +37,9 @@ fn main() {
     if let Ok(rust_log) = std::env::var("RUST_LOG") {
         logger.parse_filters(&rust_log);
     }
+    if let Ok(style) = std::env::var("RUST_LOG_STYLE") {
+        logger.parse_write_style(&style);
+    }
     logger.init();
 
     let csv_writer: Option<Arc<Mutex<Writer<std::fs::File>>>> = args.log.as_ref().map(|path| {
