@@ -282,12 +282,64 @@ pub struct TelemetryValues {
 }
 
 impl TelemetryValues {
+    /// Everything but position, velocity and current, which change in motion.
+    fn condition(&self) -> impl PartialEq + '_ {
+        (
+            self.axis_state,
+            [
+                self.axis_error,
+                self.motor_error,
+                self.encoder_error,
+                self.controller_error,
+            ],
+            [
+                self.is_homed,
+                self.min_endstop_pressed,
+                self.motor_calibrated,
+                self.encoder_ready,
+                self.trajectory_done,
+            ],
+            (self.control_mode, self.input_mode),
+        )
+    }
+
     fn error_words_zero(&self) -> bool {
         self.axis_error == 0
             && self.motor_error == 0
             && self.encoder_error == 0
             && self.controller_error == 0
     }
+}
+
+/// Log the axis condition on a connection's first sample and whenever it
+/// changes; a warning while any error word is set.
+fn log_condition_change(previous: Option<&TelemetryValues>, values: &TelemetryValues) {
+    if previous.is_some_and(|previous| previous.condition() == values.condition()) {
+        return;
+    }
+    let level = if values.error_words_zero() {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    };
+    log::log!(
+        level,
+        "ODrive axis {:?}: errors axis {:#x} motor {:#x} encoder {:#x} controller {:#x}; \
+         homed {}, min endstop {}, motor calibrated {}, encoder ready {}, trajectory done {}; \
+         control mode {}, input mode {}",
+        values.axis_state,
+        values.axis_error,
+        values.motor_error,
+        values.encoder_error,
+        values.controller_error,
+        values.is_homed,
+        values.min_endstop_pressed,
+        values.motor_calibrated,
+        values.encoder_ready,
+        values.trajectory_done,
+        values.control_mode,
+        values.input_mode,
+    );
 }
 
 /// A telemetry sample, readable only while fresh.
@@ -2247,7 +2299,8 @@ impl LinkEngine {
             values,
         };
         let connection = self.connection.as_mut().expect("connection");
-        connection.latest = Some(sample.clone());
+        let previous = connection.latest.replace(sample.clone());
+        log_condition_change(previous.as_ref().map(|p| &p.values), &sample.values);
         if matches!(connection.gate, Some(GateStep::FirstCycle)) {
             connection.gate = None;
             connection.verified = true;
