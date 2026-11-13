@@ -499,6 +499,15 @@ fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_un
     assert_eq!(writes.len(), gate_writes + 1);
     assert_eq!(writes.last().unwrap(), &2.0_f32.to_le_bytes().to_vec());
     assert_eq!(link.board.f32_value(CURRENT_LIM), 2.0);
+    // The accepted value was written and then read back.
+    let traffic: Vec<bool> = link
+        .board
+        .requests
+        .iter()
+        .filter(|request| request.endpoint == CURRENT_LIM)
+        .map(|request| request.payload.is_empty())
+        .collect();
+    assert_eq!(traffic[traffic.len() - 2..], [false, true]);
 }
 
 fn verified(config: LinkConfig, board: FakeFibre) -> Harness {

@@ -93,7 +93,7 @@ A non-Stop pause after three confirmed pickup failures in which automatic scanni
 _Avoid_: Stopped state, Stop job
 
 **Position trust**:
-Sans's judgement of whether the suction box's current position can be used for absolute motion. Only a Home that Sans watched from start to end in the current link epoch grants it; the board's homed flag alone never does. It is lost on every Stop, reconnect and uncertain motion, and regaining it requires Home.
+Sans's judgement of whether the suction box's current position can be used for absolute motion. Only a Home that Sans watched from start to end on the current connection grants it; the board's homed flag alone never does. It is lost on every Stop, reconnect and uncertain motion, and regaining it requires Home.
 _Avoid_: Homed flag, homed boolean
 
 **Stop**:

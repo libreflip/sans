@@ -13,9 +13,9 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use sans_core::{
-    prepare_machine_profile, LiftEvent, LiftFault, LiftOperations, LiftOutcome, LiftRejection,
-    LiftRequest, LinkCommand, LinkConfig, LinkEngine, LinkEvent, OperationId, PageTurnLeg,
-    Priority, StopCause, StopEvidence, Ticket, TouchdownHold, VacuumEvidence,
+    prepare_machine_profile, LiftDirection, LiftEvent, LiftFault, LiftOperations, LiftOutcome,
+    LiftRejection, LiftRequest, LinkCommand, LinkConfig, LinkEngine, LinkEvent, OperationId,
+    PageTurnLeg, Priority, StopCause, StopEvidence, Ticket, TouchdownHold, VacuumEvidence,
 };
 use support::fake_fibre::*;
 
@@ -80,10 +80,9 @@ impl Rig {
         fs::write(&path, format!("{VALID_PROFILE}{lift_axis}")).unwrap();
         let prepared = prepare_machine_profile(Some(&path)).unwrap();
         let profile = prepared.profile();
-        let sign = if lift_axis.contains("\"reversed\"") {
-            -1.0
-        } else {
-            1.0
+        let sign = match profile.odrive.lift_axis.as_ref().unwrap().direction {
+            LiftDirection::Normal => 1.0,
+            LiftDirection::Reversed => -1.0,
         };
         let mut rig = Self {
             engine: LinkEngine::new(LinkConfig::from_profile(profile).unwrap(), 0x1234),
@@ -292,12 +291,23 @@ fn homed() -> Rig {
 
 fn homed_with(lift_axis: &str) -> Rig {
     let mut rig = Rig::new(lift_axis);
+    home(&mut rig);
+    rig
+}
+
+/// Run a Home from idle to clean completion.
+fn home(rig: &mut Rig) {
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
-    finish_home(&mut rig);
+    finish_home(rig);
     rig.run_for(25);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
-    rig
+}
+
+fn arm(rig: &mut Rig) {
+    let id = rig.start(Arm, Unknown).unwrap();
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
 }
 
 fn armed() -> Rig {
@@ -306,9 +316,7 @@ fn armed() -> Rig {
 
 fn armed_with(lift_axis: &str) -> Rig {
     let mut rig = homed_with(lift_axis);
-    let id = rig.start(Arm, Unknown).unwrap();
-    rig.run_for(25);
-    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    arm(&mut rig);
     rig
 }
 
@@ -758,14 +766,8 @@ fn stop_latches_and_recovery_is_clear_then_home_then_arm() {
         Err(LiftRejection::PositionUntrusted)
     );
 
-    let home = rig.start(Home, Unknown).unwrap();
-    rig.run_for(5);
-    finish_home(&mut rig);
-    rig.run_for(25);
-    assert_eq!(rig.outcome(home), Some(LiftOutcome::Completed(None)));
-    let arm = rig.start(Arm, Unknown).unwrap();
-    rig.run_for(25);
-    assert_eq!(rig.outcome(arm), Some(LiftOutcome::Completed(None)));
+    home(&mut rig);
+    arm(&mut rig);
 }
 
 #[test]
@@ -920,16 +922,23 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
 
 /// Start a Touchdown, script the axis after the grace, and run the routine
 /// cancel it ends with to a stationary finish.
-fn touchdown_ending(rig: &mut Rig, position_mm: f32, velocity_mm_s: f32, iq_a: f32, ms: u64) {
+fn touchdown_ending(
+    rig: &mut Rig,
+    position_mm: f32,
+    velocity_mm_s: f32,
+    iq_a: f32,
+    ms: u64,
+) -> OperationId {
     let request = Touchdown {
         post_turn_page_width_mm: None,
     };
-    rig.start(request, Off).unwrap();
+    let id = rig.start(request, Off).unwrap();
     rig.axis(position_mm, velocity_mm_s, iq_a);
     rig.run_until(ms, |rig| rig.moves().len() == 2);
     rig.axis(position_mm, 0.0, iq_a);
     rig.trajectory_done();
     rig.run_for(25);
+    id
 }
 
 #[test]
@@ -937,21 +946,20 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
     use LiftFault::*;
     // Arrival at the descent limit, even saturated.
     let mut rig = armed();
-    touchdown_ending(&mut rig, 297.6, 0.0, PRESS_A, 100);
+    let exhausted = touchdown_ending(&mut rig, 297.6, 0.0, PRESS_A, 100);
     assert_eq!(rig.moves(), vec![298.0, 297.6]);
     // Permanent stiction at the start.
     let mut stuck = armed();
-    touchdown_ending(&mut stuck, 0.3, 0.0, PRESS_A, 400);
+    let no_progress = touchdown_ending(&mut stuck, 0.3, 0.0, PRESS_A, 400);
     // Descending forever.
     let mut slow = armed();
-    touchdown_ending(&mut slow, 50.0, 5.0, 0.5, 2100);
+    let timed_out = touchdown_ending(&mut slow, 50.0, 5.0, 0.5, 2100);
 
-    for (rig, fault) in [
-        (rig, TravelExhausted),
-        (stuck, NoProgress),
-        (slow, TimedOut),
+    for (rig, id, fault) in [
+        (rig, exhausted, TravelExhausted),
+        (stuck, no_progress, NoProgress),
+        (slow, timed_out, TimedOut),
     ] {
-        let id = OperationId(3);
         assert_eq!(rig.outcome(id), Some(LiftOutcome::Fault(fault)));
         assert_eq!(rig.ops.status().latch, None);
         assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
@@ -1238,4 +1246,34 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
     arrive(&mut rig);
     assert_eq!(rig.outcome(park), Some(LiftOutcome::Completed(None)));
+}
+
+#[test]
+fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain() {
+    let mut stuck = armed();
+    stuck.stop();
+    stuck.run_for(25);
+    stuck.board.set_i32(MOTOR_ERROR, 0x40);
+    let clear = stuck.clear_fault().unwrap();
+    stuck.run_for(50);
+    assert!(
+        matches!(
+            stuck.outcome(clear),
+            Some(LiftOutcome::Fault(LiftFault::ClearFailed(_)))
+        ),
+        "{:?}",
+        stuck.outcome(clear)
+    );
+    assert!(stuck.ops.status().latch.is_some());
+
+    // Parked on a pressed endstop, upstream re-sets only the endstop bit.
+    let mut parked = armed();
+    parked.stop();
+    parked.run_for(25);
+    parked.board.set_i32(AXIS_ERROR, 1 << 12);
+    parked.board.set_bool(MIN_ENDSTOP_STATE, true);
+    let clear = parked.clear_fault().unwrap();
+    parked.run_for(50);
+    assert_eq!(parked.outcome(clear), Some(LiftOutcome::Completed(None)));
+    assert_eq!(parked.ops.status().latch, None);
 }

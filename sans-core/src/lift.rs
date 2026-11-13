@@ -112,7 +112,7 @@ use std::time::{Duration, Instant};
 use crate::config::{LiftAxisProfile, LiftDirection, MotionProfile};
 use crate::odrive::{
     AxisState, CommandResult, LinkCommand, LinkEvent, LinkPhase, LinkStatus, Priority,
-    TelemetrySample, TelemetryValues, Ticket,
+    TelemetrySample, TelemetryValues, Ticket, AXIS_ERROR_MIN_ENDSTOP_PRESSED,
 };
 use crate::MachineProfile;
 
@@ -220,6 +220,8 @@ pub enum StopCause {
 pub enum LiftFault {
     /// The adapter refused or retired a command before it left the host.
     CommandRejected(String),
+    /// Errors remained after `clear_fault`; the Stop latch stays set.
+    ClearFailed(String),
     /// Home ended idle without clean evidence; the axis is idle and unlatched.
     HomeFailed(String),
     /// Touchdown reached the descent limit or a hold target outside travel.
@@ -538,8 +540,10 @@ impl LiftOperations {
         });
     }
 
-    /// Clear the board's errors and, once that completes, the Stop latch.
-    /// Never arms.
+    /// Clear the board's errors, then drop the Stop latch once a fresh sample
+    /// taken after the clear reads idle with all error words zero, the axis
+    /// minimum-endstop bit alone allowed while the endstop is pressed.
+    /// Otherwise it finishes `ClearFailed` and the latch stays. Never arms.
     pub fn clear_fault(
         &mut self,
         now: Instant,
@@ -548,6 +552,9 @@ impl LiftOperations {
         let axis = self.axis.clone().ok_or(LiftRejection::Uncommissioned)?;
         if self.active.is_some() {
             return Err(LiftRejection::Busy);
+        }
+        if !self.verified {
+            return Err(LiftRejection::LinkNotVerified);
         }
         let values = self.fresh(now).ok_or(LiftRejection::NoFreshSample)?;
         if values.axis_state != AxisState::Idle {
@@ -918,7 +925,7 @@ impl LiftOperations {
             self.applied_limit_a = Some(amps);
             return self.submit_phase(link);
         }
-        if matches!(active.phase, Phase::Arm | Phase::Clear) {
+        if matches!(active.phase, Phase::Arm) {
             return self.finish(LiftOutcome::Completed(None));
         }
         active.confirmed_at = Some(now);
@@ -980,7 +987,20 @@ impl LiftOperations {
         }
         match step {
             Step::Wait => {}
-            Step::Finish(outcome) => self.finish(outcome),
+            Step::Finish(outcome) => {
+                // Lift-away evidence: this fresh stationary sample is above the hold.
+                if matches!(
+                    outcome,
+                    LiftOutcome::Completed(None) | LiftOutcome::Cancelled { .. }
+                ) && stationary
+                    && self
+                        .live_hold_mm
+                        .is_some_and(|hold| position < hold - axis.position_tolerance_mm)
+                {
+                    self.live_hold_mm = None;
+                }
+                self.finish(outcome)
+            }
             Step::Stop(reason) => self.stop(StopCause::Uncertain(reason), link),
             Step::Cancel(fault) => self.begin_cancel(now, Some(fault), link),
             Step::Hold { target_mm } => {
@@ -1005,23 +1025,6 @@ impl LiftOperations {
 
     // ----- outcomes ------------------------------------------------------------
 
-    /// End a live hold on a stationary sample above its reference by more than the tolerance.
-    fn end_hold_on_lift_away(&mut self) {
-        let (Some(reference), Some(axis), Some(sample)) =
-            (self.live_hold_mm, self.axis.as_ref(), self.latest.as_ref())
-        else {
-            return;
-        };
-        let values = sample.display_values();
-        if let (Some(position), Some(velocity)) = (values.position_mm, values.velocity_mm_s) {
-            if velocity.abs() <= axis.stationary_velocity_mm_s
-                && position < reference - axis.position_tolerance_mm
-            {
-                self.live_hold_mm = None;
-            }
-        }
-    }
-
     fn lose_trust(&mut self) {
         self.trusted = false;
         self.touchdown_mm = None;
@@ -1045,12 +1048,6 @@ impl LiftOperations {
                 self.touchdown_mm = Some(hold.position_mm);
                 self.live_hold_mm = Some(hold.position_mm);
             }
-        }
-        if matches!(
-            outcome,
-            LiftOutcome::Completed(None) | LiftOutcome::Cancelled { .. }
-        ) {
-            self.end_hold_on_lift_away();
         }
         self.events.push_back(LiftEvent::Finished {
             id: active.id,
@@ -1133,7 +1130,30 @@ fn sample_step(
         (taken_at.duration_since(open.opened_at) >= dwell).then_some(open)
     };
     match &mut active.phase {
-        Phase::Arm | Phase::Clear => Step::Wait,
+        Phase::Arm => Step::Wait,
+        Phase::Clear => {
+            // Upstream re-sets the endstop bit whenever the endstop is pressed
+            // outside homing, so that bit alone is accepted, as Home accepts it.
+            let only_endstop =
+                values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
+            if values.axis_state == AxisState::Idle
+                && values.motor_error == 0
+                && values.encoder_error == 0
+                && values.controller_error == 0
+                && (values.axis_error == 0 || only_endstop)
+            {
+                Step::Finish(LiftOutcome::Completed(None))
+            } else {
+                Step::Finish(LiftOutcome::Fault(LiftFault::ClearFailed(format!(
+                    "after clear: axis state {:?}, errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
+                    values.axis_state,
+                    values.axis_error,
+                    values.motor_error,
+                    values.encoder_error,
+                    values.controller_error
+                ))))
+            }
+        }
         Phase::Home => match values.axis_state {
             AxisState::Homing => Step::Wait,
             AxisState::Idle => {
