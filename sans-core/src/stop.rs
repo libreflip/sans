@@ -2,8 +2,9 @@
 //!
 //! [`StopControl`] sits beside [`LiftOperations`]. It has no threads, no I/O
 //! and no clock. The Stop latch is the lift module's own: whoever sets it,
-//! an operator Stop, the physical button, a lift fault or a lost link,
-//! `StopControl` sees the latch and sends Monospace `ALL OFF` once for it.
+//! an operator Stop, the physical button, a lift fault, an ODrive error or
+//! a lost link, `StopControl` sees the latch and sends Monospace `ALL OFF`
+//! once for it.
 //! It then judges Confirmed or Unconfirmed Stop within the Machine profile's
 //! `timeouts.stop_terminal_ms`, counted from controller receipt.
 //!

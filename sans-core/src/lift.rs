@@ -105,6 +105,12 @@
 //!   and becomes Stop, which fails closed.
 //! - Stop (reference): a Disarm, which floats the motor phases upstream. What
 //!   the vertical axis does unpowered is a physical question for #60 and #25.
+//! - ODrive errors (host policy): a fresh sample with any error word set,
+//!   the axis minimum-endstop bit alone on a pressed endstop excepted,
+//!   latches Stop unless a Home is running; a Home that ends with errors is
+//!   `HomeFailed` and the next sample latches Stop. Upstream error words are
+//!   sticky until `clear_errors`, and a set word makes every non-idle state
+//!   exit at once, so Clear Stop is the recovery.
 //! - Stale telemetry: only fresh current-epoch samples count as evidence.
 
 use std::collections::VecDeque;
@@ -214,6 +220,9 @@ pub enum StopCause {
     LinkLost(String),
     /// A command or the axis gave no certain outcome.
     Uncertain(String),
+    /// The ODrive reported an error word, the axis minimum-endstop bit alone
+    /// on a pressed endstop excepted. Clear Stop clears it.
+    AxisError(String),
 }
 
 /// A typed operation fault.
@@ -962,6 +971,16 @@ impl LiftOperations {
             let cause = StopCause::Uncertain("Position trust lost during motion".into());
             return self.stop(cause, link);
         }
+        // A Home's own errors finish it as `HomeFailed`; the next sample stops.
+        let homing = self
+            .active
+            .as_ref()
+            .is_some_and(|a| matches!(a.phase, Phase::Home | Phase::HomeCancel));
+        if self.latch.is_none() && !homing {
+            if let Some(errors) = odrive_errors(&values) {
+                return self.stop(StopCause::AxisError(errors), link);
+            }
+        }
         let (Some(position), Some(velocity)) = (values.position_mm, values.velocity_mm_s) else {
             return;
         };
@@ -1087,6 +1106,24 @@ fn phase_name(phase: &Phase) -> &'static str {
     }
 }
 
+/// The ODrive's error words, or `None` when they are clear. Upstream re-sets
+/// the axis minimum-endstop bit whenever the endstop is pressed outside
+/// homing, so that bit alone on a pressed endstop counts as clear.
+fn odrive_errors(values: &TelemetryValues) -> Option<String> {
+    let only_endstop =
+        values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
+    let clear = (values.axis_error == 0 || only_endstop)
+        && values.motor_error == 0
+        && values.encoder_error == 0
+        && values.controller_error == 0;
+    (!clear).then(|| {
+        format!(
+            "ODrive errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
+            values.axis_error, values.motor_error, values.encoder_error, values.controller_error
+        )
+    })
+}
+
 /// Judge one fresh sample taken after the active command's confirmation.
 fn sample_step(
     axis: &LiftAxisProfile,
@@ -1142,17 +1179,8 @@ fn sample_step(
     match &mut active.phase {
         Phase::Arm => Step::Wait,
         Phase::Clear => {
-            // Upstream re-sets the endstop bit whenever the endstop is pressed
-            // outside homing, so that bit alone is accepted, as Home accepts it.
-            let only_endstop =
-                values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
             // A moving axis never clears: Stop evidence would be withdrawn.
-            if values.axis_state == AxisState::Idle
-                && stationary
-                && values.motor_error == 0
-                && values.encoder_error == 0
-                && values.controller_error == 0
-                && (values.axis_error == 0 || only_endstop)
+            if values.axis_state == AxisState::Idle && stationary && odrive_errors(values).is_none()
             {
                 Step::Finish(LiftOutcome::Completed(None))
             } else {

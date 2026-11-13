@@ -1334,6 +1334,47 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
     assert_eq!(parked.ops.status().latch, None);
 }
 
+#[test]
+fn an_odrive_error_latches_stop_and_clear_stop_clears_it() {
+    let mut rig = homed();
+    rig.board.set_i32(MOTOR_ERROR, 0x40);
+    rig.run_for(25);
+    let status = rig.ops.status();
+    assert!(
+        matches!(&status.latch, Some(StopCause::AxisError(errors)) if errors.contains("motor 0x40")),
+        "{:?}",
+        status.latch
+    );
+    assert!(!status.position_trusted);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    let clear = rig.clear_stop().unwrap();
+    assert_eq!(rig.board.writes_to(CLEAR_ERRORS).len(), 1);
+    // The fake keeps its error words until a test resets them, as upstream
+    // `clear_errors` does.
+    rig.board.set_i32(MOTOR_ERROR, 0);
+    rig.run_for(50);
+    assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.ops.status().latch, None);
+}
+
+#[test]
+fn resting_on_the_pressed_minimum_endstop_is_not_an_odrive_error() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_i32(AXIS_ERROR, 1 << 12);
+    rig.board.set_bool(MIN_ENDSTOP_STATE, true);
+    rig.run_for(50);
+    assert_eq!(rig.ops.status().latch, None);
+
+    // The bit without the pressed endstop is an error.
+    rig.board.set_bool(MIN_ENDSTOP_STATE, false);
+    rig.run_for(25);
+    assert!(matches!(
+        rig.ops.status().latch,
+        Some(StopCause::AxisError(_))
+    ));
+}
+
 // ----- 10. Cross-board Stop -----------------------------------------------------
 
 fn unconfirmed(verdict: Option<StopVerdict>) -> bool {
