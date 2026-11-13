@@ -234,6 +234,11 @@ pub struct CameraRoleProfile {
     pub rotation_degrees: u16,
     /// Full-page preview crop in post-rotation pixels.
     pub crop: CropGeometry,
+    /// Fixed manual exposure in V4L2 `exposure_time_absolute` units of 100 µs.
+    ///
+    /// When omitted, the Camera's own exposure mode is left unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure_100us: Option<u32>,
 }
 
 /// A post-rotation Camera crop rectangle in pixels.
@@ -799,6 +804,9 @@ fn validate_camera(name: &str, camera: &CameraRoleProfile, problems: &mut Vec<St
             None
         }
     };
+    if camera.exposure_100us == Some(0) {
+        problems.push(format!("{name}.exposure_100us must be positive"));
+    }
     if camera.crop.width == 0 || camera.crop.height == 0 {
         problems.push(format!("{name}.crop dimensions must be nonzero"));
     }
