@@ -480,19 +480,25 @@ fn physical_button_and_a_lost_machine_each_stop_the_machine() {
     ));
     assert_eq!(started.all_offs.lock().unwrap().len(), 1);
 
-    // Capture needs the lost board's light, so the blocker stays shown.
+    // Capture needs the lost board's light, so no snapshot after the
+    // request may replace the blocker with a capture.
     started
         .controller
         .send(ControllerIntent::CapturePair)
         .unwrap();
-    started.controller.send(ControllerIntent::Stop).unwrap();
-    let after = recv_within(&started.controller, GATE_WAIT, |snapshot| {
-        started.all_offs.lock().unwrap().len() == 1 && snapshot.stop.is_some()
-    });
-    assert!(matches!(
-        after.screen,
-        MachineScreen::Setup(SetupState::Blocked { .. })
-    ));
+    let watch_until = std::time::Instant::now() + Duration::from_millis(500);
+    while let Some(left) = watch_until.checked_duration_since(std::time::Instant::now()) {
+        if let Ok(snapshot) = started.controller.recv_snapshot_timeout(left) {
+            assert!(
+                matches!(
+                    snapshot.screen,
+                    MachineScreen::Setup(SetupState::Blocked { .. })
+                ),
+                "{:?}",
+                snapshot.screen
+            );
+        }
+    }
 }
 
 #[test]
