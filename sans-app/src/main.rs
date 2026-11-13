@@ -8,12 +8,12 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, CapturePair, CapturePairError, ControllerMachine, MachineEvent, MachineFactory,
-    MonospaceClient, MonospaceConnection, MonospaceEventKind, MonospaceFault,
-    PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
+    bootstrap, MachineBoard, MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection,
+    MonospaceEventKind, MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker,
+    SetupDiagnostic,
 };
 #[cfg(not(target_os = "linux"))]
-use sans_core::{CameraCaptureError, CameraRole};
+use sans_core::{CameraCaptureError, CameraRole, CapturePair, CapturePairError, ControllerMachine};
 
 const MONOSPACE_BOOT_DELAY: Duration = Duration::from_millis(2_500);
 
@@ -29,71 +29,62 @@ struct BootstrapMachineFactory<CameraFactory> {
     cameras: CameraFactory,
 }
 
-struct BootstrapMachine<CameraMachine> {
-    cameras: CameraMachine,
-    monospace: MonospaceConnection,
-}
+/// Monospace as the controller's relay board.
+struct MonospaceBoard(MonospaceConnection);
 
-impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
-    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
-        self.cameras.capture_pair()
-    }
-
+impl MachineBoard for MonospaceBoard {
     fn all_off(&mut self, within: Duration) -> Result<(), String> {
-        self.monospace
+        self.0
             .client
             .all_off_within(within)
             .map_err(|error| error.to_string())
     }
+
+    fn poll(&mut self) -> Option<MachineEvent> {
+        while let Ok(event) = self.0.events.try_recv() {
+            if let Some(event) = monospace_machine_event(event.epoch.get(), event.kind) {
+                return Some(event);
+            }
+        }
+        None
+    }
 }
 
 impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<CameraFactory> {
-    type Machine = BootstrapMachine<CameraFactory::Machine>;
+    type Machine = CameraFactory::Machine;
 
     fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
         self.cameras.odrive_opener()
+    }
+
+    fn open_board(&mut self, profile: &PreparedMachineProfile) -> Option<OpenedBoard> {
+        let path = &profile.profile().boards.monospace_path;
+        let open_timeout = Duration::from_millis(profile.profile().timeouts.device_open_ms);
+        let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
+        let opened =
+            MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
+                .map(|monospace| {
+                    let epoch = monospace.client.epoch().get();
+                    let board: Box<dyn MachineBoard> = Box::new(MonospaceBoard(monospace));
+                    let diagnostic = SetupDiagnostic::ready(
+                        "Monospace",
+                        format!("Ready at {path} on connection epoch {epoch}"),
+                    );
+                    (board, diagnostic)
+                })
+                .map_err(|error| SetupBlocker::new(format!("Monospace at {path}: {error}")));
+        Some(opened)
     }
 
     fn open(
         self,
         profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
-        let cameras = self.cameras.open(profile);
-        let path = &profile.profile().boards.monospace_path;
-        let open_timeout = Duration::from_millis(profile.profile().timeouts.device_open_ms);
-        let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
-        let monospace =
-            MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
-                .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
-
-        match (cameras, monospace) {
-            (Ok((cameras, mut diagnostics)), Ok(monospace)) => {
-                let epoch = monospace.client.epoch().get();
-                diagnostics.push(SetupDiagnostic::ready(
-                    "Monospace",
-                    format!("Ready at {path} on connection epoch {epoch}"),
-                ));
-                Ok((BootstrapMachine { cameras, monospace }, diagnostics))
-            }
-            (Err(mut camera_blockers), Err(mut monospace_blockers)) => {
-                camera_blockers.append(&mut monospace_blockers);
-                Err(camera_blockers)
-            }
-            (Err(camera_blockers), Ok(_)) => Err(camera_blockers),
-            (Ok(_), Err(monospace_blockers)) => Err(monospace_blockers),
-        }
+        self.cameras.open(profile)
     }
 
     fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
-        if let Some(event) = CameraFactory::poll_machine(&mut machine.cameras) {
-            return Some(event);
-        }
-        while let Ok(event) = machine.monospace.events.try_recv() {
-            if let Some(event) = monospace_machine_event(event.epoch.get(), event.kind) {
-                return Some(event);
-            }
-        }
-        None
+        CameraFactory::poll_machine(machine)
     }
 }
 

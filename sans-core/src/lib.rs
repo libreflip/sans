@@ -25,8 +25,9 @@ pub use crate::config::{
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineEvent, MachineFactory,
-    MachineScreen, ScanReadiness, SetupBlocker, SetupDiagnostic, SetupState, TelemetrySummary,
+    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineBoard, MachineEvent,
+    MachineFactory, MachineScreen, OpenedBoard, ScanReadiness, SetupBlocker, SetupDiagnostic,
+    SetupState, TelemetrySummary,
 };
 pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,

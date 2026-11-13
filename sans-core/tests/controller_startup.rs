@@ -307,7 +307,7 @@ fn typed_intent_drives_fake_backed_controller_thread_end_to_end() {
     let opened_on = open_threads.lock().unwrap().clone();
     assert_eq!(opened_on.len(), 1);
     assert_ne!(opened_on[0].0, caller_thread);
-    assert_eq!(opened_on[0].1.as_deref(), Some("sans-controller"));
+    assert_eq!(opened_on[0].1.as_deref(), Some("sans-machine"));
 
     controller.send(ControllerIntent::Exit).unwrap();
     let exited = support::recv_until(&controller, |snapshot| {
