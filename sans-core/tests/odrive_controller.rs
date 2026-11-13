@@ -488,16 +488,19 @@ fn physical_button_and_a_lost_machine_each_stop_the_machine() {
         .unwrap();
     let watch_until = std::time::Instant::now() + Duration::from_millis(500);
     while let Some(left) = watch_until.checked_duration_since(std::time::Instant::now()) {
-        if let Ok(snapshot) = started.controller.recv_snapshot_timeout(left) {
-            assert!(
-                matches!(
-                    snapshot.screen,
-                    MachineScreen::Setup(SetupState::Blocked { .. })
-                ),
-                "{:?}",
-                snapshot.screen
-            );
-        }
+        let snapshot = match started.controller.recv_snapshot_timeout(left) {
+            Ok(snapshot) => snapshot,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(error) => panic!("the controller closed: {error}"),
+        };
+        assert!(
+            matches!(
+                snapshot.screen,
+                MachineScreen::Setup(SetupState::Blocked { .. })
+            ),
+            "{:?}",
+            snapshot.screen
+        );
     }
 }
 
