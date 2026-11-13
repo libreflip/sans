@@ -6,6 +6,7 @@ mod controller;
 mod hardware;
 mod lift;
 mod odrive;
+mod stop;
 
 #[cfg(target_os = "linux")]
 pub use crate::camera::{
@@ -24,8 +25,9 @@ pub use crate::config::{
 };
 pub use crate::controller::{
     bootstrap, CapturePreview, CaptureStatus, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineFactory, MachineScreen,
-    ScanReadiness, SetupBlocker, SetupDiagnostic, SetupState, TelemetrySummary,
+    ControllerMachine, ControllerSnapshot, LiftAxisStatus, MachineBoard, MachineEvent,
+    MachineFactory, MachineScreen, OpenedBoard, ScanReadiness, SetupBlocker, SetupDiagnostic,
+    SetupState, TelemetrySummary,
 };
 pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
@@ -34,7 +36,7 @@ pub use crate::hardware::{
 };
 pub use crate::lift::{
     LiftEvent, LiftFault, LiftOperations, LiftOutcome, LiftRejection, LiftRequest, LiftStatus,
-    OperationId, PageTurnLeg, StopCause, StopEvidence, TouchdownHold, VacuumEvidence,
+    LinkPort, OperationId, PageTurnLeg, StopCause, StopEvidence, TouchdownHold, VacuumEvidence,
 };
 pub use crate::odrive::{
     spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,
@@ -42,3 +44,4 @@ pub use crate::odrive::{
     LinkStatus, OpenRequest, PacketReader, PacketWriter, Priority, TelemetrySample,
     TelemetryValues, Ticket, Transmit, UsbFibreOpener,
 };
+pub use crate::stop::{ClearRefused, Relays, StopControl, StopStatus, StopVerdict};

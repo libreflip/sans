@@ -1,6 +1,7 @@
 //! Native portrait touchscreen entry point for Sans.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use clap::Parser;
@@ -8,9 +9,10 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineFactory,
-    MonospaceClient, MonospaceConnection, MonospaceEventKind, MonospaceFault,
-    PreparedMachineProfile, SetupBlocker, SetupDiagnostic, CAPTURE_LIGHT_SETTLE,
+    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineBoard,
+    MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection, MonospaceEventKind,
+    MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
+    CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{CameraCaptureError, CameraRole};
@@ -25,21 +27,57 @@ struct Arguments {
     config: Option<PathBuf>,
 }
 
-struct BootstrapMachineFactory<CameraFactory> {
-    cameras: CameraFactory,
+/// One Monospace connection, shared by the controller's board and the
+/// Machine's capture light. Each command holds the lock only for its own
+/// reply, so the light never holds up `ALL OFF` for longer than one command.
+type SharedMonospace = Arc<Mutex<MonospaceConnection>>;
+
+fn lock(monospace: &SharedMonospace) -> MutexGuard<'_, MonospaceConnection> {
+    monospace.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+struct BootstrapMachineFactory<CameraFactory> {
+    cameras: CameraFactory,
+    /// The opened Monospace, handed to the Machine for the capture light.
+    monospace: Option<SharedMonospace>,
+}
+
+/// Monospace as the controller's relay board.
+struct MonospaceBoard(SharedMonospace);
+
+impl MachineBoard for MonospaceBoard {
+    fn all_off(&mut self, within: Duration) -> Result<(), String> {
+        lock(&self.0)
+            .client
+            .all_off_within(within)
+            .map_err(|error| error.to_string())
+    }
+
+    fn poll(&mut self) -> Option<MachineEvent> {
+        let monospace = lock(&self.0);
+        while let Ok(event) = monospace.events.try_recv() {
+            if let Some(event) = monospace_machine_event(event.epoch.get(), event.kind) {
+                return Some(event);
+            }
+        }
+        None
+    }
+}
+
+/// The Cameras, lit by Monospace while they capture.
 struct BootstrapMachine<CameraMachine> {
     cameras: CameraMachine,
-    monospace: MonospaceConnection,
+    light: Option<SharedMonospace>,
 }
 
 impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
     fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
-        let light = &mut self.monospace.client;
+        let Some(light) = &self.light else {
+            return self.cameras.capture_pair();
+        };
         let cameras = &mut self.cameras;
         capture_lit_pair(
-            |on| light.set_light(on),
+            |on| lock(light).client.set_light(on),
             CAPTURE_LIGHT_SETTLE,
             || cameras.capture_pair(),
         )
@@ -53,63 +91,59 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
         self.cameras.odrive_opener()
     }
 
+    fn open_board(&mut self, profile: &PreparedMachineProfile) -> Option<OpenedBoard> {
+        let path = &profile.profile().boards.monospace_path;
+        let open_timeout = Duration::from_millis(profile.profile().timeouts.device_open_ms);
+        let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
+        let opened =
+            MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
+                .map(|monospace| {
+                    let epoch = monospace.client.epoch().get();
+                    let monospace = Arc::new(Mutex::new(monospace));
+                    self.monospace = Some(Arc::clone(&monospace));
+                    let board: Box<dyn MachineBoard> = Box::new(MonospaceBoard(monospace));
+                    let diagnostic = SetupDiagnostic::ready(
+                        "Monospace",
+                        format!("Ready at {path} on connection epoch {epoch}"),
+                    );
+                    (board, diagnostic)
+                })
+                .map_err(|error| SetupBlocker::new(format!("Monospace at {path}: {error}")));
+        Some(opened)
+    }
+
     fn open(
         self,
         profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
-        let cameras = self.cameras.open(profile);
-        let path = &profile.profile().boards.monospace_path;
-        let open_timeout = Duration::from_millis(profile.profile().timeouts.device_open_ms);
-        let reply_timeout = Duration::from_millis(profile.profile().timeouts.command_ms);
-        let monospace =
-            MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
-                .map_err(|error| vec![SetupBlocker::new(format!("Monospace at {path}: {error}"))]);
-
-        match (cameras, monospace) {
-            (Ok((cameras, mut diagnostics)), Ok(monospace)) => {
-                let epoch = monospace.client.epoch().get();
-                diagnostics.push(SetupDiagnostic::ready(
-                    "Monospace",
-                    format!("Ready at {path} on connection epoch {epoch}"),
-                ));
-                Ok((BootstrapMachine { cameras, monospace }, diagnostics))
-            }
-            (Err(mut camera_blockers), Err(mut monospace_blockers)) => {
-                camera_blockers.append(&mut monospace_blockers);
-                Err(camera_blockers)
-            }
-            (Err(camera_blockers), Ok(_)) => Err(camera_blockers),
-            (Ok(_), Err(monospace_blockers)) => Err(monospace_blockers),
-        }
+        let (cameras, diagnostics) = self.cameras.open(profile)?;
+        let machine = BootstrapMachine {
+            cameras,
+            light: self.monospace,
+        };
+        Ok((machine, diagnostics))
     }
 
-    fn poll_setup(machine: &mut Self::Machine) -> Option<SetupBlocker> {
-        if let Some(blocker) = CameraFactory::poll_setup(&mut machine.cameras) {
-            return Some(blocker);
-        }
-        while let Ok(event) = machine.monospace.events.try_recv() {
-            if let Some(blocker) = monospace_setup_blocker(event.epoch.get(), event.kind) {
-                return Some(blocker);
-            }
-        }
-        None
+    fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
+        CameraFactory::poll_machine(&mut machine.cameras)
     }
 }
 
-fn monospace_setup_blocker(epoch: u64, event: MonospaceEventKind) -> Option<SetupBlocker> {
+fn monospace_machine_event(epoch: u64, event: MonospaceEventKind) -> Option<MachineEvent> {
     match event {
-        MonospaceEventKind::Pressure(_) | MonospaceEventKind::ButtonPressed => None,
+        MonospaceEventKind::Pressure(_) => None,
+        MonospaceEventKind::ButtonPressed => Some(MachineEvent::StopButton),
         MonospaceEventKind::UnknownEvent(payload) => {
             eprintln!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
             None
         }
-        MonospaceEventKind::Disconnected => Some(SetupBlocker::new(format!(
+        MonospaceEventKind::Disconnected => Some(MachineEvent::Lost(SetupBlocker::new(format!(
             "Monospace disconnected on connection epoch {epoch}"
-        ))),
-        MonospaceEventKind::Fault(fault) => Some(SetupBlocker::new(format!(
+        )))),
+        MonospaceEventKind::Fault(fault) => Some(MachineEvent::Lost(SetupBlocker::new(format!(
             "Monospace connection epoch {epoch} is blocked: {}",
             monospace_fault_summary(&fault)
-        ))),
+        )))),
     }
 }
 
@@ -170,6 +204,7 @@ fn main() -> eframe::Result {
         arguments.config.as_deref(),
         BootstrapMachineFactory {
             cameras: camera_factory,
+            monospace: None,
         },
     );
     let startup = Startup::from_bootstrap(startup);
@@ -187,9 +222,9 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use sans_core::{MonospaceEventKind, MonospaceFault};
+    use sans_core::{MachineEvent, MonospaceEventKind, MonospaceFault, SetupBlocker};
 
-    use super::{monospace_fault_summary, monospace_setup_blocker};
+    use super::{monospace_fault_summary, monospace_machine_event};
 
     #[test]
     fn setup_fault_summaries_preserve_the_failure_class() {
@@ -212,24 +247,29 @@ mod tests {
     }
 
     #[test]
-    fn typed_monospace_events_map_to_setup_without_promoting_unknown_buttons() {
-        assert!(monospace_setup_blocker(8, MonospaceEventKind::Pressure(1_013.0)).is_none());
-        assert!(monospace_setup_blocker(8, MonospaceEventKind::ButtonPressed).is_none());
-        assert!(
-            monospace_setup_blocker(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into()))
-                .is_none()
+    fn typed_monospace_events_map_the_button_to_stop_and_failures_to_lost() {
+        let lost = |summary: &str| Some(MachineEvent::Lost(SetupBlocker::new(summary)));
+        assert_eq!(
+            monospace_machine_event(8, MonospaceEventKind::Pressure(1_013.0)),
+            None
         );
         assert_eq!(
-            monospace_setup_blocker(8, MonospaceEventKind::Disconnected)
-                .unwrap()
-                .summary,
-            "Monospace disconnected on connection epoch 8"
+            monospace_machine_event(8, MonospaceEventKind::ButtonPressed),
+            Some(MachineEvent::StopButton)
         );
         assert_eq!(
-            monospace_setup_blocker(9, MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout))
-                .unwrap()
-                .summary,
-            "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
+            monospace_machine_event(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into())),
+            None
+        );
+        assert_eq!(
+            monospace_machine_event(8, MonospaceEventKind::Disconnected),
+            lost("Monospace disconnected on connection epoch 8")
+        );
+        assert_eq!(
+            monospace_machine_event(9, MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)),
+            lost(
+                "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
+            )
         );
     }
 }

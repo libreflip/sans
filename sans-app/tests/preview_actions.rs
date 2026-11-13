@@ -1,11 +1,11 @@
-//! Capture pair, Retry Capture, and Exit stay on screen and pressable while the body scrolls.
+//! Stop, Capture pair, Retry Capture, and Exit stay on screen and pressable while the body scrolls.
 
 mod support;
 
 use eframe::egui;
 use support::cameras::Step;
 use support::fixtures::portrait_full_frame;
-use support::session::{Session, MATRIX, SCROLLING};
+use support::session::{Session, MATRIX, SCROLLING, T1};
 
 fn assert_actions_fixed(session: &Session, actions: &[(&str, egui::Rect)]) {
     for (label, expected) in actions {
@@ -41,7 +41,7 @@ fn assert_one_capture(session: &mut Session, action: &str) {
 fn actions_stay_inside_the_window_and_still_at_every_scroll_step() {
     for viewport in MATRIX {
         let mut session = Session::with_pair(portrait_full_frame(), viewport);
-        let actions = ["Capture pair", "Exit"].map(|label| (label, session.rect(label)));
+        let actions = ["Stop", "Capture pair", "Exit"].map(|label| (label, session.rect(label)));
 
         session.wheel_through(45.0, |session| assert_actions_fixed(session, &actions));
     }
@@ -92,4 +92,29 @@ fn tapping_exit_at_the_end_of_the_body_closes_the_window() {
 
         session.wait_until("a close command", Session::close_requested);
     }
+}
+
+#[test]
+fn stop_leads_every_action_bar_and_tapping_it_latches_stop() {
+    for viewport in MATRIX {
+        let session = Session::with_pair(portrait_full_frame(), viewport);
+        let stop = session.rect("Stop");
+        for other in ["Capture pair", "Exit"] {
+            let rect = session.rect(other);
+            assert!(
+                stop.top() <= rect.top() && stop.left() <= rect.left(),
+                "Stop at {stop:?} is not before {other} at {rect:?} at {}",
+                viewport.name
+            );
+        }
+    }
+    assert!(Session::setup_blocked(vec!["fixture blocker".into()], T1).has("Stop"));
+
+    let mut session = Session::with_pair(portrait_full_frame(), T1);
+    session.wheel(100_000.0);
+    session.tap_label("Stop");
+
+    // The fixture Machine has no Monospace, so the Stop cannot be confirmed.
+    session.wait_for_label("UNCONFIRMED STOP: switch off machine power");
+    assert!(!session.has("Clear Stop"));
 }

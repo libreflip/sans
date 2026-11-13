@@ -35,8 +35,9 @@
 //!   Unknown state, a failed relay command or a Monospace reconnect is not
 //!   confirmed off. The module cannot check this provenance; the caller is
 //!   responsible for it. The module checks vacuum evidence at `start` only.
-//! - Stop evidence is reported, never judged: #25 owns Stop deadlines and
-//!   Confirmed or Unconfirmed Stop.
+//! - Stop evidence is reported, never judged: `crate::stop::StopControl`
+//!   adds Monospace `ALL OFF`, the Stop deadline and Confirmed or
+//!   Unconfirmed Stop.
 //!
 //! # Motion contract and evidence classes
 //!
@@ -310,6 +311,8 @@ pub struct LiftStatus {
     pub live_hold_mm: Option<f32>,
     /// Axis evidence since the last Stop.
     pub stop_evidence: Option<StopEvidence>,
+    /// How many Stops have been dispatched; each starts fresh axis evidence.
+    pub stops: u64,
 }
 
 /// Owns every lift-axis operation on one link. See the module documentation.
@@ -331,6 +334,7 @@ pub struct LiftOperations {
     stop_disarm: Option<Ticket>,
     stop_confirmed_at: Option<Instant>,
     stop_evidence: Option<StopEvidence>,
+    stops: u64,
     last_id: u64,
     active: Option<Active>,
     events: VecDeque<LiftEvent>,
@@ -396,7 +400,10 @@ enum Step {
     Hold { target_mm: f32 },
 }
 
-type Port<'a> = dyn FnMut(LinkCommand, Priority) -> Option<Ticket> + 'a;
+/// Submits one lift-axis link command and returns its ticket, or `None` when
+/// the link is closed.
+pub type LinkPort<'a> = dyn FnMut(LinkCommand, Priority) -> Option<Ticket> + 'a;
+type Port<'a> = LinkPort<'a>;
 
 impl LiftOperations {
     /// Build from the validated Machine profile. An uncommissioned lift axis
@@ -419,6 +426,7 @@ impl LiftOperations {
             stop_disarm: None,
             stop_confirmed_at: None,
             stop_evidence: None,
+            stops: 0,
             last_id: 0,
             active: None,
             events: VecDeque::new(),
@@ -532,6 +540,7 @@ impl LiftOperations {
         self.finish(LiftOutcome::Fault(LiftFault::Stopped(cause.clone())));
         self.latch.get_or_insert(cause);
         self.stop_disarm = link(LinkCommand::Disarm, Priority::Urgent);
+        self.stops += 1;
         self.stop_confirmed_at = None;
         self.stop_evidence = Some(if self.stop_disarm.is_some() && self.verified {
             StopEvidence::Pending
@@ -541,7 +550,7 @@ impl LiftOperations {
     }
 
     /// Clear the board's errors, then drop the Stop latch once a fresh sample
-    /// taken after the clear reads idle with all error words zero, the axis
+    /// taken after the clear reads idle and stationary with all error words zero, the axis
     /// minimum-endstop bit alone allowed while the endstop is pressed.
     /// Otherwise it finishes `ClearFailed` and the latch stays. Never arms.
     pub fn clear_fault(
@@ -622,6 +631,7 @@ impl LiftOperations {
             touchdown_mm: self.touchdown_mm,
             live_hold_mm: self.live_hold_mm,
             stop_evidence: self.stop_evidence,
+            stops: self.stops,
         }
     }
 
@@ -1136,7 +1146,9 @@ fn sample_step(
             // outside homing, so that bit alone is accepted, as Home accepts it.
             let only_endstop =
                 values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
+            // A moving axis never clears: Stop evidence would be withdrawn.
             if values.axis_state == AxisState::Idle
+                && stationary
                 && values.motor_error == 0
                 && values.encoder_error == 0
                 && values.controller_error == 0
@@ -1145,7 +1157,7 @@ fn sample_step(
                 Step::Finish(LiftOutcome::Completed(None))
             } else {
                 Step::Finish(LiftOutcome::Fault(LiftFault::ClearFailed(format!(
-                    "after clear: axis state {:?}, errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
+                    "after clear: axis state {:?}, stationary {stationary}, errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
                     values.axis_state,
                     values.axis_error,
                     values.motor_error,
