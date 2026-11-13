@@ -14,6 +14,7 @@ pub use self::engine::{
     AxisState, CommandResult, DiscoveryRecord, LinkCommand, LinkConfig, LinkEngine, LinkEvent,
     LinkPhase, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket, Transmit,
 };
+pub(crate) use self::protocol::AXIS_ERROR_MIN_ENDSTOP_PRESSED;
 pub use self::runner::{spawn_link, LinkClosed, LinkHandle, LinkRunner};
 pub use self::transport::{FibreConnection, FibreOpener, OpenRequest, PacketReader, PacketWriter};
 pub use self::usb::UsbFibreOpener;

@@ -27,6 +27,10 @@ urgent_deadline_ms = 50
 # caps of 4.8 A, 1 motor turn per second and 1 motor turn per second squared.
 # Those caps are arbitrary conservative host policy, not measured or physically
 # qualified limits; #60 reviews them. Commissioning does not enable scanning.
+# Lift millimetres are 0 at Home and increase downward; set direction so this holds.
+# The tuning values below are provisional until #60 measures them. Each must be
+# positive and finite; the saturation percent is at most 100 and the hold depth
+# is at most a 5 mm software policy cap.
 #
 # [odrive.lift_axis]
 # direction = "<normal-or-reversed>"
@@ -37,6 +41,16 @@ urgent_deadline_ms = 50
 # velocity_limit_mm_s = <at-most-1-turn-per-second>
 # acceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
 # deceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
+# position_tolerance_mm = <positive>
+# stationary_velocity_mm_s = <positive>
+# move_timeout_ms = <positive>
+# home_timeout_ms = <positive>
+# cancel_timeout_ms = <positive>
+# touchdown_grace_ms = <positive>
+# touchdown_dwell_ms = <positive>
+# touchdown_no_progress_mm = <positive>
+# touchdown_saturation_percent = <at-most-100>
+# touchdown_hold_depth_mm = <at-most-5>
 
 [cameras.left]
 identity = "<set-/dev/v4l/by-id-or-by-path-identity>"

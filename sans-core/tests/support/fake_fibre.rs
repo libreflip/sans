@@ -25,6 +25,7 @@ pub const VBUS_VOLTAGE: u16 = 1;
 pub const AXIS_ERROR: u16 = 71;
 pub const CURRENT_STATE: u16 = 73;
 pub const REQUESTED_STATE: u16 = 74;
+pub const IS_HOMED: u16 = 77;
 pub const MOTOR_ERROR: u16 = 132;
 pub const MOTOR_IS_CALIBRATED: u16 = 134;
 pub const IQ_SETPOINT: u16 = 149;
@@ -32,6 +33,7 @@ pub const IQ_MEASURED: u16 = 150;
 pub const CURRENT_LIM: u16 = 180;
 pub const CONTROLLER_ERROR: u16 = 193;
 pub const INPUT_POS: u16 = 194;
+pub const TRAJECTORY_DONE: u16 = 200;
 pub const CONTROL_MODE: u16 = 208;
 pub const INPUT_MODE: u16 = 209;
 pub const CONTROLLER_VEL_LIMIT: u16 = 213;
@@ -299,6 +301,10 @@ impl FakeFibre {
                 self.settling = self.settle_after_one_read.get(&state).copied();
             }
             return;
+        }
+        if endpoint == INPUT_POS {
+            // Upstream clears trajectory_done when it replans after a position write.
+            self.set_bool(TRAJECTORY_DONE, false);
         }
         self.values.insert(endpoint, payload);
     }

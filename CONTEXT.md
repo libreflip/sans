@@ -41,7 +41,7 @@ One attempt to pick up and turn the page within a capture cycle. Retries remain 
 _Avoid_: Cycle, page slot
 
 **Touchdown**:
-The controlled operation that lowers the suction box until it detects page contact and holds the selected press level.
+The controlled operation that lowers the suction box until it detects page contact and holds the selected press level, with its target a short commissioned hold depth below contact.
 _Avoid_: Move down, descend
 
 **Flutter fan**:
@@ -93,7 +93,7 @@ A non-Stop pause after three confirmed pickup failures in which automatic scanni
 _Avoid_: Stopped state, Stop job
 
 **Position trust**:
-Ligature's report of whether the suction box's current position can be used for absolute motion. Lost position trust requires Home before recovery motion.
+Sans's judgement of whether the suction box's current position can be used for absolute motion. Only a Home that Sans watched from start to end on the current connection grants it; the board's homed flag alone never does. It is lost on every Stop, reconnect and uncertain motion, and regaining it requires Home.
 _Avoid_: Homed flag, homed boolean
 
 **Stop**:

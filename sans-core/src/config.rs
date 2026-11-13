@@ -46,6 +46,10 @@ const ODRIVE_VELOCITY_CAP_TURNS_PER_S: f32 = 1.0;
 ///
 /// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
 const ODRIVE_ACCELERATION_CAP_TURNS_PER_S2: f32 = 1.0;
+/// Software policy cap on the Touchdown hold depth below contact, in millimetres.
+///
+/// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
+const TOUCHDOWN_HOLD_DEPTH_CAP_MM: f32 = 5.0;
 const CAMERA_FRAME_WIDTH: u32 = 3840;
 const CAMERA_FRAME_HEIGHT: u32 = 2160;
 
@@ -188,6 +192,26 @@ pub struct LiftAxisProfile {
     pub acceleration_limit_mm_s2: f32,
     /// Trajectory deceleration limit; at most 1 motor turn per second squared after conversion.
     pub deceleration_limit_mm_s2: f32,
+    /// How close a position must be to a target to count as there.
+    pub position_tolerance_mm: f32,
+    /// Speed at or under which the axis counts as stationary.
+    pub stationary_velocity_mm_s: f32,
+    /// Bound on a move, a page-turn leg and the whole of a Touchdown.
+    pub move_timeout_ms: u64,
+    /// Bound on a Home.
+    pub home_timeout_ms: u64,
+    /// Bound on a routine cancel or a cancelled Home.
+    pub cancel_timeout_ms: u64,
+    /// Time after the Touchdown descent starts in which current saturation is ignored.
+    pub touchdown_grace_ms: u64,
+    /// How long a stall must last to count as contact, and again to count as settled.
+    pub touchdown_dwell_ms: u64,
+    /// Movement within which a stalled axis counts as not progressing.
+    pub touchdown_no_progress_mm: f32,
+    /// Measured current, as a percentage of the press current, that counts as saturated; at most 100.
+    pub touchdown_saturation_percent: f32,
+    /// Hold target depth below contact; at most the 5 mm software policy cap.
+    pub touchdown_hold_depth_mm: f32,
 }
 
 /// Left and Right Camera-role configuration.
@@ -692,6 +716,43 @@ fn validate_lift_axis(lift_axis: &LiftAxisProfile, problems: &mut Vec<String>) {
                 "{name}.{field} exceeds the {cap} {unit} software policy cap after conversion"
             ));
         }
+    }
+    for (field, value) in [
+        ("position_tolerance_mm", lift_axis.position_tolerance_mm),
+        (
+            "stationary_velocity_mm_s",
+            lift_axis.stationary_velocity_mm_s,
+        ),
+        (
+            "touchdown_no_progress_mm",
+            lift_axis.touchdown_no_progress_mm,
+        ),
+        (
+            "touchdown_saturation_percent",
+            lift_axis.touchdown_saturation_percent,
+        ),
+        ("touchdown_hold_depth_mm", lift_axis.touchdown_hold_depth_mm),
+    ] {
+        validate_positive_finite(&format!("{name}.{field}"), value, problems);
+    }
+    for (field, value) in [
+        ("move_timeout_ms", lift_axis.move_timeout_ms),
+        ("home_timeout_ms", lift_axis.home_timeout_ms),
+        ("cancel_timeout_ms", lift_axis.cancel_timeout_ms),
+        ("touchdown_grace_ms", lift_axis.touchdown_grace_ms),
+        ("touchdown_dwell_ms", lift_axis.touchdown_dwell_ms),
+    ] {
+        validate_positive_timeout(&format!("{name}.{field}"), value, problems);
+    }
+    if lift_axis.touchdown_saturation_percent > 100.0 {
+        problems.push(format!(
+            "{name}.touchdown_saturation_percent must be at most 100"
+        ));
+    }
+    if lift_axis.touchdown_hold_depth_mm > TOUCHDOWN_HOLD_DEPTH_CAP_MM {
+        problems.push(format!(
+            "{name}.touchdown_hold_depth_mm exceeds the {TOUCHDOWN_HOLD_DEPTH_CAP_MM} mm software policy cap"
+        ));
     }
 }
 

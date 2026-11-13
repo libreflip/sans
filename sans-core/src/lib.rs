@@ -4,6 +4,7 @@ mod camera;
 mod config;
 mod controller;
 mod hardware;
+mod lift;
 mod odrive;
 
 #[cfg(target_os = "linux")]
@@ -30,6 +31,10 @@ pub use crate::hardware::{
     ConnectionEpoch, HwError, MonospaceClient, MonospaceConnection, MonospaceEvent,
     MonospaceEventKind, MonospaceEvents, MonospaceFault, MonospaceUrgentWriter,
     MONOSPACE_BAUD_RATE,
+};
+pub use crate::lift::{
+    LiftEvent, LiftFault, LiftOperations, LiftOutcome, LiftRejection, LiftRequest, LiftStatus,
+    OperationId, PageTurnLeg, StopCause, StopEvidence, TouchdownHold, VacuumEvidence,
 };
 pub use crate::odrive::{
     spawn_link, AxisState, CommandResult, DiscoveryRecord, FibreConnection, FibreOpener,

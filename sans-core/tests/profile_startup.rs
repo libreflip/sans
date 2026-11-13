@@ -370,6 +370,16 @@ current_limit_a = 4.8
 velocity_limit_mm_s = 8.0
 acceleration_limit_mm_s2 = 8.0
 deceleration_limit_mm_s2 = 4.0
+position_tolerance_mm = 0.5
+stationary_velocity_mm_s = 0.2
+move_timeout_ms = 2000
+home_timeout_ms = 3000
+cancel_timeout_ms = 1000
+touchdown_grace_ms = 100
+touchdown_dwell_ms = 100
+touchdown_no_progress_mm = 1.0
+touchdown_saturation_percent = 90.0
+touchdown_hold_depth_mm = 2.0
 "#;
 
 #[test]
@@ -449,6 +459,21 @@ fn lift_axis_limits_above_software_policy_caps_are_reported() {
             "deceleration_limit_mm_s2 = 4.0\n",
             "",
             "deceleration_limit_mm_s2",
+        ),
+        (
+            "touchdown_dwell_ms = 100\n",
+            "",
+            "missing field `touchdown_dwell_ms`",
+        ),
+        (
+            "touchdown_saturation_percent = 90.0",
+            "touchdown_saturation_percent = 100.5",
+            "odrive.lift_axis.touchdown_saturation_percent must be at most 100",
+        ),
+        (
+            "touchdown_hold_depth_mm = 2.0",
+            "touchdown_hold_depth_mm = 5.1",
+            "odrive.lift_axis.touchdown_hold_depth_mm exceeds the 5 mm software policy cap",
         ),
     ];
 
