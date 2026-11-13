@@ -453,6 +453,14 @@ pub enum CapturePairError {
     /// The capture light could not be switched around the acquisition.
     #[error("complete Capture pair rejected: capture light {0}")]
     Light(String),
+    /// The acquisition failed and the capture light then did not turn off.
+    #[error("{capture}; capture light also did not turn off: {light}")]
+    LightAfterFailure {
+        /// The acquisition failure.
+        capture: Box<CapturePairError>,
+        /// The light-off failure.
+        light: String,
+    },
 }
 
 /// How long the capture light settles before a lit pair is acquired.
@@ -462,22 +470,29 @@ pub const CAPTURE_LIGHT_SETTLE: Duration = Duration::from_millis(200);
 ///
 /// The light turns on, `settle` elapses, `capture` runs, and the light is
 /// switched off whether or not the capture succeeded. A light failure rejects
-/// the pair; a Camera failure takes precedence over a later light-off failure.
+/// the pair, and a light-off failure is reported alongside any earlier failure.
 pub fn capture_lit_pair<E: fmt::Display>(
     mut set_light: impl FnMut(bool) -> Result<(), E>,
     settle: Duration,
     capture: impl FnOnce() -> Result<CapturePair, CapturePairError>,
 ) -> Result<CapturePair, CapturePairError> {
-    if let Err(error) = set_light(true) {
-        let _ = set_light(false);
-        return Err(CapturePairError::Light(format!("did not turn on: {error}")));
+    if let Err(on) = set_light(true) {
+        return Err(CapturePairError::Light(match set_light(false) {
+            Ok(()) => format!("did not turn on: {on}"),
+            Err(off) => format!("did not turn on: {on}; did not turn off: {off}"),
+        }));
     }
     thread::sleep(settle);
     let pair = capture();
-    let off = set_light(false);
-    let pair = pair?;
-    off.map_err(|error| CapturePairError::Light(format!("did not turn off: {error}")))?;
-    Ok(pair)
+    match (pair, set_light(false)) {
+        (Ok(pair), Ok(())) => Ok(pair),
+        (Ok(_), Err(off)) => Err(CapturePairError::Light(format!("did not turn off: {off}"))),
+        (Err(capture), Ok(())) => Err(capture),
+        (Err(capture), Err(off)) => Err(CapturePairError::LightAfterFailure {
+            capture: Box::new(capture),
+            light: off.to_string(),
+        }),
+    }
 }
 
 /// Controller-owned adapters for the two stable Camera roles.
@@ -673,7 +688,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error,
-            CapturePairError::Light("did not turn on: serial gone".into())
+            CapturePairError::Light(
+                "did not turn on: serial gone; did not turn off: serial gone".into()
+            )
         );
         assert_eq!(*events.borrow(), [true, false]);
 
@@ -691,7 +708,13 @@ mod tests {
             || Err(camera_error.clone().into()),
         )
         .unwrap_err();
-        assert_eq!(error, CapturePairError::Camera(camera_error));
+        assert_eq!(
+            error,
+            CapturePairError::LightAfterFailure {
+                capture: Box::new(CapturePairError::Camera(camera_error)),
+                light: "timeout".into(),
+            }
+        );
     }
 
     #[test]

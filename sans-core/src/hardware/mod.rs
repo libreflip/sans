@@ -18,6 +18,7 @@ use thiserror::Error;
 pub const MONOSPACE_BAUD_RATE: u32 = 115_200;
 
 const ALL_OFF_COMMAND: &str = "ALL OFF";
+const LIGHT_OFF_COMMAND: &str = "LIGHT OFF";
 static NEXT_CONNECTION_EPOCH: AtomicU64 = AtomicU64::new(1);
 type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
@@ -658,7 +659,7 @@ impl MonospaceClient {
 
     /// Turn the capture light on or off.
     pub fn set_light(&mut self, on: bool) -> Result<(), HwError> {
-        self.expect_ok(if on { "LIGHT ON" } else { "LIGHT OFF" })
+        self.expect_ok(if on { "LIGHT ON" } else { LIGHT_OFF_COMMAND })
     }
 
     /// Turn off vacuum, flutter fan, and turn blower. Light is unchanged.
@@ -743,12 +744,17 @@ fn wait_for_boot(deadline: Instant, boot_delay: Duration) -> Result<(), HwError>
     Ok(())
 }
 
+/// Retire the writer after de-energizing the relays and switching the light off.
+///
+/// `ALL OFF` leaves the light unchanged and the firmware keeps its last state,
+/// so a retired connection must not strand a light it may have switched on.
 fn best_effort_all_off_and_close(write_half: &SharedWriter) {
     let mut writer = write_half
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(writer) = writer.as_mut() {
-        let _ = write_line(writer.as_mut(), ALL_OFF_COMMAND);
+        let _ = write_line(writer.as_mut(), ALL_OFF_COMMAND)
+            .and_then(|()| write_line(writer.as_mut(), LIGHT_OFF_COMMAND));
     }
     writer.take();
 }
