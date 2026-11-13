@@ -1,144 +1,61 @@
-# Supervised lift commissioning
+# Try the lift
 
-Issue #60 has two parts: the `lift_diag` runner and a supervised component
-run on the actual lift. Automated fake results do not complete the physical
-part. Production scanning stays disabled. Assembled-book acceptance is #31.
+`lift_diag` lets you test lift motion and Touchdown without the scan UI.
+Run it with someone at the machine, other device-control tools stopped, and
+the power switch within reach. Support the lift before disarming it; USB Stop
+cannot hold an unpowered vertical load.
 
-## Before connecting
+## Setup
 
-Stop Sans, `hw_diag`, `odrivetool` and other device owners. Support the vertical
-load before testing idle or Disarm. Keep machine power within reach. USB Stop
-is a software command, not a hardware emergency stop. Do not run this unattended.
+Use an ODrive with calibration and native homing already working. Copy
+[sans.example.toml](../sans.example.toml), fill its required fields, and add
+the `[odrive.lift_axis]` section with your mechanism's conversion, direction,
+travel bounds and motion settings. Millimetres start at Home and increase
+downward. Camera identities and page-width bounds still need valid values,
+though this tool does not open cameras.
 
-Use a copy of the normal Machine profile. Fill every placeholder in
-`sans.example.toml`, including distinct stable camera identities and positive
-page-width bounds. The runner validates the whole profile but never opens
-cameras. Set the real Monospace path, ODrive USB serial, axis, measured
-`mm_per_turn`, direction and conservative travel bounds. Millimetres start at
-Home and increase downward. Include an explicit `[odrive.lift_axis]` table;
-there are no substituted limits or tuning values.
-
-Keep the existing ODrive calibration, Hall feedback, native homing, position
-control and trapezoidal input configuration. Check native homing speed,
-direction, endstop and calibration separately before using Home. The runner
-neither tunes nor saves the board, and does not change those modes. The
-previous report that native Home works is an operator observation; verify
-Home through Sans and retain the result for this run.
-
-For the first supported, unloaded trials, choose the smallest useful current,
-speed and travel. An example candidate is 0.5 A, 1 mm/s, 1 mm/s² acceleration
-and deceleration, 0.5 mm position tolerance, 0.2 mm/s stationary threshold,
-10000 ms move timeout, 30000 ms Home timeout and 1000 ms cancel timeout.
-These are starting candidates, not measured machine settings. If that current
-cannot support the load, resolve that with the supervisor before motion.
-Conversion, direction and travel must come from the mechanism, not this example.
-
-For initial Touchdown trials, candidate host values are 100 ms startup grace,
-200 ms dwell, 0.5 mm no-progress tolerance, 90% current saturation and 0.5 mm
-hold depth. The existing 50% press setting makes press current half the
-commissioned current. Measure whether it can both hold and lift the load.
-Start with the template's 20 ms poll, 100 ms maximum age, 100 ms request and
-50 ms urgent deadlines. Review these against recorded sample age and cycle
-time. Do not relax the immutable caps to make a trial pass.
-
-The immutable software ceilings are 4.8 A, 1 motor turn/s and 1 motor turn/s²
-for acceleration and deceleration. Profile limits may only lower them.
-They are host policy caps, not a physical qualification of this mechanism.
-The Stop terminal budget is at most 500 ms; host dispatch targets 100 ms.
-
-## Run and operate
-
-Create the output directory first and use a new filename for every run:
+The code currently caps current at 4.8 A, speed at 1 motor turn/s, and
+acceleration/deceleration at 1 motor turn/s². These are provisional software
+choices, not measured machine limits. Start with settings suitable for your
+mechanism; the profile can lower these caps.
 
 ```sh
 mkdir -p sans-core/test-results/commissioning
 cargo run -p sans-core --bin lift_diag --locked -- \
-  --config /path/to/candidate-sans.toml \
-  --log sans-core/test-results/commissioning/lift-YYYY-MM-DD-01.csv
+  --config /path/to/sans.toml \
+  --log sans-core/test-results/commissioning/run-01.csv
 ```
 
-Launching performs the production nonmoving gates: Monospace `ALL OFF` then
-`PRESS STOP`, and ODrive identity/schema checks, idle and bounded limit setup.
-Wait for `Verified` and fresh samples. Nothing arms, homes or moves automatically.
-The CLI never switches vacuum, flutter fan or turn blower on. The readiness
-gate's current-connection `ALL OFF` acknowledgement supplies vacuum-off evidence;
-a board fault or disconnect revokes it and requests cross-board Stop.
+Use a new CSV filename each time. Startup leaves the axis idle and the air
+actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 
-| Command | Result |
+## Commands
+
+| Command | What it does |
 | --- | --- |
-| `home` | Native Home, watched by Sans; a clean completion grants Position trust. |
-| `arm` | Enter closed loop; separate from Home and clearing faults. |
-| `disarm` | Urgent idle request while no operation is active; loses Position trust. |
-| `move 10` | Absolute 10 mm target within commissioned travel. |
-| `touchdown` | Bounded descent and automatic press hold using the profile values. |
-| `lift 5` | Absolute 5 mm target, required to be above the fresh current position. |
-| `cancel` | Routine cancel of the active operation; may retain a live press hold. |
-| `stop` or blank Enter | Cross-board Stop, including during motion, hold or collection. |
-| `clear-fault` | Clear errors without arming. A latched Stop must first be Confirmed. |
-| `status` or `help` | Policy status, fresh position/current/age and available commands. |
-| `quit`, EOF, Ctrl-C or SIGTERM | Request cross-board Stop, wait for its verdict, then exit. |
+| `home` | Run Home and establish Position trust. |
+| `arm` | Enable the motor, as a separate action. |
+| `disarm` | Idle the motor when no operation is active; loses Position trust. |
+| `move 10` | Move to absolute position 10 mm. |
+| `touchdown` | Lower to contact and keep pressing at the profile's press setting. |
+| `lift 5` | Lift to absolute position 5 mm, which must be above the current position. |
+| `cancel` | Cancel the current operation; a press hold may remain active. |
+| `stop` or blank Enter | Stop the lift and switch the air actuators off. |
+| `clear-fault` | Clear a Confirmed Stop without arming or resuming motion. |
+| `status` or `help` | Show state, position, current, sample age and commands. |
+| `quit`, EOF or Ctrl-C | Request Stop and wait for its verdict before exiting. |
 
-Use `cancel` or `stop` during an operation; `disarm` then reports Busy. A completed
-Touchdown continues pressing until a successful lift-away or Stop. No extra
-hold command is needed. After Stop, use `clear-fault`, wait for completion,
-then separately `home` and `arm`. Nothing resumes an interrupted move.
-An Unconfirmed Stop requires manual power intervention; clear-fault refuses it.
-After fixing a lost connection, restart the diagnostic and repeat explicit recovery.
-Forced process termination, host power loss and cable loss cannot run an exit
-handler. Check the mechanism before leaving, even after a normal exit.
+## Try it
 
-## Short physical procedure
+1. Run `home`, then `arm`, waiting for each to finish. Try a short move and
+   check direction and distance before moving farther.
+2. Try `touchdown` on some scrap material, then `lift` away. Check that contact
+   detection and press hold work, and that the press current can lift the load.
+3. Try `cancel`, `stop` and the physical button during motion. After a Confirmed
+   Stop, recover with separate `clear-fault`, `home` and `arm` commands. If Stop
+   is Unconfirmed, switch off power and check the machine before continuing.
 
-1. Record the source commit, supervisor, date, load/support arrangement, board
-   identity and available firmware provenance, Hall configuration, calibration,
-   endstop behavior and measured conversion/direction. Firmware `0.0.0` alone
-   does not identify a vendor build. Retain the CSV discovery/schema fingerprint
-   and compatibility result alongside these observations.
-2. With power intervention ready, check Home, separate Arm and Disarm. Use short
-   moves within known travel. Check direction, distance and the stationary
-   completion evidence. Do not deliberately overtravel.
-3. Repeat modest moves under representative host load. Inspect polling intervals,
-   cycle durations, sample ages, current and position steps. Record Hall resolution,
-   latency and values selected for grace, dwell, no-progress and timeouts.
-4. Use representative material for bounded Touchdown, hold and lift-away. Record
-   false contacts, stiction, press stability and whether press current lifts the
-   loaded box. A failed contact or lift-away trial keeps scanning blocked.
-5. Exercise routine cancel, Stop during a move, Stop during Touchdown/hold and
-   the physical button with the supervisor's agreed load/support arrangement.
-   Check stopped and off evidence, then explicit clear-fault, Home and Arm.
-   Retest after each fault; never infer physical behavior from the fake board.
-6. Compare measured dispatch and terminal evidence against 100 ms and 500 ms.
-   Record failures in #60 and relevant #59/#25/#20 follow-ups. Do not silently
-   lengthen the contract. Review the physical evidence before any readiness change.
-
-## Read the evidence
-
-The CSV records the complete loaded profile, connection discovery and epochs,
-command receipt/submission/results, operation outcomes and policy/Stop status.
-`sample` rows contain position, velocity, both currents, sample age, cycle time
-and raw state/error/calibration/endstop fields. Stale samples retain their age
-but withhold values. Rows have UTC and monotonic milliseconds from process start.
-
-`submit` means host queue submission. `usb_write` is the timestamp immediately
-before the production transport write, with the packet as hexadecimal bytes;
-`usb_result` records its return, including failure. The wrapper forwards the
-production timeout and release behavior unchanged. Rows can arrive out of
-timestamp order because USB and policy run on separate threads.
-`usb_reply` records received packets, allowing sequence correlation, round-trip
-measurements and reconstruction of the descriptor downloaded on this connection.
-Use that descriptor's axis `requested_state` endpoint to identify the
-idle write payload, little-endian `01000000`, and correlate sequence numbers
-with replies/results. Do not count an unrelated telemetry request as Stop
-dispatch. Successful write return does not itself prove stopped motion.
-
-Compare `command_received` to that idle write and to `all_off_dispatch` for host
-dispatch. `all_off_result` records current-connection acknowledgement and elapsed
-time. The first status with Stationary and Confirmed records the fresh stopped/off
-verdict. The sample's first-read timestamp is receipt minus `sample_age_ms`.
-Cycle duration is a full sequential polling cycle, not a single USB round trip.
-Transport write duration and command result latency are separate measurements.
-
-Logging uses a bounded nonblocking queue and a separate writer. Queue overflow
-or writer failure requests Stop and marks the run incomplete. Do not accept
-partial evidence. Preserve the CSV and a short observation note under
-`sans-core/test-results/`; do not mark unperformed trials passed.
+Keep the CSV and a short note of what worked or failed. It already records the
+profile, telemetry, commands and Stop results. The 100 ms dispatch and 500 ms
+stopped/off targets still need checking on the machine. Physical testing for
+#60 remains pending, and production scanning stays disabled.
