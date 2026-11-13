@@ -485,6 +485,57 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
 // ----- 2. Home ------------------------------------------------------------------
 
 #[test]
+fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
+    let mut rig = armed();
+    rig.board.fault_next(CURRENT_STATE, ReplyFault::Hold);
+    let id = rig.start(LiftRequest::Disarm, Unknown).unwrap();
+    assert!(!rig.ops.status().position_trusted);
+    assert_eq!(rig.ops.status().latch, None);
+    rig.run_for(25);
+    assert_eq!(
+        rig.outcome(id),
+        None,
+        "samples before acknowledgement cannot complete Disarm"
+    );
+    for reply in rig.board.take_held() {
+        rig.engine.receive(rig.now, &reply);
+    }
+    rig.settle();
+    assert_eq!(
+        rig.outcome(id),
+        None,
+        "acknowledgement alone is not stationary evidence"
+    );
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.board.requested_states(), vec![1, 11, 8, 1]);
+    assert_eq!(rig.ops.status().latch, None, "Disarm does not latch Stop");
+    assert_eq!(
+        rig.start(MoveTo { position_mm: 10.0 }, Off),
+        Err(LiftRejection::PositionUntrusted)
+    );
+}
+
+#[test]
+fn explicit_disarm_during_motion_is_busy_and_stop_still_preempts() {
+    let mut rig = armed();
+    let move_id = rig.start(MoveTo { position_mm: 50.0 }, Off).unwrap();
+    let mark = rig.board.writes.len();
+    assert_eq!(
+        rig.start(LiftRequest::Disarm, Unknown),
+        Err(LiftRejection::Busy)
+    );
+    assert_eq!(rig.board.writes.len(), mark);
+    rig.machine_stop();
+    rig.run_for(25);
+    assert!(matches!(
+        rig.outcome(move_id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+}
+
+#[test]
 fn home_success_grants_trust_and_leaves_the_axis_idle() {
     let mut rig = Rig::new(LIFT_AXIS);
     assert!(!rig.ops.status().position_trusted);

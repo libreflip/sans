@@ -20,6 +20,7 @@ serialport = { version = "4", default-features = false }
 
 # hw_diag diagnostic CLI
 clap = { version = "4", features = ["derive"] }
+ctrlc = { version = "3", features = ["termination"] }
 csv = "1"
 chrono = "0.4"
 nusb = "0.2.9"

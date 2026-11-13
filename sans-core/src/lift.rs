@@ -74,6 +74,10 @@
 //!   write, so only samples after the readback count.
 //! - Arming (reference) sets the input position to the current estimate, so
 //!   arming commands no motion.
+//! - Explicit Disarm (host policy) is accepted only without an active
+//!   operation, revokes Position trust and the live hold, and waits for an
+//!   urgent idle request followed by a fresh stationary idle sample. Use
+//!   routine cancel or cross-board Stop to interrupt an operation.
 //! - Routine cancel (reference): an urgent absolute move to the sampled
 //!   position. A position write in trapezoidal mode replans from the current
 //!   setpoint with the configured deceleration, so the axis may overshoot by
@@ -134,6 +138,9 @@ pub struct OperationId(pub u64);
 pub enum LiftRequest {
     /// Enter closed-loop control; completes when the adapter confirms it.
     Arm,
+    /// Urgently idle an otherwise inactive axis and revoke Position trust.
+    /// During an operation use routine cancel or cross-board Stop instead.
+    Disarm,
     /// Run native homing from idle. Grants Position trust on clean evidence.
     Home,
     /// Absolute move, also used to park.
@@ -384,6 +391,7 @@ struct Active {
 #[derive(Clone, Debug)]
 enum Phase {
     Arm,
+    Disarm,
     Clear,
     Home,
     Move {
@@ -483,6 +491,7 @@ impl LiftOperations {
         }
         let phase = match request {
             LiftRequest::Arm => Phase::Arm,
+            LiftRequest::Disarm => Phase::Disarm,
             LiftRequest::Home => Phase::Home,
             LiftRequest::MoveTo { position_mm } => Phase::Move {
                 target_mm: self.check_move(now, position_mm, vacuum, None)?,
@@ -529,8 +538,11 @@ impl LiftOperations {
             Phase::Home => axis.home_timeout_ms,
             _ => axis.move_timeout_ms,
         };
-        if matches!(phase, Phase::Home) {
+        if matches!(phase, Phase::Home | Phase::Disarm) {
             self.lose_trust();
+        }
+        if matches!(phase, Phase::Disarm) {
+            self.live_hold_mm = None;
         }
         let id = self.begin(now, Duration::from_millis(timeout), phase);
         self.submit_phase(link);
@@ -548,7 +560,11 @@ impl LiftOperations {
             return;
         };
         match phase {
-            Phase::Arm | Phase::Clear | Phase::Cancel { .. } | Phase::HomeCancel => {}
+            Phase::Arm
+            | Phase::Disarm
+            | Phase::Clear
+            | Phase::Cancel { .. }
+            | Phase::HomeCancel => {}
             Phase::Home => {
                 let deadline = now + Duration::from_millis(self.axis().cancel_timeout_ms);
                 let active = self.active.as_mut().expect("checked");
@@ -820,6 +836,7 @@ impl LiftOperations {
         let restore_a = self.board_current_a.filter(|_| self.press_limit);
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
+            Phase::Disarm => (None, LinkCommand::Disarm),
             Phase::Home => (restore_a, LinkCommand::Home),
             Phase::Move { target_mm } => (
                 restore_a,
@@ -849,7 +866,14 @@ impl LiftOperations {
                     link,
                 );
             }
-            _ => self.submit(command, Priority::Ordinary, link),
+            _ => {
+                let priority = if matches!(active.phase, Phase::Disarm) {
+                    Priority::Urgent
+                } else {
+                    Priority::Ordinary
+                };
+                self.submit(command, priority, link);
+            }
         }
     }
 
@@ -1154,6 +1178,7 @@ fn needs_trust(phase: &Phase) -> bool {
 fn phase_name(phase: &Phase) -> &'static str {
     match phase {
         Phase::Arm => "Arm",
+        Phase::Disarm => "Disarm",
         Phase::Clear => "clear fault",
         Phase::Home => "Home",
         Phase::Move { .. } => "move",
@@ -1230,6 +1255,11 @@ fn sample_step(
     };
     match &mut active.phase {
         Phase::Arm => Step::Wait,
+        Phase::Disarm => match values.axis_state {
+            AxisState::Idle if stationary => Step::Finish(LiftOutcome::Completed(None)),
+            AxisState::Idle => Step::Wait,
+            other => Step::Stop(format!("disarmed axis reads {other:?}")),
+        },
         Phase::Clear => {
             // A moving axis never clears: Stop evidence would be withdrawn.
             if values.axis_state == AxisState::Idle && stationary && odrive_errors(values).is_none()

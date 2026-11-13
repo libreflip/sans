@@ -91,4 +91,12 @@ Automated tests run the link against a fake Fibre device served from the capture
 
 ## Direct diagnostics
 
+`cargo run -p sans-core --bin lift_diag -- --config <profile> --log <new.csv>`
+opens a supervised commissioning CLI for Home, Arm, Disarm, bounded moves,
+Touchdown/press hold, lift-away, cancel and cross-board Stop. It uses the
+production lift and Stop policies, records CSV evidence and starts without
+motion. See the [commissioning procedure](docs/lift-commissioning.md) for profile
+prerequisites and commands. Physical acceptance in #60 remains pending until
+the supervised run and evidence review; scanning stays disabled.
+
 `sans-core` retains `hw_diag` and the Linux V4L2 `camcal` binary. Run them only during supervised hardware work while the `sans` application is stopped; they open devices directly, and `hw_diag` can energize relays.
