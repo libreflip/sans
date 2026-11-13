@@ -245,8 +245,9 @@ fn verify_fixed_profile(
 
 /// Fixes the image controls the profile names; omitted ones keep the Camera's own behaviour.
 ///
-/// Every value is checked against its control's reported range before any control is written,
-/// so a profile value the Camera cannot take leaves all of its controls as they were.
+/// Every value is checked against its control's reported type, range and step before any control
+/// is written, so a value outside what the Camera reports leaves all of its controls as they were.
+/// A write the Camera still rejects blocks Setup after the controls before it have been set.
 fn apply_fixed_controls(
     role: CameraRole,
     path: &Path,
