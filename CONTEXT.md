@@ -104,6 +104,10 @@ _Avoid_: Finish Book
 A Stop for which current-connection evidence shows that motion is stopped and vacuum, flutter fan, and turn blower were commanded off.
 _Avoid_: Safe stop
 
+**Clear Stop**:
+The deliberate recovery from a Confirmed Stop that clears the lift axis's errors and the Stop latch without arming; Position trust stays lost until Home.
+_Avoid_: Reset, resume
+
 **Unconfirmed Stop**:
 A Stop lacking current-connection evidence for either stopped motion or commanded-off vacuum, flutter fan, and turn blower; it requires manual power intervention.
 _Avoid_: Failed stop, safe stop

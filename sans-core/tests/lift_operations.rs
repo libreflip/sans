@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use sans_core::{
     prepare_machine_profile, LiftDirection, LiftEvent, LiftFault, LiftOperations, LiftOutcome,
     LiftRejection, LiftRequest, LinkCommand, LinkConfig, LinkEngine, LinkEvent, OperationId,
-    PageTurnLeg, Priority, StopCause, StopEvidence, Ticket, TouchdownHold, VacuumEvidence,
+    PageTurnLeg, Priority, StopCause, StopControl, StopEvidence, StopVerdict, Ticket,
+    TouchdownHold, VacuumEvidence,
 };
 use support::fake_fibre::*;
 
@@ -51,6 +52,11 @@ struct Rig {
     engine: LinkEngine,
     board: FakeFibre,
     ops: LiftOperations,
+    control: StopControl,
+    /// The next `ALL OFF` replies; `Ok` once the script runs out.
+    relay_replies: Vec<Result<(), String>>,
+    /// The wait each `ALL OFF` was given.
+    relay_calls: Vec<Duration>,
     now: Instant,
     tickets: u64,
     sign: f32,
@@ -88,6 +94,9 @@ impl Rig {
             engine: LinkEngine::new(LinkConfig::from_profile(profile).unwrap(), 0x1234),
             board: FakeFibre::compatible(),
             ops: LiftOperations::new(profile),
+            control: StopControl::new(profile),
+            relay_replies: Vec::new(),
+            relay_calls: Vec::new(),
             now: Instant::now(),
             tickets: 0,
             sign,
@@ -128,8 +137,10 @@ impl Rig {
                 self.link_events.push((self.now, event));
             }
             while let Some(event) = self.ops.take_event() {
+                self.control.note(&event);
                 self.events.push(event);
             }
+            self.observe();
             if replies.is_empty() && !fed {
                 return;
             }
@@ -138,6 +149,36 @@ impl Rig {
             }
         }
         panic!("the rig kept exchanging without time passing");
+    }
+
+    fn observe(&mut self) {
+        let (calls, replies) = (&mut self.relay_calls, &mut self.relay_replies);
+        let mut relays = relays(calls, replies);
+        self.control.observe(self.now, &self.ops, &mut relays);
+    }
+
+    /// A cross-board Stop through `StopControl`.
+    fn machine_stop(&mut self) {
+        let (calls, replies) = (&mut self.relay_calls, &mut self.relay_replies);
+        let mut relays = relays(calls, replies);
+        let mut link = port(&mut self.engine, &mut self.tickets, self.now);
+        let cause = StopCause::Requested("touchscreen".into());
+        self.control
+            .stop(self.now, cause, &mut self.ops, &mut link, &mut relays);
+        drop((link, relays));
+        self.settle();
+    }
+
+    fn clear_stop(&mut self) -> Result<OperationId, sans_core::ClearRefused> {
+        let mut link = port(&mut self.engine, &mut self.tickets, self.now);
+        let result = self.control.clear(self.now, &mut self.ops, &mut link);
+        drop(link);
+        self.settle();
+        result
+    }
+
+    fn verdict(&self) -> Option<StopVerdict> {
+        self.control.status().map(|status| status.verdict)
     }
 
     fn run_for(&mut self, ms: u64) {
@@ -270,6 +311,21 @@ impl Rig {
             .rev()
             .find(|(_, request)| !request.payload.is_empty())
             .unwrap()
+    }
+}
+
+/// The scripted Monospace `ALL OFF` port.
+fn relays<'a>(
+    calls: &'a mut Vec<Duration>,
+    replies: &'a mut Vec<Result<(), String>>,
+) -> impl FnMut(Duration) -> Result<(), String> + 'a {
+    move |within| {
+        calls.push(within);
+        if replies.is_empty() {
+            Ok(())
+        } else {
+            replies.remove(0)
+        }
     }
 }
 
@@ -1276,4 +1332,217 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
     parked.run_for(50);
     assert_eq!(parked.outcome(clear), Some(LiftOutcome::Completed(None)));
     assert_eq!(parked.ops.status().latch, None);
+}
+
+// ----- 6. Cross-board Stop ------------------------------------------------------
+
+fn unconfirmed(verdict: Option<StopVerdict>) -> bool {
+    matches!(verdict, Some(StopVerdict::Unconfirmed { .. }))
+}
+
+#[test]
+fn stop_fans_out_disarm_and_all_off_and_confirms_on_stationary_evidence() {
+    let mut rig = armed();
+
+    rig.machine_stop();
+
+    let (urgent, request) = rig.last_write();
+    assert!(*urgent);
+    assert_eq!(request.endpoint, REQUESTED_STATE);
+    assert_eq!(rig.relay_calls, vec![Duration::from_millis(500)]);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirming));
+    assert_eq!(
+        rig.control.next_wakeup(),
+        Some(rig.now + Duration::from_millis(500))
+    );
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+    assert_eq!(rig.control.next_wakeup(), None);
+    assert_eq!(rig.relay_calls.len(), 1);
+}
+
+#[test]
+fn relay_failure_is_unconfirmed_even_with_a_stationary_axis() {
+    let mut rig = armed();
+    rig.relay_replies = vec![Err("reply timeout".into())];
+
+    rig.machine_stop();
+    rig.run_for(25);
+
+    assert_eq!(
+        rig.ops.status().stop_evidence,
+        Some(StopEvidence::Stationary)
+    );
+    assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
+}
+
+#[test]
+fn missing_evidence_is_unconfirmed_at_the_deadline_and_late_evidence_never_upgrades() {
+    let mut rig = armed();
+    // The axis keeps moving after Disarm, so no stationary sample arrives.
+    rig.axis(50.0, 3.0, 0.0);
+
+    rig.machine_stop();
+    rig.run_for(499);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirming));
+    rig.run_for(1);
+    assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
+
+    rig.axis(50.0, 0.0, 0.0);
+    rig.run_for(50);
+    assert_eq!(
+        rig.ops.status().stop_evidence,
+        Some(StopEvidence::Stationary)
+    );
+    assert!(unconfirmed(rig.verdict()));
+}
+
+#[test]
+fn a_lift_fault_latch_is_adopted_and_sends_all_off_once() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.start(Home, Unknown).unwrap();
+    // Home never finishes, so its timeout latches Stop inside the lift module.
+    rig.run_for(3_000);
+
+    assert!(rig.ops.status().latch.is_some());
+    assert_eq!(rig.relay_calls.len(), 1);
+    rig.run_for(100);
+    assert_eq!(rig.relay_calls.len(), 1);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+}
+
+#[test]
+fn confirmed_stop_is_withdrawn_by_a_moving_sample() {
+    let mut rig = armed();
+    rig.machine_stop();
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    rig.axis(0.0, 1.0, 0.0);
+    rig.run_for(25);
+
+    assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
+}
+
+#[test]
+fn stopping_again_starts_a_new_attempt_that_can_confirm() {
+    let mut rig = armed();
+    rig.relay_replies = vec![Err("Monospace disconnected".into())];
+    rig.machine_stop();
+    rig.run_for(25);
+    assert!(unconfirmed(rig.verdict()));
+    assert!(
+        rig.clear_stop().is_err(),
+        "Unconfirmed Stop cannot be cleared"
+    );
+
+    rig.machine_stop();
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirming));
+    rig.run_for(25);
+
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+    assert_eq!(rig.relay_calls.len(), 2);
+}
+
+#[test]
+fn a_repeated_stop_while_confirming_keeps_the_deadline() {
+    let mut rig = armed();
+    rig.axis(50.0, 3.0, 0.0);
+    rig.machine_stop();
+    let deadline = rig.control.next_wakeup().unwrap();
+    rig.run_for(100);
+
+    rig.machine_stop();
+
+    assert_eq!(rig.control.next_wakeup(), Some(deadline));
+    assert_eq!(rig.relay_calls.len(), 1, "ALL OFF was already processed");
+    assert_eq!(
+        rig.board
+            .requested_states()
+            .iter()
+            .filter(|s| **s == 1)
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn clear_stop_needs_a_confirmed_stop_and_never_arms() {
+    let mut rig = armed();
+    rig.axis(50.0, 3.0, 0.0);
+    rig.machine_stop();
+    assert_eq!(rig.clear_stop(), Err(sans_core::ClearRefused::NotConfirmed));
+    rig.axis(50.0, 0.0, 0.0);
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    let states = rig.board.requested_states().len();
+    let clear = rig.clear_stop().unwrap();
+    rig.run_for(50);
+
+    assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
+    assert_eq!(
+        rig.board.requested_states().len(),
+        states,
+        "clear never arms"
+    );
+    assert_eq!(rig.ops.status().latch, None);
+    assert_eq!(rig.control.status(), None);
+    assert!(!rig.ops.status().position_trusted);
+}
+
+#[test]
+fn reconnect_unconfirms_and_a_new_stop_confirms_in_the_new_epoch() {
+    let mut rig = armed();
+    rig.machine_stop();
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    rig.connect();
+    rig.run_for(25);
+    assert!(
+        rig.ops.status().latch.is_some(),
+        "a reconnect keeps the latch"
+    );
+    assert!(unconfirmed(rig.verdict()));
+
+    rig.machine_stop();
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+}
+
+#[test]
+fn clear_stop_fails_and_keeps_the_latch_while_the_axis_moves() {
+    let mut rig = armed();
+    rig.machine_stop();
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    let clear = rig.clear_stop().unwrap();
+    // The disarmed axis drifts while it stays idle.
+    rig.axis(10.0, 1.0, 0.0);
+    rig.run_for(50);
+
+    assert!(matches!(
+        rig.outcome(clear),
+        Some(LiftOutcome::Fault(LiftFault::ClearFailed(_)))
+    ));
+    assert!(rig.ops.status().latch.is_some());
+    assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
+}
+
+#[test]
+fn a_stop_the_lift_module_repeats_on_its_own_is_a_new_attempt() {
+    let mut rig = armed();
+    rig.machine_stop();
+    rig.run_for(25);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    // The clear never answers, so its timeout stops the axis again.
+    rig.board.fault_next(CLEAR_ERRORS, ReplyFault::Hold);
+    rig.clear_stop().unwrap();
+    rig.run_for(2_100);
+
+    assert_eq!(rig.relay_calls.len(), 2);
+    assert!(rig.ops.status().latch.is_some());
 }

@@ -666,6 +666,14 @@ impl MonospaceClient {
         self.expect_ok(ALL_OFF_COMMAND)
     }
 
+    /// `ALL OFF`, waiting at most `within` for its exact `OK`.
+    ///
+    /// Stop uses this to fit its confirmation budget. A late reply poisons
+    /// the connection, as any reply timeout does.
+    pub fn all_off_within(&mut self, within: Duration) -> Result<(), HwError> {
+        self.expect_ok_with_timeout(ALL_OFF_COMMAND, within)
+    }
+
     /// Read one averaged pressure sample in millibar.
     pub fn press_once(&mut self) -> Result<f32, HwError> {
         let reply = self.send_raw("PRESS?")?;

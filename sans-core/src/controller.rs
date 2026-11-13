@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::camera::{CapturePair, CapturePairError};
+use crate::lift::{LiftOperations, StopCause};
 use crate::odrive::{
-    spawn_link, DiscoveryRecord, FibreOpener, LinkConfig, LinkEvent, LinkHandle, LinkPhase,
-    LinkRunner, LinkStatus, TelemetrySample, TelemetryValues,
+    spawn_link, DiscoveryRecord, FibreOpener, LinkCommand, LinkConfig, LinkEvent, LinkHandle,
+    LinkPhase, LinkRunner, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket,
 };
+use crate::stop::{Relays, StopControl, StopStatus};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
 /// Telemetry-only snapshot changes publish at most four times a second.
@@ -20,9 +22,14 @@ const TELEMETRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The complete set of UI-to-controller actions.
 ///
-/// No intent arms, homes, moves or clears errors on the lift axis.
+/// No intent arms, homes or moves the lift axis. Only `ClearStop` clears
+/// its errors, and only after a Confirmed Stop.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerIntent {
+    /// Latch Stop: urgently disarm the lift axis and switch Monospace `ALL OFF`.
+    Stop,
+    /// Clear a Confirmed Stop's lift-axis errors and latch. Never arms.
+    ClearStop,
     /// Acquire one complete stationary Capture pair.
     CapturePair,
     /// End the current lift-axis connection and run the connection gate once more.
@@ -199,12 +206,28 @@ pub struct ControllerSnapshot {
     pub lift_axis: LiftAxisStatus,
     /// Scanning stays disabled in this build.
     pub scan_readiness: ScanReadiness,
+    /// The latched Stop, if any.
+    pub stop: Option<StopStatus>,
 }
 
 /// Controller-thread-owned Machine behavior.
 pub trait ControllerMachine: 'static {
     /// Acquire one complete pair or reject it without publishing a partial pair.
     fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError>;
+
+    /// Send Monospace `ALL OFF` and wait at most `within` for its exact `OK`.
+    fn all_off(&mut self, _within: Duration) -> Result<(), String> {
+        Err("no Monospace connection".into())
+    }
+}
+
+/// Something a live Machine reported between intents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MachineEvent {
+    /// The physical button was pressed; it means Stop.
+    StopButton,
+    /// A live resource failed. The controller Stops, then drops the Machine.
+    Lost(SetupBlocker),
 }
 
 /// A deferred constructor for controller-thread-owned Machine resources.
@@ -223,8 +246,8 @@ pub trait MachineFactory: Send + 'static {
         profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>>;
 
-    /// Poll controller-owned resources for a live Setup failure.
-    fn poll_setup(_machine: &mut Self::Machine) -> Option<SetupBlocker> {
+    /// Poll controller-owned resources for a button press or a live failure.
+    fn poll_machine(_machine: &mut Self::Machine) -> Option<MachineEvent> {
         None
     }
 }
@@ -432,25 +455,47 @@ fn spawn_controller<Factory: MachineFactory>(
             }
 
             loop {
-                if let Some(machine) = active_machine.as_mut() {
-                    if let Some(blocker) = Factory::poll_setup(machine) {
+                // Lift deadlines run on every pass: a busy inbox never times out.
+                if lift.poll(Instant::now(), &mut relays(&mut active_machine))
+                    && !state.publish(&mut lift)
+                {
+                    return;
+                }
+                match active_machine.as_mut().and_then(Factory::poll_machine) {
+                    None => {}
+                    Some(MachineEvent::StopButton) => {
+                        let cause = StopCause::Requested("physical button".into());
+                        lift.stop(Instant::now(), cause, &mut relays(&mut active_machine));
+                        if !state.publish(&mut lift) {
+                            return;
+                        }
+                    }
+                    Some(MachineEvent::Lost(blocker)) => {
+                        // Stop while the Machine can still switch its relays off.
+                        let cause = StopCause::LinkLost(blocker.summary.clone());
+                        lift.stop(Instant::now(), cause, &mut relays(&mut active_machine));
+                        active_machine = None;
                         state.screen = MachineScreen::Setup(SetupState::Blocked {
                             reasons: vec![blocker],
                         });
                         if !state.publish(&mut lift) {
                             return;
                         }
-                        active_machine = None;
                     }
                 }
 
                 // Wake for whichever comes first: the next Setup poll of a live
                 // Machine, or the next refresh of a shown sample, so its age
                 // and freshness keep moving even if the link has gone silent.
+                let now = Instant::now();
                 let setup_poll = active_machine.is_some().then_some(SETUP_POLL_INTERVAL);
                 let wait = setup_poll
                     .into_iter()
-                    .chain(lift.refresh_wait(Instant::now()))
+                    .chain(lift.refresh_wait(now))
+                    .chain(
+                        lift.next_wakeup()
+                            .map(|at| at.saturating_duration_since(now)),
+                    )
                     .min();
                 let message = match wait {
                     None => match inbox.recv() {
@@ -469,6 +514,19 @@ fn spawn_controller<Factory: MachineFactory>(
                     },
                 };
                 match message {
+                    Inbox::Intent(ControllerIntent::Stop) => {
+                        let cause = StopCause::Requested("touchscreen Stop".into());
+                        lift.stop(Instant::now(), cause, &mut relays(&mut active_machine));
+                        if !state.publish(&mut lift) {
+                            return;
+                        }
+                    }
+                    Inbox::Intent(ControllerIntent::ClearStop) => {
+                        lift.clear_stop(Instant::now());
+                        if !state.publish(&mut lift) {
+                            return;
+                        }
+                    }
                     Inbox::Intent(ControllerIntent::CapturePair) => {
                         let Some(machine) = active_machine.as_mut() else {
                             continue;
@@ -501,7 +559,10 @@ fn spawn_controller<Factory: MachineFactory>(
                         return;
                     }
                     Inbox::Link(event) => {
-                        let publish = lift.apply(event) || lift.refresh_due(Instant::now());
+                        let now = Instant::now();
+                        let stop_changed =
+                            lift.handle(now, &event, &mut relays(&mut active_machine));
+                        let publish = lift.apply(event) || stop_changed || lift.refresh_due(now);
                         if publish && !state.publish(&mut lift) {
                             return;
                         }
@@ -534,16 +595,39 @@ impl Projection {
             screen: self.screen.clone(),
             lift_axis: lift.status(Instant::now()),
             scan_readiness: ScanReadiness::current(),
+            stop: lift.stop.status(),
         };
         self.revision += 1;
         self.snapshots.send(snapshot).is_ok()
     }
 }
 
-/// The controller's view of the lift-axis link. The link runs on its own
-/// threads; this only folds its events into the next snapshot.
+/// The Machine's `ALL OFF` port, or a failure when no Machine is open.
+fn relays<M: ControllerMachine>(
+    machine: &mut Option<M>,
+) -> impl FnMut(Duration) -> Result<(), String> + '_ {
+    move |within| match machine.as_mut() {
+        Some(machine) => machine.all_off(within),
+        None => Err("no live Machine resources".into()),
+    }
+}
+
+/// The lift-axis submission port; `None` when there is no link.
+fn port(
+    link: &Option<(LinkHandle, LinkRunner)>,
+) -> impl FnMut(LinkCommand, Priority) -> Option<Ticket> + '_ {
+    move |command, priority| link.as_ref()?.0.submit(command, priority).ok()
+}
+
+/// The controller's view of the lift-axis link and the cross-board Stop.
+/// The link runs on its own threads; this folds its events into lift-axis
+/// policy and the next snapshot.
 struct LiftAxis {
     link: Option<(LinkHandle, LinkRunner)>,
+    ops: LiftOperations,
+    stop: StopControl,
+    /// The Stop status the last snapshot carried.
+    shown_stop: Option<StopStatus>,
     status: LiftAxisStatus,
     latest: Option<TelemetrySample>,
     /// When a snapshot last carried this projection.
@@ -558,6 +642,9 @@ impl LiftAxis {
     ) -> Self {
         let mut lift = Self {
             link: None,
+            ops: LiftOperations::new(profile.profile()),
+            stop: StopControl::new(profile.profile()),
+            shown_stop: None,
             status: LiftAxisStatus::starting(),
             latest: None,
             last_publish: None,
@@ -577,6 +664,58 @@ impl LiftAxis {
             }
         }
         lift
+    }
+
+    /// Latch Stop and fan it out to both boards.
+    fn stop(&mut self, now: Instant, cause: StopCause, relays: &mut Relays<'_>) {
+        let mut link = port(&self.link);
+        self.stop.stop(now, cause, &mut self.ops, &mut link, relays);
+        drop(link);
+        self.settle(now, relays);
+    }
+
+    fn clear_stop(&mut self, now: Instant) {
+        let mut link = port(&self.link);
+        // A refusal is recorded in the Stop status.
+        let _ = self.stop.clear(now, &mut self.ops, &mut link);
+    }
+
+    /// Feed one link event to lift-axis policy; true when the Stop changed.
+    fn handle(&mut self, now: Instant, event: &LinkEvent, relays: &mut Relays<'_>) -> bool {
+        let mut link = port(&self.link);
+        self.ops.handle_link_event(now, event, &mut link);
+        drop(link);
+        self.settle(now, relays);
+        self.stop_changed()
+    }
+
+    /// Process deadlines; true when the Stop changed.
+    fn poll(&mut self, now: Instant, relays: &mut Relays<'_>) -> bool {
+        let mut link = port(&self.link);
+        self.ops.poll(now, &mut link);
+        drop(link);
+        self.settle(now, relays);
+        self.stop_changed()
+    }
+
+    fn settle(&mut self, now: Instant, relays: &mut Relays<'_>) {
+        while let Some(event) = self.ops.take_event() {
+            self.stop.note(&event);
+        }
+        self.stop.observe(now, &self.ops, relays);
+    }
+
+    fn stop_changed(&self) -> bool {
+        self.stop.status() != self.shown_stop
+    }
+
+    /// The earliest lift-axis or Stop deadline.
+    fn next_wakeup(&self) -> Option<Instant> {
+        self.ops
+            .next_wakeup()
+            .into_iter()
+            .chain(self.stop.next_wakeup())
+            .min()
     }
 
     fn reconnect(&self) {
@@ -633,6 +772,7 @@ impl LiftAxis {
 
     fn status(&mut self, now: Instant) -> LiftAxisStatus {
         self.last_publish = Some(now);
+        self.shown_stop = self.stop.status();
         let mut status = self.status.clone();
         status.telemetry = self
             .latest
@@ -719,6 +859,7 @@ mod tests {
                 screen: capture_preview(CaptureStatus::Ready, Some(first)),
                 lift_axis: LiftAxisStatus::starting(),
                 scan_readiness: ScanReadiness::current(),
+                stop: None,
             })
             .unwrap();
         let latest = pair(2);
@@ -727,6 +868,7 @@ mod tests {
             screen: capture_preview(CaptureStatus::Ready, Some(latest)),
             lift_axis: LiftAxisStatus::starting(),
             scan_readiness: ScanReadiness::current(),
+            stop: None,
         };
         snapshots.send(expected.clone()).unwrap();
 
@@ -749,6 +891,7 @@ mod tests {
             screen: MachineScreen::Exited,
             lift_axis: LiftAxisStatus::starting(),
             scan_readiness: ScanReadiness::current(),
+            stop: None,
         };
         snapshots.send(exited.clone()).unwrap();
         snapshots.close();

@@ -6,10 +6,11 @@ use std::time::Duration;
 use eframe::egui;
 use sans_core::{
     CapturePair, CapturePreview, CaptureStatus, CapturedFrame, ControllerClosed, ControllerHandle,
-    ControllerIntent, PreviewImage,
+    ControllerIntent, PreviewImage, StopStatus,
 };
 
 use crate::screen::{self, Header};
+use crate::stop::{show_stop, stop_actions, stop_header};
 
 /// Smallest Full-page height before the body scrolls instead.
 const FULL_PAGE_MIN_HEIGHT: f32 = 240.0;
@@ -93,12 +94,14 @@ fn load_texture(
 
 /// Show the Capture preview screen for `preview`.
 ///
-/// The action bar holds the state's capture action followed by `exit`.
+/// The action bar holds Stop beside the state's capture action, then `exit`. A
+/// latched Stop replaces the header status and leads the body.
 pub(crate) fn show_capture_preview(
     ui: &mut egui::Ui,
     context: &egui::Context,
     handle: &ControllerHandle,
     preview: &CapturePreview,
+    stop: Option<&StopStatus>,
     textures: Option<&PreviewTextures>,
     exit: impl FnOnce(&mut egui::Ui),
 ) -> Result<(), ControllerClosed> {
@@ -107,12 +110,14 @@ pub(crate) fn show_capture_preview(
         CaptureStatus::Capturing => ("Capturing both Camera roles", egui::Color32::LIGHT_BLUE),
         CaptureStatus::Blocked { .. } => ("Capture blocked", egui::Color32::LIGHT_RED),
     };
-    let header = Header::new(status, colour).warning_tag(
-        preview
-            .preview_warning
-            .as_ref()
-            .map(|_| "100% preview warning"),
-    );
+    let header = stop_header(stop).unwrap_or_else(|| {
+        Header::new(status, colour).warning_tag(
+            preview
+                .preview_warning
+                .as_ref()
+                .map(|_| "100% preview warning"),
+        )
+    });
     if preview.status == CaptureStatus::Capturing {
         context.request_repaint_after(Duration::from_millis(16));
     }
@@ -122,10 +127,15 @@ pub(crate) fn show_capture_preview(
         ui,
         header,
         |ui| {
-            result = show_capture_action(ui, context, handle, &preview.status);
+            let mut capture = Ok(());
+            result = stop_actions(ui, handle, stop, |ui| {
+                capture = show_capture_action(ui, context, handle, &preview.status);
+            })
+            .and(capture);
             exit(ui);
         },
         |ui, viewport_height| {
+            show_stop(ui, stop);
             if let CaptureStatus::Blocked { reason } = &preview.status {
                 ui.colored_label(egui::Color32::LIGHT_RED, reason);
             }

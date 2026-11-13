@@ -7,6 +7,7 @@
 mod lift_axis;
 mod preview;
 mod screen;
+mod stop;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use sans_core::{
 use crate::lift_axis::{reconnect_action, show_lift_axis};
 use crate::preview::{show_capture_preview, sync_preview_textures, PreviewTextures};
 use crate::screen::Header;
+use crate::stop::{show_stop, stop_actions, stop_header};
 
 /// Initial size hint, used only when no window manager honours the maximize request.
 const PORTRAIT_SIZE_HINT: [f32; 2] = [600.0, 1_024.0];
@@ -187,6 +189,8 @@ fn show_controller(
             show_lift_axis(ui, &snapshot.lift_axis, &snapshot.scan_readiness);
         }
     };
+    let stop = snapshot.and_then(|snapshot| snapshot.stop.as_ref());
+    let header = |status, colour| stop_header(stop).unwrap_or_else(|| Header::new(status, colour));
     let mut closed = false;
     let mut exit = |ui: &mut egui::Ui| show_exit_action(ui, context, handle, exit_requested_at);
 
@@ -194,20 +198,31 @@ fn show_controller(
         None | Some(MachineScreen::Exited) => {
             screen::show(
                 ui,
-                Header::new("Checking Camera readiness...", egui::Color32::GRAY).busy(),
-                exit,
-                |_, _| {},
+                stop_header(stop).unwrap_or_else(|| {
+                    Header::new("Checking Camera readiness...", egui::Color32::GRAY).busy()
+                }),
+                |ui| closed = stop_actions(ui, handle, stop, exit).is_err(),
+                |ui, _| show_stop(ui, stop),
             );
+            if closed {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
         Some(MachineScreen::Setup(SetupState::Blocked { reasons })) => {
             screen::show(
                 ui,
-                Header::new("Setup blocked", egui::Color32::YELLOW),
+                header("Setup blocked", egui::Color32::YELLOW),
                 |ui| {
-                    closed = reconnect_action(ui, handle).is_err();
+                    let mut reconnect = Ok(());
+                    closed = stop_actions(ui, handle, stop, |ui| {
+                        reconnect = reconnect_action(ui, handle);
+                    })
+                    .and(reconnect)
+                    .is_err();
                     exit(ui);
                 },
                 |ui, _| {
+                    show_stop(ui, stop);
                     ui.label("Scanning is disabled. Non-actuating diagnostics remain available.");
                     ui.add_space(12.0);
                     for reason in reasons {
@@ -223,16 +238,22 @@ fn show_controller(
         Some(MachineScreen::Setup(SetupState::Ready { diagnostics })) => {
             screen::show(
                 ui,
-                Header::new("Machine ready", egui::Color32::LIGHT_GREEN),
+                header("Machine ready", egui::Color32::LIGHT_GREEN),
                 |ui| {
-                    if screen::action_button(ui, "Capture pair").clicked() {
-                        closed = handle.send(ControllerIntent::CapturePair).is_err();
-                        context.request_repaint_after(Duration::from_millis(16));
-                    }
+                    let mut capture = Ok(());
+                    closed = stop_actions(ui, handle, stop, |ui| {
+                        if screen::action_button(ui, "Capture pair").clicked() {
+                            capture = handle.send(ControllerIntent::CapturePair);
+                            context.request_repaint_after(Duration::from_millis(16));
+                        }
+                    })
+                    .and(capture)
+                    .is_err();
                     closed |= reconnect_action(ui, handle).is_err();
                     exit(ui);
                 },
                 |ui, _| {
+                    show_stop(ui, stop);
                     for diagnostic in diagnostics {
                         ui.label(format!("{}: {}", diagnostic.component, diagnostic.summary));
                     }
@@ -244,7 +265,7 @@ fn show_controller(
             }
         }
         Some(MachineScreen::CapturePreview(preview)) => {
-            if show_capture_preview(ui, context, handle, preview, textures, exit).is_err() {
+            if show_capture_preview(ui, context, handle, preview, stop, textures, exit).is_err() {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

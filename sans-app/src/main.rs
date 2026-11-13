@@ -8,9 +8,9 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, CapturePair, CapturePairError, ControllerMachine, MachineFactory, MonospaceClient,
-    MonospaceConnection, MonospaceEventKind, MonospaceFault, PreparedMachineProfile, SetupBlocker,
-    SetupDiagnostic,
+    bootstrap, CapturePair, CapturePairError, ControllerMachine, MachineEvent, MachineFactory,
+    MonospaceClient, MonospaceConnection, MonospaceEventKind, MonospaceFault,
+    PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{CameraCaptureError, CameraRole};
@@ -37,6 +37,13 @@ struct BootstrapMachine<CameraMachine> {
 impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
     fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
         self.cameras.capture_pair()
+    }
+
+    fn all_off(&mut self, within: Duration) -> Result<(), String> {
+        self.monospace
+            .client
+            .all_off_within(within)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -77,33 +84,34 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
         }
     }
 
-    fn poll_setup(machine: &mut Self::Machine) -> Option<SetupBlocker> {
-        if let Some(blocker) = CameraFactory::poll_setup(&mut machine.cameras) {
-            return Some(blocker);
+    fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
+        if let Some(event) = CameraFactory::poll_machine(&mut machine.cameras) {
+            return Some(event);
         }
         while let Ok(event) = machine.monospace.events.try_recv() {
-            if let Some(blocker) = monospace_setup_blocker(event.epoch.get(), event.kind) {
-                return Some(blocker);
+            if let Some(event) = monospace_machine_event(event.epoch.get(), event.kind) {
+                return Some(event);
             }
         }
         None
     }
 }
 
-fn monospace_setup_blocker(epoch: u64, event: MonospaceEventKind) -> Option<SetupBlocker> {
+fn monospace_machine_event(epoch: u64, event: MonospaceEventKind) -> Option<MachineEvent> {
     match event {
-        MonospaceEventKind::Pressure(_) | MonospaceEventKind::ButtonPressed => None,
+        MonospaceEventKind::Pressure(_) => None,
+        MonospaceEventKind::ButtonPressed => Some(MachineEvent::StopButton),
         MonospaceEventKind::UnknownEvent(payload) => {
             eprintln!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
             None
         }
-        MonospaceEventKind::Disconnected => Some(SetupBlocker::new(format!(
+        MonospaceEventKind::Disconnected => Some(MachineEvent::Lost(SetupBlocker::new(format!(
             "Monospace disconnected on connection epoch {epoch}"
-        ))),
-        MonospaceEventKind::Fault(fault) => Some(SetupBlocker::new(format!(
+        )))),
+        MonospaceEventKind::Fault(fault) => Some(MachineEvent::Lost(SetupBlocker::new(format!(
             "Monospace connection epoch {epoch} is blocked: {}",
             monospace_fault_summary(&fault)
-        ))),
+        )))),
     }
 }
 
@@ -181,9 +189,9 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use sans_core::{MonospaceEventKind, MonospaceFault};
+    use sans_core::{MachineEvent, MonospaceEventKind, MonospaceFault, SetupBlocker};
 
-    use super::{monospace_fault_summary, monospace_setup_blocker};
+    use super::{monospace_fault_summary, monospace_machine_event};
 
     #[test]
     fn setup_fault_summaries_preserve_the_failure_class() {
@@ -206,24 +214,29 @@ mod tests {
     }
 
     #[test]
-    fn typed_monospace_events_map_to_setup_without_promoting_unknown_buttons() {
-        assert!(monospace_setup_blocker(8, MonospaceEventKind::Pressure(1_013.0)).is_none());
-        assert!(monospace_setup_blocker(8, MonospaceEventKind::ButtonPressed).is_none());
-        assert!(
-            monospace_setup_blocker(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into()))
-                .is_none()
+    fn typed_monospace_events_map_the_button_to_stop_and_failures_to_lost() {
+        let lost = |summary: &str| Some(MachineEvent::Lost(SetupBlocker::new(summary)));
+        assert_eq!(
+            monospace_machine_event(8, MonospaceEventKind::Pressure(1_013.0)),
+            None
         );
         assert_eq!(
-            monospace_setup_blocker(8, MonospaceEventKind::Disconnected)
-                .unwrap()
-                .summary,
-            "Monospace disconnected on connection epoch 8"
+            monospace_machine_event(8, MonospaceEventKind::ButtonPressed),
+            Some(MachineEvent::StopButton)
         );
         assert_eq!(
-            monospace_setup_blocker(9, MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout))
-                .unwrap()
-                .summary,
-            "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
+            monospace_machine_event(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into())),
+            None
+        );
+        assert_eq!(
+            monospace_machine_event(8, MonospaceEventKind::Disconnected),
+            lost("Monospace disconnected on connection epoch 8")
+        );
+        assert_eq!(
+            monospace_machine_event(9, MonospaceEventKind::Fault(MonospaceFault::ReplyTimeout)),
+            lost(
+                "Monospace connection epoch 9 is blocked: reply timeout poisoned response correlation"
+            )
         );
     }
 }

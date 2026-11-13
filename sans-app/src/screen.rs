@@ -6,7 +6,9 @@
 //! - The header is one line with the application name and the current status.
 //!   It never scrolls.
 //! - The action bar is fixed to the bottom and holds the screen's actions,
-//!   stacked vertically at touch height. It never scrolls and cannot be resized.
+//!   stacked vertically at touch height, except that Stop shares the first
+//!   row with the screen's leading action. It never scrolls and cannot be
+//!   resized.
 //! - The body fills the space between them and scrolls vertically by pointer
 //!   drag, mouse wheel, or a solid scroll bar when its content is taller.
 //!   Every screen scrolls the same way: the bar is always solid and shown
@@ -130,7 +132,12 @@ fn show_header(ui: &mut egui::Ui, header: &Header<'_>) {
 
 /// A full-height action button.
 pub(crate) fn action_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
-    ui.add_sized(action_size(ui), egui::Button::new(label))
+    action(ui, egui::Button::new(label))
+}
+
+/// A full-height action from a styled button.
+pub(crate) fn action(ui: &mut egui::Ui, button: egui::Button<'_>) -> egui::Response {
+    ui.add_sized(action_size(ui), button)
 }
 
 /// A non-interactive placeholder that keeps an action's place in the bar.

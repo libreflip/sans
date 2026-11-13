@@ -563,3 +563,36 @@ fn reconnect_uses_a_fresh_epoch() {
     second_release.send(()).unwrap();
     second_board.join().unwrap();
 }
+
+#[test]
+fn all_off_within_waits_only_its_own_budget_for_the_ok() {
+    let (release_board, wait_for_timeout) = mpsc::channel();
+    let (host_reader, host, board_thread) = run_board(move |board| {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        acknowledge_readiness(&mut reader, &mut writer);
+        let mut command = String::new();
+        reader.read_line(&mut command).unwrap();
+        writer.write_all(b"OK\n").unwrap();
+        let mut late = String::new();
+        reader.read_line(&mut late).unwrap();
+        wait_for_timeout.recv().unwrap();
+        [command, late]
+    });
+    // The ordinary reply timeout is far longer than the Stop budget.
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_secs(10)).unwrap();
+
+    assert!(connection
+        .client
+        .all_off_within(Duration::from_millis(100))
+        .is_ok());
+    let started = Instant::now();
+    assert!(matches!(
+        connection.client.all_off_within(Duration::from_millis(20)),
+        Err(HwError::ReplyTimeout)
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    release_board.send(()).unwrap();
+    assert_eq!(board_thread.join().unwrap(), ["ALL OFF\n", "ALL OFF\n"]);
+}

@@ -6,12 +6,14 @@ mod support;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use sans_core::{
-    bootstrap, CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, ControllerHandle,
-    ControllerIntent, FibreOpener, LinkPhase, MachineFactory, MachineScreen,
-    PreparedMachineProfile, RoleCamera, ScanReadiness, SetupBlocker, SetupDiagnostic, SetupState,
+    bootstrap, CameraCaptureError, CameraRole, CapturePair, CapturePairError, CapturePairMachine,
+    CapturedFrame, ControllerHandle, ControllerIntent, ControllerMachine, FibreOpener, LinkPhase,
+    MachineEvent, MachineFactory, MachineScreen, PreparedMachineProfile, RoleCamera, ScanReadiness,
+    SetupBlocker, SetupDiagnostic, SetupState, StopCause, StopVerdict,
 };
 use support::fake_fibre::*;
 use support::{recv_within, GATE_WAIT};
@@ -50,14 +52,38 @@ impl RoleCamera for NeverCalledCamera {
     }
 }
 
+/// Cameras plus a scripted Monospace: `ALL OFF` always answers `OK`.
+struct Machine {
+    cameras: CapturePairMachine,
+    all_offs: Arc<Mutex<Vec<Duration>>>,
+    events: mpsc::Receiver<MachineEvent>,
+}
+
+impl ControllerMachine for Machine {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        self.cameras.capture_pair()
+    }
+
+    fn all_off(&mut self, within: Duration) -> Result<(), String> {
+        self.all_offs.lock().unwrap().push(within);
+        Ok(())
+    }
+}
+
 struct Factory {
     opener: FakeOpener,
     opener_requests: Arc<Mutex<usize>>,
     cameras_ready: bool,
+    all_offs: Arc<Mutex<Vec<Duration>>>,
+    events: mpsc::Receiver<MachineEvent>,
 }
 
 impl MachineFactory for Factory {
-    type Machine = CapturePairMachine;
+    type Machine = Machine;
+
+    fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
+        machine.events.try_recv().ok()
+    }
 
     fn odrive_opener(&mut self) -> Box<dyn FibreOpener> {
         *self.opener_requests.lock().unwrap() += 1;
@@ -75,7 +101,14 @@ impl MachineFactory for Factory {
             Box::new(NeverCalledCamera(CameraRole::Left)),
             Box::new(NeverCalledCamera(CameraRole::Right)),
         )
-        .map(|machine| (machine, Vec::new()))
+        .map(|cameras| {
+            let machine = Machine {
+                cameras,
+                all_offs: self.all_offs,
+                events: self.events,
+            };
+            (machine, Vec::new())
+        })
         .map_err(|error| vec![SetupBlocker::new(error.to_string())])
     }
 }
@@ -83,6 +116,8 @@ impl MachineFactory for Factory {
 struct Started {
     controller: ControllerHandle,
     opener: FakeOpener,
+    all_offs: Arc<Mutex<Vec<Duration>>>,
+    machine_events: mpsc::Sender<MachineEvent>,
     _temp: tempfile::TempDir,
 }
 
@@ -109,18 +144,24 @@ fn start(profile: &str, opener: FakeOpener, cameras_ready: bool) -> Started {
     let temp = tempfile::tempdir().unwrap();
     let path: PathBuf = temp.path().join("sans.toml");
     fs::write(&path, with_relaxed_timing(profile)).unwrap();
+    let all_offs = Arc::new(Mutex::new(Vec::new()));
+    let (machine_events, events) = mpsc::channel();
     let controller = bootstrap(
         Some(&path),
         Factory {
             opener: opener.clone(),
             opener_requests: Arc::new(Mutex::new(0)),
             cameras_ready,
+            all_offs: Arc::clone(&all_offs),
+            events,
         },
     )
     .unwrap();
     Started {
         controller,
         opener,
+        all_offs,
+        machine_events,
         _temp: temp,
     }
 }
@@ -152,6 +193,8 @@ fn invalid_or_version_1_profile_never_asks_the_factory_for_the_odrive_opener() {
                 opener: opener.clone(),
                 opener_requests: Arc::clone(&requests),
                 cameras_ready: true,
+                all_offs: Arc::default(),
+                events: mpsc::channel().1,
             },
         );
 
@@ -347,4 +390,91 @@ fn shown_telemetry_keeps_ageing_after_the_link_falls_silent() {
     started.opener.release_writes();
 
     assert!(!later.lift_axis.telemetry.as_ref().unwrap().fresh);
+}
+
+fn verified() -> Started {
+    let started = start(
+        &commissioned(),
+        FakeOpener::new(FakeFibre::compatible()),
+        true,
+    );
+    recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot.lift_axis.phase == LinkPhase::Verified
+    });
+    started
+}
+
+fn stop_verdict(snapshot: &sans_core::ControllerSnapshot) -> Option<StopVerdict> {
+    snapshot.stop.as_ref().map(|stop| stop.verdict.clone())
+}
+
+#[test]
+fn stop_intent_confirms_on_both_boards_then_clear_stop_unlatches_without_arming() {
+    let started = verified();
+
+    started.controller.send(ControllerIntent::Stop).unwrap();
+    let confirmed = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        stop_verdict(snapshot) == Some(StopVerdict::Confirmed)
+    });
+
+    assert_eq!(
+        confirmed.stop.unwrap().cause,
+        StopCause::Requested("touchscreen Stop".into())
+    );
+    assert_eq!(
+        *started.all_offs.lock().unwrap(),
+        vec![Duration::from_millis(500)]
+    );
+    // The gate's idle request, then Stop's urgent Disarm.
+    assert_eq!(
+        started.opener.board.lock().unwrap().requested_states(),
+        vec![1, 1]
+    );
+
+    started
+        .controller
+        .send(ControllerIntent::ClearStop)
+        .unwrap();
+    recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot.stop.is_none()
+    });
+    let board = started.opener.board.lock().unwrap();
+    assert_eq!(board.writes_to(CLEAR_ERRORS).len(), 1);
+    assert_eq!(board.requested_states(), vec![1, 1], "clear never arms");
+}
+
+#[test]
+fn physical_button_and_a_lost_machine_each_stop_the_machine() {
+    let started = verified();
+    started
+        .machine_events
+        .send(MachineEvent::StopButton)
+        .unwrap();
+    let pressed = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot.stop.is_some()
+    });
+    assert_eq!(
+        pressed.stop.unwrap().cause,
+        StopCause::Requested("physical button".into())
+    );
+
+    let started = verified();
+    started
+        .machine_events
+        .send(MachineEvent::Lost(SetupBlocker::new(
+            "Monospace disconnected",
+        )))
+        .unwrap();
+    let lost = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        snapshot.stop.is_some()
+    });
+    assert_eq!(
+        lost.stop.unwrap().cause,
+        StopCause::LinkLost("Monospace disconnected".into())
+    );
+    assert!(matches!(
+        lost.screen,
+        MachineScreen::Setup(SetupState::Blocked { .. })
+    ));
+    assert_eq!(started.all_offs.lock().unwrap().len(), 1);
 }

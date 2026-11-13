@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use sans_core::{
     bootstrap, CapturePair, CapturePairError, ControllerClosed, ControllerHandle, ControllerIntent,
-    ControllerMachine, MachineFactory, MachineScreen, PreparedMachineProfile, SetupBlocker,
-    SetupDiagnostic, SetupState,
+    ControllerMachine, MachineEvent, MachineFactory, MachineScreen, PreparedMachineProfile,
+    SetupBlocker, SetupDiagnostic, SetupState,
 };
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
@@ -116,12 +116,12 @@ struct BlockingDropFactory {
 struct PanickingFactory;
 
 struct PollingFactory {
-    faults: mpsc::Receiver<SetupBlocker>,
+    faults: mpsc::Receiver<MachineEvent>,
     epoch: u64,
 }
 
 struct PollingMachine {
-    faults: mpsc::Receiver<SetupBlocker>,
+    faults: mpsc::Receiver<MachineEvent>,
 }
 
 impl ControllerMachine for PollingMachine {
@@ -152,7 +152,7 @@ impl MachineFactory for PollingFactory {
         ))
     }
 
-    fn poll_setup(machine: &mut Self::Machine) -> Option<SetupBlocker> {
+    fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
         machine.faults.try_recv().ok()
     }
 }
@@ -161,7 +161,7 @@ fn bootstrap_polling_controller(
     profile_path: &Path,
     epoch: u64,
 ) -> (
-    mpsc::Sender<SetupBlocker>,
+    mpsc::Sender<MachineEvent>,
     ControllerHandle,
     Vec<SetupDiagnostic>,
 ) {
@@ -185,11 +185,13 @@ fn bootstrap_polling_controller(
 }
 
 fn assert_polling_controller_blocks(
-    fault_sender: &mpsc::Sender<SetupBlocker>,
+    fault_sender: &mpsc::Sender<MachineEvent>,
     controller: &ControllerHandle,
     failure: &str,
 ) {
-    fault_sender.send(SetupBlocker::new(failure)).unwrap();
+    fault_sender
+        .send(MachineEvent::Lost(SetupBlocker::new(failure)))
+        .unwrap();
     // Lift-axis status snapshots keep the Ready screen; wait for the Setup change.
     let blocked = support::recv_until(controller, |snapshot| {
         !matches!(
