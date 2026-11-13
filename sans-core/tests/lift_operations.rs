@@ -1334,7 +1334,7 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
     assert_eq!(parked.ops.status().latch, None);
 }
 
-// ----- 6. Cross-board Stop ------------------------------------------------------
+// ----- 10. Cross-board Stop -----------------------------------------------------
 
 fn unconfirmed(verdict: Option<StopVerdict>) -> bool {
     matches!(verdict, Some(StopVerdict::Unconfirmed { .. }))
@@ -1460,6 +1460,7 @@ fn a_repeated_stop_while_confirming_keeps_the_deadline() {
         rig.board
             .requested_states()
             .iter()
+            // One idle write from the Home fixture plus one disarm write per Stop.
             .filter(|s| **s == 1)
             .count(),
         3

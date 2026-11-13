@@ -479,6 +479,20 @@ fn physical_button_and_a_lost_machine_each_stop_the_machine() {
         MachineScreen::Setup(SetupState::Blocked { .. })
     ));
     assert_eq!(started.all_offs.lock().unwrap().len(), 1);
+
+    // Capture needs the lost board's light, so the blocker stays shown.
+    started
+        .controller
+        .send(ControllerIntent::CapturePair)
+        .unwrap();
+    started.controller.send(ControllerIntent::Stop).unwrap();
+    let after = recv_within(&started.controller, GATE_WAIT, |snapshot| {
+        started.all_offs.lock().unwrap().len() == 1 && snapshot.stop.is_some()
+    });
+    assert!(matches!(
+        after.screen,
+        MachineScreen::Setup(SetupState::Blocked { .. })
+    ));
 }
 
 #[test]

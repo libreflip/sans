@@ -17,6 +17,10 @@ use crate::odrive::{
 use crate::stop::{Relays, StopControl, StopStatus};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
+mod machine;
+
+use machine::{setup_state, spawn_machine, MachineRequest};
+
 /// Telemetry-only snapshot changes publish at most four times a second.
 const TELEMETRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -413,10 +417,12 @@ pub fn bootstrap(
 }
 
 /// One controller inbox for intents, lift-axis link events and Machine-thread results.
-enum Inbox {
+pub(super) enum Inbox {
     Intent(ControllerIntent),
     Link(LinkEvent),
     Board(OpenedBoard),
+    /// A button press or failure the controller polled from its own board.
+    BoardEvent(MachineEvent),
     Cameras(Result<Vec<SetupDiagnostic>, Vec<SetupBlocker>>),
     Captured(Result<CapturePair, CapturePairError>),
     Machine(MachineEvent),
@@ -430,7 +436,7 @@ impl From<LinkEvent> for Inbox {
 }
 
 /// How often the controller polls live Machine resources for Setup failures.
-const SETUP_POLL_INTERVAL: Duration = Duration::from_millis(16);
+pub(super) const SETUP_POLL_INTERVAL: Duration = Duration::from_millis(16);
 
 fn spawn_controller<Factory: MachineFactory>(
     profile: PreparedMachineProfile,
@@ -464,9 +470,7 @@ fn spawn_controller<Factory: MachineFactory>(
             // The ODrive opener is requested only after the profile validated,
             // and before live Camera and board resources are opened.
             let mut lift = LiftAxis::start(&profile, factory.odrive_opener(), link_events);
-            let Ok(machine) = spawn_machine(Arc::clone(&profile), factory, machine_events) else {
-                return;
-            };
+            let machine = spawn_machine(Arc::clone(&profile), factory, machine_events);
             let mut board: Option<Box<dyn MachineBoard>> = None;
             let mut board_setup: Option<Result<SetupDiagnostic, SetupBlocker>> = None;
             let mut cameras_live = false;
@@ -480,35 +484,28 @@ fn spawn_controller<Factory: MachineFactory>(
                 latest_complete_pair: None,
                 snapshots: snapshot_sender,
             };
+            // Without a Machine thread the lift axis and Stop still run.
+            let machine = match machine {
+                Ok(machine) => Some(machine),
+                Err(error) => {
+                    state.opened = true;
+                    state.screen = MachineScreen::Setup(SetupState::Blocked {
+                        reasons: vec![SetupBlocker::new(format!(
+                            "cannot start the Machine thread: {error}"
+                        ))],
+                    });
+                    if !state.publish(&mut lift) {
+                        return;
+                    }
+                    None
+                }
+            };
 
             loop {
                 // Lift deadlines run on every pass: a busy inbox never times out.
                 if lift.poll(Instant::now(), &mut relays(&mut board)) && !state.publish(&mut lift) {
                     return;
                 }
-                match board.as_mut().and_then(|board| board.poll()) {
-                    None => {}
-                    Some(MachineEvent::StopButton) => {
-                        let cause = StopCause::Requested("physical button".into());
-                        lift.stop(Instant::now(), cause, &mut relays(&mut board));
-                        if !state.publish(&mut lift) {
-                            return;
-                        }
-                    }
-                    Some(MachineEvent::Lost(blocker)) => {
-                        // Stop while the board may still switch its relays off.
-                        let cause = StopCause::LinkLost(blocker.summary.clone());
-                        lift.stop(Instant::now(), cause, &mut relays(&mut board));
-                        board = None;
-                        state.screen = MachineScreen::Setup(SetupState::Blocked {
-                            reasons: vec![blocker],
-                        });
-                        if !state.publish(&mut lift) {
-                            return;
-                        }
-                    }
-                }
-
                 // Wake for whichever comes first: the next poll of a live
                 // board, a lift or Stop deadline, or the next refresh of a
                 // shown sample, so its age keeps moving if the link is silent.
@@ -522,12 +519,15 @@ fn spawn_controller<Factory: MachineFactory>(
                             .map(|at| at.saturating_duration_since(now)),
                     )
                     .min();
-                let message = match wait {
-                    None => match inbox.recv() {
+                // A board event is handled before anything else is received.
+                let board_event = board.as_mut().and_then(|board| board.poll());
+                let message = match (board_event, wait) {
+                    (Some(event), _) => Inbox::BoardEvent(event),
+                    (None, None) => match inbox.recv() {
                         Ok(message) => message,
                         Err(_) => return,
                     },
-                    Some(wait) => match inbox.recv_timeout(wait) {
+                    (None, Some(wait)) => match inbox.recv_timeout(wait) {
                         Ok(message) => message,
                         Err(RecvTimeoutError::Timeout) => {
                             if lift.refresh_due(Instant::now()) && !state.publish(&mut lift) {
@@ -556,7 +556,10 @@ fn spawn_controller<Factory: MachineFactory>(
                         if !cameras_live || capturing {
                             continue;
                         }
-                        if machine.send(MachineRequest::CapturePair).is_err() {
+                        let sent = machine.as_ref().is_some_and(|machine| {
+                            machine.send(MachineRequest::CapturePair).is_ok()
+                        });
+                        if !sent {
                             cameras_live = false;
                             continue;
                         }
@@ -617,9 +620,24 @@ fn spawn_controller<Factory: MachineFactory>(
                             return;
                         }
                     }
-                    Inbox::Machine(MachineEvent::StopButton) => {
+                    Inbox::BoardEvent(MachineEvent::StopButton)
+                    | Inbox::Machine(MachineEvent::StopButton) => {
                         let cause = StopCause::Requested("physical button".into());
                         lift.stop(Instant::now(), cause, &mut relays(&mut board));
+                        if !state.publish(&mut lift) {
+                            return;
+                        }
+                    }
+                    Inbox::BoardEvent(MachineEvent::Lost(blocker)) => {
+                        // Stop while the board may still switch its relays off.
+                        let cause = StopCause::LinkLost(blocker.summary.clone());
+                        lift.stop(Instant::now(), cause, &mut relays(&mut board));
+                        board = None;
+                        // Captures need the board's light, and the blocker stays shown.
+                        cameras_live = false;
+                        state.screen = MachineScreen::Setup(SetupState::Blocked {
+                            reasons: vec![blocker],
+                        });
                         if !state.publish(&mut lift) {
                             return;
                         }
@@ -645,97 +663,6 @@ fn spawn_controller<Factory: MachineFactory>(
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
-}
-
-/// Camera blockers then the board's; Ready only when nothing blocks.
-fn setup_state(
-    cameras: Result<Vec<SetupDiagnostic>, Vec<SetupBlocker>>,
-    board: &Option<Result<SetupDiagnostic, SetupBlocker>>,
-) -> SetupState {
-    let (mut diagnostics, mut reasons) = match cameras {
-        Ok(diagnostics) => (diagnostics, Vec::new()),
-        Err(reasons) => (Vec::new(), reasons),
-    };
-    match board {
-        Some(Ok(diagnostic)) => diagnostics.push(diagnostic.clone()),
-        Some(Err(blocker)) => reasons.push(blocker.clone()),
-        None => {}
-    }
-    if reasons.is_empty() {
-        SetupState::Ready { diagnostics }
-    } else {
-        SetupState::Blocked { reasons }
-    }
-}
-
-enum MachineRequest {
-    CapturePair,
-}
-
-/// Run the factory on its own thread: open the board, then the Cameras,
-/// then serve captures and poll for failures until the controller is gone.
-/// The Machine never leaves this thread, so it need not be `Send`.
-fn spawn_machine<Factory: MachineFactory>(
-    profile: Arc<PreparedMachineProfile>,
-    mut factory: Factory,
-    inbox: Sender<Inbox>,
-) -> std::io::Result<Sender<MachineRequest>> {
-    let (requests, received) = mpsc::channel();
-    thread::Builder::new()
-        .name("sans-machine".into())
-        .spawn(move || {
-            struct ReportPanic(Sender<Inbox>);
-
-            impl Drop for ReportPanic {
-                fn drop(&mut self) {
-                    if thread::panicking() {
-                        let _ = self.0.send(Inbox::MachinePanicked);
-                    }
-                }
-            }
-
-            let _report = ReportPanic(inbox.clone());
-            if let Some(board) = factory.open_board(&profile) {
-                if inbox.send(Inbox::Board(board)).is_err() {
-                    return;
-                }
-            }
-            let mut machine = match factory.open(&profile) {
-                Ok((machine, diagnostics)) => {
-                    if inbox.send(Inbox::Cameras(Ok(diagnostics))).is_err() {
-                        return;
-                    }
-                    machine
-                }
-                Err(reasons) => {
-                    let _ = inbox.send(Inbox::Cameras(Err(reasons)));
-                    return;
-                }
-            };
-            loop {
-                let sent = match received.recv_timeout(SETUP_POLL_INTERVAL) {
-                    Ok(MachineRequest::CapturePair) => {
-                        inbox.send(Inbox::Captured(machine.capture_pair()))
-                    }
-                    Err(RecvTimeoutError::Timeout) => match Factory::poll_machine(&mut machine) {
-                        None => Ok(()),
-                        Some(event) => {
-                            let lost = matches!(event, MachineEvent::Lost(_));
-                            let sent = inbox.send(Inbox::Machine(event));
-                            if lost {
-                                return;
-                            }
-                            sent
-                        }
-                    },
-                    Err(RecvTimeoutError::Disconnected) => return,
-                };
-                if sent.is_err() {
-                    return;
-                }
-            }
-        })?;
-    Ok(requests)
 }
 
 struct Projection {
