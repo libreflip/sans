@@ -269,9 +269,11 @@ fn light_command_timeout_switches_the_light_off_before_retiring() {
         connection.client.set_light(true),
         Err(HwError::ReplyTimeout)
     ));
+    // The retired connection refuses the light-off. The reader may already
+    // have seen the board close its end, which reports Disconnected instead.
     assert!(matches!(
         connection.client.set_light(false),
-        Err(HwError::Poisoned(_))
+        Err(HwError::Poisoned(_) | HwError::Disconnected)
     ));
     assert_eq!(
         board_thread.join().unwrap(),
