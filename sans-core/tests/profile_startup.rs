@@ -71,6 +71,11 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
     let cases = [
         (
             "schema_version = 3",
+            "schema_version = 2",
+            "negate and swap travel bounds",
+        ),
+        (
+            "schema_version = 3",
             "schema_version = 4",
             "unsupported schema_version 4",
         ),
@@ -393,8 +398,8 @@ const LIFT_AXIS_TABLE: &str = r#"
 [odrive.lift_axis]
 direction = "reversed"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -440,8 +445,13 @@ fn complete_lift_axis_table_prepares_as_commissioned() {
 fn invalid_lift_axis_values_are_reported() {
     let cases = [
         (
+            "travel_maximum_mm = 0.0",
             "travel_maximum_mm = 300.0",
-            "travel_maximum_mm = -1.0",
+            "Home is 0 and downward travel is negative",
+        ),
+        (
+            "travel_maximum_mm = 0.0",
+            "travel_maximum_mm = -301.0",
             "odrive.lift_axis travel bounds must be finite and ordered",
         ),
         (

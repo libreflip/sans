@@ -20,8 +20,8 @@ const LIFT_AXIS: &str = r#"
 [odrive.lift_axis]
 direction = "normal"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -365,7 +365,7 @@ fn uncommissioned_profile_writes_no_limit_and_rejects_energizing_commands() {
     link.submit(2, LinkCommand::Home, Priority::Urgent);
     link.submit(
         3,
-        LinkCommand::MoveAbsolute { position_mm: 10.0 },
+        LinkCommand::MoveAbsolute { position_mm: -10.0 },
         Priority::Ordinary,
     );
     link.run_for(5);
@@ -666,7 +666,7 @@ fn urgent_disarm_leaves_while_a_read_is_outstanding_and_retires_a_queued_move() 
     let read = hold_next_telemetry_read(&mut link);
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     let wire_before = link.wire.len();
@@ -703,7 +703,7 @@ fn at_most_one_ordinary_request_is_in_flight() {
     let _read = hold_next_telemetry_read(&mut link);
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.submit(2, LinkCommand::ClearErrors, Priority::Ordinary);
@@ -733,7 +733,7 @@ fn move_requires_position_control_and_trapezoidal_input_and_never_writes_a_mode(
     link.run_for(25);
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.run_for(2);
@@ -750,7 +750,7 @@ fn move_requires_position_control_and_trapezoidal_input_and_never_writes_a_mode(
     link.run_for(25);
     link.submit(
         2,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.run_for(2);
@@ -766,15 +766,15 @@ fn move_requires_position_control_and_trapezoidal_input_and_never_writes_a_mode(
     link.run_for(25);
     link.submit(
         3,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.run_for(5);
     assert_eq!(link.result(3), Some(CommandResult::Completed));
-    // 40 mm at 8 mm per turn is 5 turns.
+    // -40 mm at 8 mm per motor turn is -5 turns.
     assert_eq!(
         link.board.writes_to(INPUT_POS),
-        vec![5.0_f32.to_le_bytes().to_vec()]
+        vec![(-5.0_f32).to_le_bytes().to_vec()]
     );
     let input_pos = link.requests_to(INPUT_POS);
     assert_eq!(input_pos.len(), 2);
@@ -785,8 +785,8 @@ fn move_requires_position_control_and_trapezoidal_input_and_never_writes_a_mode(
 
     for ticket in 4..=6 {
         let position_mm = match ticket {
-            4 => 300.5,
-            5 => -0.5,
+            4 => -300.5,
+            5 => 0.5,
             _ => f32::NAN,
         };
         link.submit(
@@ -809,14 +809,14 @@ fn reversed_move_negates_the_target_in_turns() {
     let mut link = armed(reversed());
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.run_for(5);
     assert_eq!(link.result(1), Some(CommandResult::Completed));
     assert_eq!(
         link.board.writes_to(INPUT_POS),
-        vec![(-5.0_f32).to_le_bytes().to_vec()]
+        vec![5.0_f32.to_le_bytes().to_vec()]
     );
 }
 
@@ -828,7 +828,7 @@ fn move_readback_that_differs_is_not_confirmed() {
         .insert(INPUT_POS, 4.0_f32.to_le_bytes().to_vec());
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.run_for(5);
@@ -922,7 +922,7 @@ fn unknown_state_number_never_counts_as_idle_or_armed() {
     assert!(!state.is_idle() && !state.is_armed(), "{state:?}");
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.submit(2, LinkCommand::Disarm, Priority::Ordinary);
@@ -959,7 +959,7 @@ fn transport_loss_retires_pending_work_with_transmitted_flags_and_reconnect_only
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 8.0 },
+        LinkCommand::MoveAbsolute { position_mm: -8.0 },
         Priority::Ordinary,
     );
     link.engine
@@ -1087,7 +1087,7 @@ fn urgent_command_withdraws_an_engine_queued_move_packet_before_it_leaves() {
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     link.engine
@@ -1133,7 +1133,7 @@ fn non_finite_telemetry_faults_the_link_and_yields_no_usable_sample() {
         assert!(samples_after <= samples_before + 1, "{endpoint} {value}");
         link.submit(
             1,
-            LinkCommand::MoveAbsolute { position_mm: 40.0 },
+            LinkCommand::MoveAbsolute { position_mm: -40.0 },
             Priority::Ordinary,
         );
         link.submit(2, LinkCommand::Home, Priority::Urgent);
@@ -1181,7 +1181,7 @@ fn move_target_that_converts_to_a_non_finite_native_value_is_rejected_unsent() {
     let mut link = armed(config_from(&profile));
     link.submit(
         1,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Urgent,
     );
     match link.result(1) {
@@ -1251,7 +1251,7 @@ fn command_packet_stuck_before_dispatch_expires_unsent_and_can_never_leave() {
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     let stuck = link.take_unclaimed();
@@ -1286,7 +1286,7 @@ fn link_fault_revokes_an_undispatched_command_packet() {
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     let stuck = link.take_unclaimed();
@@ -1313,7 +1313,7 @@ fn energizing_write_cannot_be_dispatched_after_its_sample_goes_stale() {
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     let stuck = link.take_unclaimed();
@@ -1470,7 +1470,7 @@ fn malformed_early_reply_revokes_every_unsent_urgent_energizing_write() {
     for command in [
         LinkCommand::Arm,
         LinkCommand::Home,
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
     ] {
         let (mut link, read, held) = held_urgent_energizing(command);
         assert!(
@@ -1514,7 +1514,7 @@ fn fault_keeps_the_outcome_of_an_energizing_write_already_sent() {
     link.engine.submit(
         link.now,
         Ticket(1),
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Urgent,
     );
     let sent = link.transmit_only();
@@ -1540,7 +1540,7 @@ fn fault_keeps_the_outcome_of_an_energizing_write_already_sent() {
 #[test]
 fn disarm_supersedes_unsent_urgent_energizing_writes() {
     let (mut link, read, held) =
-        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: -40.0 });
 
     link.engine
         .submit(link.now, Ticket(2), LinkCommand::Disarm, Priority::Urgent);
@@ -1560,12 +1560,12 @@ fn disarm_supersedes_unsent_urgent_energizing_writes() {
 #[test]
 fn ordinary_disarm_supersedes_unsent_urgent_energizing_writes() {
     let (mut link, read, held) =
-        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: -40.0 });
 
     link.engine.submit(
         link.now,
         Ticket(3),
-        LinkCommand::MoveAbsolute { position_mm: 48.0 },
+        LinkCommand::MoveAbsolute { position_mm: -48.0 },
         Priority::Ordinary,
     );
     link.engine
@@ -1597,7 +1597,7 @@ fn ordinary_disarm_supersedes_unsent_urgent_energizing_writes() {
 #[test]
 fn reply_to_a_request_never_sent_advances_nothing() {
     let (mut link, _read, held) =
-        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: 40.0 });
+        held_urgent_energizing(LinkCommand::MoveAbsolute { position_mm: -40.0 });
     let sequence = decode_request(&held.packet).sequence;
     let unmatched = link.engine.status().unmatched_replies;
 
@@ -1619,7 +1619,7 @@ fn ordinary_disarm_retires_a_full_queue_before_checking_capacity() {
         link.engine.submit(
             link.now,
             Ticket(ticket),
-            LinkCommand::MoveAbsolute { position_mm: 40.0 },
+            LinkCommand::MoveAbsolute { position_mm: -40.0 },
             Priority::Ordinary,
         );
     }

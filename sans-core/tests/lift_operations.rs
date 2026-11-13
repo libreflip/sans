@@ -28,8 +28,8 @@ const LIFT_AXIS: &str = r#"
 [odrive.lift_axis]
 direction = "normal"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -377,9 +377,9 @@ fn armed_with(lift_axis: &str) -> Rig {
 fn descend_to_contact(rig: &mut Rig, request: LiftRequest, contact_mm: f32) -> OperationId {
     let id = rig.start(request, Off).unwrap();
     let moves = rig.moves().len();
-    rig.axis(contact_mm - 50.0, 5.0, PRESS_A);
+    rig.axis(contact_mm + 50.0, -5.0, -PRESS_A);
     rig.run_for(150);
-    rig.axis(contact_mm, 0.0, PRESS_A);
+    rig.axis(contact_mm, 0.0, -PRESS_A);
     rig.run_until(300, |rig| rig.moves().len() == moves + 1);
     id
 }
@@ -391,9 +391,9 @@ fn touched_down() -> Rig {
         Touchdown {
             post_turn_page_width_mm: None,
         },
-        200.0,
+        -200.0,
     );
-    rig.axis(200.4, 0.0, 1.9);
+    rig.axis(-200.4, 0.0, -1.9);
     rig.run_for(150);
     assert!(
         matches!(rig.outcome(id), Some(LiftOutcome::Completed(Some(_)))),
@@ -407,7 +407,14 @@ fn touched_down() -> Rig {
 /// leaving the press limit applied.
 fn lifted_away() -> Rig {
     let mut rig = touched_down();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Unknown).unwrap();
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Unknown,
+        )
+        .unwrap();
     arrive(&mut rig);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
     assert_eq!(rig.ops.status().live_hold_mm, None);
@@ -446,7 +453,7 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
     let mut rig = armed();
     let arm_ticket = Ticket(rig.tickets);
     rig.board.fault_next(INPUT_POS, ReplyFault::Hold);
-    let id = rig.start(MoveTo { position_mm: 50.0 }, Off).unwrap();
+    let id = rig.start(MoveTo { position_mm: -50.0 }, Off).unwrap();
     let move_ticket = Ticket(rig.tickets);
     let epoch = rig.ops.status().epoch;
     let refused = |ticket, epoch| LinkEvent::CommandResult {
@@ -485,6 +492,44 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
 // ----- 2. Home ------------------------------------------------------------------
 
 #[test]
+fn touchdown_descends_negative_and_lift_away_returns_toward_zero() {
+    let mut rig = armed();
+    let id = rig
+        .start(
+            Touchdown {
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    assert_eq!(rig.moves(), vec![-298.0]);
+    rig.axis(-150.0, -5.0, -PRESS_A);
+    rig.run_for(150);
+    rig.axis(-200.0, 0.0, -PRESS_A);
+    rig.run_for(150);
+    assert_eq!(rig.moves(), vec![-298.0, -202.0]);
+    rig.axis(-200.4, 0.0, -1.9);
+    rig.run_for(150);
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Completed(Some(_)))
+    ));
+    let lift = rig
+        .start(
+            MoveTo {
+                position_mm: -180.0,
+            },
+            Unknown,
+        )
+        .unwrap();
+    rig.axis(-180.0, 0.0, 0.0);
+    rig.trajectory_done();
+    rig.run_for(25);
+    assert_eq!(rig.outcome(lift), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.ops.status().live_hold_mm, None);
+}
+
+#[test]
 fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
     let mut rig = armed();
     rig.board.fault_next(CURRENT_STATE, ReplyFault::Hold);
@@ -511,7 +556,7 @@ fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8, 1]);
     assert_eq!(rig.ops.status().latch, None, "Disarm does not latch Stop");
     assert_eq!(
-        rig.start(MoveTo { position_mm: 10.0 }, Off),
+        rig.start(MoveTo { position_mm: -10.0 }, Off),
         Err(LiftRejection::PositionUntrusted)
     );
 }
@@ -519,7 +564,7 @@ fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
 #[test]
 fn explicit_disarm_during_motion_is_busy_and_stop_still_preempts() {
     let mut rig = armed();
-    let move_id = rig.start(MoveTo { position_mm: 50.0 }, Off).unwrap();
+    let move_id = rig.start(MoveTo { position_mm: -50.0 }, Off).unwrap();
     let mark = rig.board.writes.len();
     assert_eq!(
         rig.start(LiftRequest::Disarm, Unknown),
@@ -606,7 +651,7 @@ fn cancelled_home_disarms_waits_for_stationary_idle_and_grants_no_trust() {
     let mut rig = Rig::new(LIFT_AXIS);
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
-    rig.axis(0.0, 1.0, 0.0);
+    rig.axis(0.0, -1.0, 0.0);
 
     rig.cancel(id);
     let (urgent, request) = rig.last_write();
@@ -616,12 +661,12 @@ fn cancelled_home_disarms_waits_for_stationary_idle_and_grants_no_trust() {
     rig.run_for(50);
     assert_eq!(rig.outcome(id), None, "idle but still moving");
 
-    rig.axis(4.0, 0.0, 0.0);
+    rig.axis(-4.0, 0.0, 0.0);
     rig.board.set_bool(IS_HOMED, true);
     rig.run_for(25);
     assert_eq!(
         rig.outcome(id),
-        Some(LiftOutcome::Cancelled { position_mm: 4.0 })
+        Some(LiftOutcome::Cancelled { position_mm: -4.0 })
     );
     let status = rig.ops.status();
     assert!(!status.position_trusted);
@@ -664,10 +709,18 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
             Off,
             "non-finite",
         ),
-        (MoveTo { position_mm: 300.5 }, Off, "past maximum"),
-        (MoveTo { position_mm: -0.5 }, Off, "past minimum"),
         (
-            MoveTo { position_mm: 250.0 },
+            MoveTo {
+                position_mm: -300.5,
+            },
+            Off,
+            "past minimum",
+        ),
+        (MoveTo { position_mm: 0.5 }, Off, "past maximum"),
+        (
+            MoveTo {
+                position_mm: -250.0,
+            },
             Unknown,
             "descent with vacuum",
         ),
@@ -676,7 +729,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         (
             leg(PageTurnLeg::ToFinalLift, 350.0),
             Off,
-            "leg past minimum",
+            "leg past maximum",
         ),
         (
             leg(PageTurnLeg::Wiggle, 150.0),
@@ -727,7 +780,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
 
     let mut untrusted = Rig::new(LIFT_AXIS);
     assert_eq!(
-        untrusted.start(MoveTo { position_mm: 10.0 }, Off),
+        untrusted.start(MoveTo { position_mm: -10.0 }, Off),
         Err(PositionUntrusted)
     );
     assert_eq!(
@@ -766,7 +819,7 @@ fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence(
     let mark = rig.board.writes.len();
     // The board already reads at the target with its trajectory done, and a
     // telemetry cycle is in progress when the move is requested.
-    rig.axis(10.0, 0.0, 0.0);
+    rig.axis(-10.0, 0.0, 0.0);
     rig.board.readback_override.insert(TRAJECTORY_DONE, vec![1]);
     rig.board.fault_next(POS_ESTIMATE, ReplyFault::Hold);
     rig.run_until(25, |rig| {
@@ -776,7 +829,7 @@ fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence(
             .is_some_and(|request| request.endpoint == POS_ESTIMATE)
     });
 
-    let id = rig.start(MoveTo { position_mm: 10.0 }, Unknown).unwrap();
+    let id = rig.start(MoveTo { position_mm: -10.0 }, Unknown).unwrap();
     for reply in rig.board.take_held() {
         rig.engine.receive(rig.now, &reply);
     }
@@ -796,36 +849,57 @@ fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence(
 #[test]
 fn routine_cancel_stops_armed_with_no_idle_write_and_accepts_a_retry() {
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
-    rig.axis(40.0, 3.0, 0.5);
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.axis(-40.0, -3.0, -0.5);
     rig.run_for(25);
 
     rig.cancel(id);
     let (urgent, request) = rig.last_write();
     assert!(*urgent);
     assert_eq!(request.endpoint, INPUT_POS);
-    assert_eq!(rig.moves(), vec![100.0, 40.0]);
-    rig.axis(41.5, 0.0, 0.0);
+    assert_eq!(rig.moves(), vec![-100.0, -40.0]);
+    rig.axis(-41.5, 0.0, 0.0);
     rig.trajectory_done();
     rig.run_for(25);
 
     assert_eq!(
         rig.outcome(id),
-        Some(LiftOutcome::Cancelled { position_mm: 41.5 })
+        Some(LiftOutcome::Cancelled { position_mm: -41.5 })
     );
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
     let status = rig.ops.status();
     assert_eq!(status.latch, None);
     assert!(status.position_trusted);
-    assert!(rig.start(MoveTo { position_mm: 100.0 }, Off).is_ok());
+    assert!(rig
+        .start(
+            MoveTo {
+                position_mm: -100.0
+            },
+            Off
+        )
+        .is_ok());
 }
 
 #[test]
 fn cancel_whose_braking_envelope_crosses_travel_becomes_urgent_stop() {
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 299.5 }, Off).unwrap();
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -299.5,
+            },
+            Off,
+        )
+        .unwrap();
     // 2 mm/s: 0.3 mm over the 150 ms age and urgent deadline plus 1 mm braking.
-    rig.axis(299.0, 2.0, 0.5);
+    rig.axis(-299.0, -2.0, -0.5);
     rig.run_for(25);
 
     rig.cancel(id);
@@ -834,7 +908,7 @@ fn cancel_whose_braking_envelope_crosses_travel_becomes_urgent_stop() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
-    assert_eq!(rig.moves(), vec![299.5], "no cancel move");
+    assert_eq!(rig.moves(), vec![-299.5], "no cancel move");
     let (urgent, request) = rig.last_write();
     assert!(*urgent);
     assert_eq!(request.endpoint, REQUESTED_STATE);
@@ -843,8 +917,15 @@ fn cancel_whose_braking_envelope_crosses_travel_becomes_urgent_stop() {
 #[test]
 fn cancel_without_stationary_evidence_by_its_timeout_becomes_stop() {
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
-    rig.axis(40.0, 3.0, 0.5);
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.axis(-40.0, -3.0, -0.5);
     rig.run_for(25);
     rig.cancel(id);
 
@@ -896,7 +977,7 @@ fn stop_latches_and_recovery_is_clear_then_home_then_arm() {
     assert_eq!(status.latch, None);
     assert!(!status.position_trusted);
     assert_eq!(
-        rig.start(MoveTo { position_mm: 10.0 }, Off),
+        rig.start(MoveTo { position_mm: -10.0 }, Off),
         Err(LiftRejection::PositionUntrusted)
     );
 
@@ -907,8 +988,15 @@ fn stop_latches_and_recovery_is_clear_then_home_then_arm() {
 #[test]
 fn reconnect_mid_operation_gives_one_fault_and_no_writes_beyond_the_gate() {
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
-    rig.axis(40.0, 3.0, 0.5);
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.axis(-40.0, -3.0, -0.5);
     rig.run_for(25);
     let mark = rig.board.writes.len();
 
@@ -930,7 +1018,14 @@ fn reconnect_mid_operation_gives_one_fault_and_no_writes_beyond_the_gate() {
 #[test]
 fn stop_leaves_urgently_while_a_telemetry_read_is_held() {
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Off,
+        )
+        .unwrap();
     rig.board.fault_next(POS_ESTIMATE, ReplyFault::Hold);
     rig.run_for(25);
     let held = rig.board.take_held();
@@ -968,20 +1063,20 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     assert_eq!(
         rig.moves(),
-        vec![298.0],
-        "travel maximum less the hold depth"
+        vec![-298.0],
+        "travel minimum plus the hold depth"
     );
 
     // Saturated and stationary during the 100 ms grace is not contact: a
     // window may open only when it ends, so 140 ms is short of its dwell.
-    rig.axis(5.0, 0.0, PRESS_A);
+    rig.axis(-5.0, 0.0, -PRESS_A);
     rig.run_for(140);
     // Saturated while descending is not contact.
-    rig.axis(60.0, 5.0, PRESS_A);
+    rig.axis(-60.0, -5.0, -PRESS_A);
     rig.run_for(200);
     assert_eq!(rig.moves().len(), 1);
 
-    rig.axis(200.0, 0.0, PRESS_A);
+    rig.axis(-200.0, 0.0, -PRESS_A);
     let set_at = rig.now;
     rig.run_until(300, |rig| rig.moves().len() == 2);
     let first_stalled = rig
@@ -993,11 +1088,11 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
         })
         .unwrap();
     assert_eq!(rig.now - first_stalled, Duration::from_millis(100));
-    assert_eq!(rig.moves()[1], 202.0, "contact plus the hold depth");
+    assert_eq!(rig.moves()[1], -202.0, "contact minus the hold depth");
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     assert_eq!(rig.write_order_since(mark).last(), Some(&INPUT_POS));
 
-    rig.axis(200.4, 0.0, 1.9);
+    rig.axis(-200.4, 0.0, -1.9);
     rig.run_for(90);
     assert_eq!(rig.outcome(id), None);
     assert_eq!(rig.ops.status().touchdown_mm, None);
@@ -1005,12 +1100,12 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
     assert_eq!(
         rig.outcome(id),
         Some(LiftOutcome::Completed(Some(TouchdownHold {
-            position_mm: 200.4,
+            position_mm: -200.4,
             press_current_a: PRESS_A,
-            hold_target_mm: 202.0,
+            hold_target_mm: -202.0,
         })))
     );
-    assert_eq!(rig.ops.status().touchdown_mm, Some(200.4));
+    assert_eq!(rig.ops.status().touchdown_mm, Some(-200.4));
 }
 
 #[test]
@@ -1021,14 +1116,14 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
         Touchdown {
             post_turn_page_width_mm: None,
         },
-        200.0,
+        -200.0,
     );
 
-    rig.axis(202.0, 0.0, 0.3);
+    rig.axis(-202.0, 0.0, -0.3);
     rig.trajectory_done();
     rig.run_for(25);
     // The routine cancel moves to the sampled position and settles.
-    assert_eq!(rig.moves(), vec![298.0, 202.0, 202.0]);
+    assert_eq!(rig.moves(), vec![-298.0, -202.0, -202.0]);
     rig.trajectory_done();
     rig.run_for(25);
 
@@ -1070,14 +1165,14 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
     use LiftFault::*;
     // Arrival at the descent limit, even saturated.
     let mut rig = armed();
-    let exhausted = touchdown_ending(&mut rig, 297.6, 0.0, PRESS_A, 100);
-    assert_eq!(rig.moves(), vec![298.0, 297.6]);
+    let exhausted = touchdown_ending(&mut rig, -297.6, 0.0, -PRESS_A, 100);
+    assert_eq!(rig.moves(), vec![-298.0, -297.6]);
     // Permanent stiction at the start.
     let mut stuck = armed();
-    let no_progress = touchdown_ending(&mut stuck, 0.3, 0.0, PRESS_A, 400);
+    let no_progress = touchdown_ending(&mut stuck, -0.3, 0.0, -PRESS_A, 400);
     // Descending forever.
     let mut slow = armed();
-    let timed_out = touchdown_ending(&mut slow, 50.0, 5.0, 0.5, 2100);
+    let timed_out = touchdown_ending(&mut slow, -50.0, -5.0, -0.5, 2100);
 
     for (rig, id, fault) in [
         (rig, exhausted, TravelExhausted),
@@ -1092,19 +1187,19 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
 
 #[test]
 fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
-    let lift_axis = LIFT_AXIS.replace("travel_minimum_mm = 0.0", "travel_minimum_mm = 20.0");
+    let lift_axis = LIFT_AXIS.replace("travel_maximum_mm = 0.0", "travel_maximum_mm = -20.0");
     let mut rig = armed_with(&lift_axis);
 
     let request = Touchdown {
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
-    rig.axis(10.0, 0.0, PRESS_A);
+    rig.axis(-10.0, 0.0, -PRESS_A);
     rig.run_for(300);
 
-    // 12 mm is above the 20 mm travel minimum: no hold write, and with the
+    // -12 mm is above the -20 mm travel maximum: no hold write, and with the
     // axis outside travel the cancel cannot run either.
-    assert_eq!(rig.moves(), vec![298.0]);
+    assert_eq!(rig.moves(), vec![-298.0]);
     assert!(
         matches!(rig.outcome(id), Some(LiftOutcome::Fault(_))),
         "{:?}",
@@ -1121,10 +1216,10 @@ fn dropped_telemetry_during_touchdown_ends_in_stop_never_contact() {
     let id = rig.start(request, Off).unwrap();
     rig.run_for(150);
     rig.board.fault_next(POS_ESTIMATE, ReplyFault::Drop);
-    rig.axis(200.0, 0.0, PRESS_A);
+    rig.axis(-200.0, 0.0, -PRESS_A);
     rig.run_for(300);
 
-    assert_eq!(rig.moves(), vec![298.0]);
+    assert_eq!(rig.moves(), vec![-298.0]);
     assert!(
         matches!(
             rig.outcome(id),
@@ -1167,13 +1262,13 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
             "{next:?}"
         );
     }
-    // 200.4 mm less 65, 60, 80, 100 and 105% of 150 mm.
+    // -200.4 mm plus 65, 60, 80, 100 and 105% of 150 mm.
     let legs = &rig.moves()[rig.moves().len() - 5..];
-    for (written, expected) in legs.iter().zip([102.9, 110.4, 80.4, 50.4, 42.9]) {
+    for (written, expected) in legs.iter().zip([-102.9, -110.4, -80.4, -50.4, -42.9]) {
         assert!(close(*written, expected), "{legs:?}");
     }
 
-    // The cutoff is 80% of 150 mm above the previous Touchdown: 80.4 mm.
+    // The cutoff is 80% of 150 mm above the previous Touchdown: -80.4 mm.
     let id = rig
         .start(
             Touchdown {
@@ -1182,8 +1277,8 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
             Off,
         )
         .unwrap();
-    for position in [60.0, 85.0, 100.0] {
-        rig.axis(position, 5.0, 0.5);
+    for position in [-60.0, -85.0, -100.0] {
+        rig.axis(position, -5.0, -0.5);
         rig.run_for(25);
     }
     let cutoffs: Vec<_> = rig
@@ -1194,7 +1289,7 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
     assert_eq!(cutoffs, vec![&LiftEvent::TurnBlowerCutoff { id }]);
     assert_eq!(
         rig.ops.status().touchdown_mm,
-        Some(200.4),
+        Some(-200.4),
         "replaced only on completion"
     );
 }
@@ -1203,9 +1298,9 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
 fn reversed_direction_negates_the_native_target() {
     let mut rig = armed_with(&reversed());
 
-    rig.start(MoveTo { position_mm: 80.0 }, Off).unwrap();
+    rig.start(MoveTo { position_mm: -80.0 }, Off).unwrap();
 
-    assert_eq!(rig.f32_writes(INPUT_POS), vec![-10.0]);
+    assert_eq!(rig.f32_writes(INPUT_POS), vec![10.0]);
 }
 
 fn reversed() -> String {
@@ -1213,37 +1308,39 @@ fn reversed() -> String {
 }
 
 #[test]
-fn reversed_direction_touchdown_detects_contact_from_descent_current_only() {
-    let mut rig = armed_with(&reversed());
-    let id = rig
-        .start(
-            Touchdown {
-                post_turn_page_width_mm: None,
-            },
-            Off,
-        )
-        .unwrap();
-    rig.run_for(150);
-    // Saturated torque opposing the descent is never contact.
-    rig.axis(100.0, 0.0, -PRESS_A);
-    rig.run_for(200);
-    assert_eq!(rig.moves(), vec![298.0]);
-    assert_eq!(rig.outcome(id), None);
+fn touchdown_detects_contact_from_descent_current_only_in_both_directions() {
+    for (profile, native_hold_turns) in [(LIFT_AXIS.to_owned(), -25.25), (reversed(), 25.25)] {
+        let mut rig = armed_with(&profile);
+        let id = rig
+            .start(
+                Touchdown {
+                    post_turn_page_width_mm: None,
+                },
+                Off,
+            )
+            .unwrap();
+        rig.run_for(150);
+        // Saturated torque opposing the descent is never contact.
+        rig.axis(-100.0, 0.0, PRESS_A);
+        rig.run_for(200);
+        assert_eq!(rig.moves(), vec![-298.0]);
+        assert_eq!(rig.outcome(id), None);
 
-    rig.axis(200.0, 0.0, PRESS_A);
-    rig.run_until(300, |rig| rig.moves().len() == 2);
-    assert_eq!(rig.moves()[1], 202.0);
-    assert_eq!(rig.f32_writes(INPUT_POS)[1], -202.0 / 8.0);
-    rig.axis(200.4, 0.0, 1.9);
-    rig.run_for(150);
-    assert_eq!(
-        rig.outcome(id),
-        Some(LiftOutcome::Completed(Some(TouchdownHold {
-            position_mm: 200.4,
-            press_current_a: PRESS_A,
-            hold_target_mm: 202.0,
-        })))
-    );
+        rig.axis(-200.0, 0.0, -PRESS_A);
+        rig.run_until(300, |rig| rig.moves().len() == 2);
+        assert_eq!(rig.moves()[1], -202.0);
+        assert_eq!(rig.f32_writes(INPUT_POS)[1], native_hold_turns);
+        rig.axis(-200.4, 0.0, -1.9);
+        rig.run_for(150);
+        assert_eq!(
+            rig.outcome(id),
+            Some(LiftOutcome::Completed(Some(TouchdownHold {
+                position_mm: -200.4,
+                press_current_a: PRESS_A,
+                hold_target_mm: -202.0,
+            })))
+        );
+    }
 }
 
 #[test]
@@ -1255,7 +1352,7 @@ fn stationary_stop_evidence_is_withdrawn_by_contradiction_or_link_loss() {
         contradicted.ops.status().stop_evidence,
         Some(StopEvidence::Stationary)
     );
-    contradicted.axis(0.0, 1.0, 0.0);
+    contradicted.axis(0.0, -1.0, 0.0);
     contradicted.run_for(25);
     assert_eq!(
         contradicted.ops.status().stop_evidence,
@@ -1292,7 +1389,7 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
             .any(|request| request.endpoint == INPUT_MODE)
     });
     let moves = rig.moves();
-    let id = rig.start(MoveTo { position_mm: 10.0 }, Unknown).unwrap();
+    let id = rig.start(MoveTo { position_mm: -10.0 }, Unknown).unwrap();
     for reply in rig.board.take_held() {
         rig.engine.receive(rig.now, &reply);
     }
@@ -1308,12 +1405,19 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
 
     // The same loss during a confirmed move.
     let mut rig = armed();
-    let id = rig.start(MoveTo { position_mm: 100.0 }, Off).unwrap();
-    rig.axis(40.0, 3.0, 0.5);
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.axis(-40.0, -3.0, -0.5);
     rig.run_for(25);
     rig.board.set_bool(IS_HOMED, false);
     rig.run_for(50);
-    assert_eq!(rig.moves(), vec![100.0]);
+    assert_eq!(rig.moves(), vec![-100.0]);
     assert_eq!(rig.finishes(id).len(), 1);
     assert!(matches!(
         rig.outcome(id),
@@ -1327,13 +1431,18 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
 #[test]
 fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     let mut rig = touched_down();
-    assert_eq!(rig.ops.status().live_hold_mm, Some(200.4));
+    assert_eq!(rig.ops.status().live_hold_mm, Some(-200.4));
     let writes = rig.board.writes.len();
     let wire = rig.wire.len();
 
     assert_eq!(rig.start(Home, Off), Err(LiftRejection::InHold));
     assert_eq!(
-        rig.start(MoveTo { position_mm: 250.0 }, Off),
+        rig.start(
+            MoveTo {
+                position_mm: -250.0
+            },
+            Off
+        ),
         Err(LiftRejection::InHold)
     );
     let touchdown = Touchdown {
@@ -1365,7 +1474,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     assert_eq!(rig.ops.status().live_hold_mm, None);
 
     let mark = rig.board.writes.len();
-    let park = rig.start(MoveTo { position_mm: 50.0 }, Unknown).unwrap();
+    let park = rig.start(MoveTo { position_mm: -50.0 }, Unknown).unwrap();
     assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     arrive(&mut rig);
@@ -1530,7 +1639,7 @@ fn relay_failure_is_unconfirmed_even_with_a_stationary_axis() {
 fn missing_evidence_is_unconfirmed_at_the_deadline_and_late_evidence_never_upgrades() {
     let mut rig = armed();
     // The axis keeps moving after Disarm, so no stationary sample arrives.
-    rig.axis(50.0, 3.0, 0.0);
+    rig.axis(-50.0, -3.0, 0.0);
 
     rig.machine_stop();
     rig.run_for(499);
@@ -1538,7 +1647,7 @@ fn missing_evidence_is_unconfirmed_at_the_deadline_and_late_evidence_never_upgra
     rig.run_for(1);
     assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
 
-    rig.axis(50.0, 0.0, 0.0);
+    rig.axis(-50.0, 0.0, 0.0);
     rig.run_for(50);
     assert_eq!(
         rig.ops.status().stop_evidence,
@@ -1568,7 +1677,7 @@ fn confirmed_stop_is_withdrawn_by_a_moving_sample() {
     rig.run_for(25);
     assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
 
-    rig.axis(0.0, 1.0, 0.0);
+    rig.axis(0.0, -1.0, 0.0);
     rig.run_for(25);
 
     assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
@@ -1597,7 +1706,7 @@ fn stopping_again_starts_a_new_attempt_that_can_confirm() {
 #[test]
 fn a_repeated_stop_while_confirming_keeps_the_deadline() {
     let mut rig = armed();
-    rig.axis(50.0, 3.0, 0.0);
+    rig.axis(-50.0, -3.0, 0.0);
     rig.machine_stop();
     let deadline = rig.control.next_wakeup().unwrap();
     rig.run_for(100);
@@ -1620,10 +1729,10 @@ fn a_repeated_stop_while_confirming_keeps_the_deadline() {
 #[test]
 fn clear_stop_needs_a_confirmed_stop_and_never_arms() {
     let mut rig = armed();
-    rig.axis(50.0, 3.0, 0.0);
+    rig.axis(-50.0, -3.0, 0.0);
     rig.machine_stop();
     assert_eq!(rig.clear_stop(), Err(sans_core::ClearRefused::NotConfirmed));
-    rig.axis(50.0, 0.0, 0.0);
+    rig.axis(-50.0, 0.0, 0.0);
     rig.run_for(25);
     assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
 
@@ -1671,7 +1780,7 @@ fn clear_stop_fails_and_keeps_the_latch_while_the_axis_moves() {
 
     let clear = rig.clear_stop().unwrap();
     // The disarmed axis drifts while it stays idle.
-    rig.axis(10.0, 1.0, 0.0);
+    rig.axis(-10.0, -1.0, 0.0);
     rig.run_for(50);
 
     assert!(matches!(

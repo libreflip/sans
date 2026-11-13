@@ -10,7 +10,7 @@
 //! from polled position and current, and separates routine cancel, which
 //! leaves the axis armed, from Stop, which latches a host fault.
 //!
-//! Lift-axis millimetres are 0 at the Home reference and increase downward.
+//! Lift-axis millimetres are 0 at the Home reference and decrease downward.
 //!
 //! # Integration contract
 //!
@@ -86,7 +86,7 @@
 //! - Current limit (reference): upstream reads the configured limit every
 //!   control cycle, so a runtime write takes effect at once. Units are amps.
 //! - Touchdown contact (host policy): saturated current in the descent
-//!   direction (measured current signed by the commissioned direction, so
+//!   direction (measured current projected onto descent, so
 //!   opposite torque never counts), stationary velocity
 //!   and no progress for a whole dwell window, after a startup grace, with
 //!   the travel bound checked first. Whether a stalled hold stays saturated
@@ -145,7 +145,7 @@ pub enum LiftRequest {
     Home,
     /// Absolute move, also used to park.
     MoveTo {
-        /// Target in millimetres, 0 at Home and increasing downward.
+        /// Target in millimetres, 0 at Home and decreasing downward.
         position_mm: f32,
     },
     /// Lower until contact and hold the press. With a post-turn page width,
@@ -525,7 +525,7 @@ impl LiftOperations {
                             leg: PageTurnLeg::Wiggle,
                             ..
                         }
-                    ) || position.is_none_or(|p| target_mm > p + axis.position_tolerance_mm)
+                    ) || position.is_none_or(|p| target_mm < p - axis.position_tolerance_mm)
                 }
                 Phase::Home | Phase::Descend { .. } => true,
                 _ => false,
@@ -726,7 +726,7 @@ impl LiftOperations {
             Some(anchor) if (position - anchor).abs() > tolerance => {
                 Err(LiftRejection::NotAtWiggleStart)
             }
-            None if target_mm > position + tolerance && vacuum != VacuumEvidence::ConfirmedOff => {
+            None if target_mm < position - tolerance && vacuum != VacuumEvidence::ConfirmedOff => {
                 Err(LiftRejection::VacuumNotConfirmedOff)
             }
             _ => Ok(target_mm),
@@ -742,7 +742,7 @@ impl LiftOperations {
         }
     }
 
-    /// The recorded Touchdown position minus the leg's Lift percentage of the page width.
+    /// The recorded Touchdown position plus the leg's Lift percentage of the page width.
     fn leg_target(&self, leg: PageTurnLeg, page_width_mm: f32) -> Result<f32, LiftRejection> {
         let page_width_mm = self.check_page_width(page_width_mm)?;
         let touchdown = self
@@ -756,7 +756,7 @@ impl LiftOperations {
             PageTurnLeg::ToVacuumOff => motion.vacuum_off_percent,
             PageTurnLeg::ToFinalLift => motion.final_lift_percent,
         };
-        Ok(touchdown - percent / 100.0 * page_width_mm)
+        Ok(touchdown + percent / 100.0 * page_width_mm)
     }
 
     fn check_touchdown(
@@ -776,7 +776,7 @@ impl LiftOperations {
                 let previous = self
                     .touchdown_mm
                     .ok_or(LiftRejection::NoTouchdownPosition)?;
-                Some(previous - self.motion.blower_off_descent_percent / 100.0 * width)
+                Some(previous + self.motion.blower_off_descent_percent / 100.0 * width)
             }
         };
         let press_a = self.motion.touchdown_press_current_a;
@@ -790,10 +790,10 @@ impl LiftOperations {
             });
         }
         let axis = self.axis();
-        let limit_mm = axis.travel_maximum_mm - axis.touchdown_hold_depth_mm;
+        let limit_mm = axis.travel_minimum_mm + axis.touchdown_hold_depth_mm;
         if !(limit_mm >= axis.travel_minimum_mm
             && limit_mm <= axis.travel_maximum_mm
-            && limit_mm > start_mm + axis.touchdown_no_progress_mm)
+            && limit_mm < start_mm - axis.touchdown_no_progress_mm)
         {
             return Err(LiftRejection::NoDescentRoom);
         }
@@ -1090,7 +1090,7 @@ impl LiftOperations {
         let step = sample_step(&axis, active, &values, taken_at, position, stationary);
         let id = active.id;
         if let Phase::Descend { touchdown, .. } = &mut active.phase {
-            if touchdown.cutoff_mm.is_some_and(|cutoff| position >= cutoff) {
+            if touchdown.cutoff_mm.is_some_and(|cutoff| position <= cutoff) {
                 touchdown.cutoff_mm = None;
                 self.events.push_back(LiftEvent::TurnBlowerCutoff { id });
             }
@@ -1105,7 +1105,7 @@ impl LiftOperations {
                 ) && stationary
                     && self
                         .live_hold_mm
-                        .is_some_and(|hold| position < hold - axis.position_tolerance_mm)
+                        .is_some_and(|hold| position > hold + axis.position_tolerance_mm)
                 {
                     self.live_hold_mm = None;
                 }
@@ -1229,8 +1229,8 @@ fn sample_step(
     let dwell = Duration::from_millis(axis.touchdown_dwell_ms);
     // Measured current in the descent direction; opposite torque never counts.
     let descent_iq_a = match axis.direction {
-        LiftDirection::Normal => values.iq_measured_a,
-        LiftDirection::Reversed => -values.iq_measured_a,
+        LiftDirection::Normal => -values.iq_measured_a,
+        LiftDirection::Reversed => values.iq_measured_a,
     };
     let stalled = |press_a: f32| {
         descent_iq_a >= axis.touchdown_saturation_percent / 100.0 * press_a && stationary
@@ -1326,7 +1326,7 @@ fn sample_step(
             }
         }
         Phase::Descend { touchdown, window } => {
-            if position >= touchdown.limit_mm - tolerance || values.trajectory_done {
+            if position <= touchdown.limit_mm + tolerance || values.trajectory_done {
                 return Step::Cancel(LiftFault::TravelExhausted);
             }
             let grace = Duration::from_millis(axis.touchdown_grace_ms);
@@ -1337,7 +1337,7 @@ fn sample_step(
             if (contact.position_mm - touchdown.start_mm).abs() <= axis.touchdown_no_progress_mm {
                 return Step::Cancel(LiftFault::NoProgress);
             }
-            let target_mm = contact.position_mm + axis.touchdown_hold_depth_mm;
+            let target_mm = contact.position_mm - axis.touchdown_hold_depth_mm;
             if !(target_mm.is_finite()
                 && target_mm >= axis.travel_minimum_mm
                 && target_mm <= axis.travel_maximum_mm)

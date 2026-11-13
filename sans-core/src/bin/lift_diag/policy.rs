@@ -103,7 +103,7 @@ impl Diagnostic {
                     .and_then(|sample| sample.fresh_values(now))
                     .and_then(|values| values.position_mm)
                     .ok_or("lift needs a fresh position")?;
-                if !position_mm.is_finite() || position_mm >= current {
+                if !position_mm.is_finite() || position_mm <= current {
                     return Err(
                         "lift target must be above the current position, in absolute millimetres"
                             .into(),

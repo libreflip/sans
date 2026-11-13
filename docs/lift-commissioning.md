@@ -10,9 +10,18 @@ cannot hold an unpowered vertical load.
 Use an ODrive with calibration and native homing already working. Copy
 [sans.example.toml](../sans.example.toml), fill its required fields, and add
 the `[odrive.lift_axis]` section with your mechanism's conversion, direction,
-travel bounds and motion settings. Millimetres start at Home and increase
-downward. Camera identities and page-width bounds still need valid values,
-though this tool does not open cameras.
+travel bounds and motion settings. Home is 0 mm; downward travel is negative.
+Set `direction` so descending reads negative. Camera identities and page-width
+bounds still need valid values, though this tool does not open cameras.
+
+For the 10:1 reduction, `mm_per_turn = pulley travel per revolution / 10`.
+For a toothed pulley, that travel is tooth count × belt pitch. Keep
+`mm_per_turn` positive; `direction` handles the sign.
+
+Profiles now use schema version 3. To convert a version 2 lift profile, flip
+`direction` and set `new_min = -old_max`, `new_max = -old_min`. Leave positive
+speed, current and distance magnitudes unchanged. With no lift section, only
+the schema number needs changing.
 
 The code currently caps current at 4.8 A, speed at 1 motor turn/s, and
 acceleration/deceleration at 1 motor turn/s². These are provisional software
@@ -36,9 +45,9 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | `home` | Run Home and establish Position trust. |
 | `arm` | Enable the motor, as a separate action. |
 | `disarm` | Idle the motor when no operation is active; loses Position trust. |
-| `move 10` | Move to absolute position 10 mm. |
+| `move -10` | Move down to absolute position -10 mm. |
 | `touchdown` | Lower to contact and keep pressing at the profile's press setting. |
-| `lift 5` | Lift to absolute position 5 mm, which must be above the current position. |
+| `lift -5` | Lift to absolute position -5 mm, which must be above the current position. |
 | `cancel` | Cancel the current operation; a press hold may remain active. |
 | `stop` or blank Enter | Stop the lift and switch the air actuators off. |
 | `clear-fault` | Clear a Confirmed Stop without arming or resuming motion. |

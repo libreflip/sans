@@ -20,8 +20,8 @@ const LIFT_AXIS: &str = r#"
 [odrive.lift_axis]
 direction = "normal"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -158,7 +158,7 @@ fn urgent_disarm_withdraws_a_move_still_waiting_in_the_writer() {
     let clear = link.stall_writer(&opener);
     // The move's write now waits in the writer queue behind the held packet.
     let movement = link.submit(
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     let disarm = link.submit(LinkCommand::Disarm, Priority::Urgent);
@@ -210,7 +210,7 @@ fn move_stuck_in_the_writer_past_its_deadline_never_reaches_the_board() {
     let mut link = Link::start(&opener);
     let clear = link.stall_writer(&opener);
     let movement = link.submit(
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Ordinary,
     );
     // Keep the writer stuck until the link has faulted and the move is retired.
@@ -287,7 +287,7 @@ fn disarm_supersedes_an_urgent_move_still_waiting_in_the_writer() {
     let clear = link.stall_writer(&opener);
     // An urgent move queues behind the stuck packet, then a disarm follows.
     let movement = link.submit(
-        LinkCommand::MoveAbsolute { position_mm: 40.0 },
+        LinkCommand::MoveAbsolute { position_mm: -40.0 },
         Priority::Urgent,
     );
     let disarm = link.submit(LinkCommand::Disarm, Priority::Urgent);

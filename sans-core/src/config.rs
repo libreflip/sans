@@ -160,7 +160,8 @@ pub enum LiftDirection {
 pub struct LiftAxisProfile {
     /// Commissioned motor direction.
     pub direction: LiftDirection,
-    /// Millimetres of lift travel per motor turn; positive and finite.
+    /// Millimetres of lift travel per motor turn, including gearbox reduction;
+    /// positive and finite. For a 10:1 reduction, divide output travel per turn by 10.
     pub mm_per_turn: f32,
     /// Lowest commissioned soft bound for absolute moves.
     pub travel_minimum_mm: f32,
@@ -370,7 +371,8 @@ pub enum StartupError {
         "Machine profile at {path} uses retired schema version 2: remove current_limit_a, \
          velocity_limit_mm_s, acceleration_limit_mm_s2 and deceleration_limit_mm_s2 from \
          [odrive.lift_axis] (the ODrive's own limits apply), replace motion.touchdown_press_percent \
-         with motion.touchdown_press_current_a in amps, and set schema_version = 3"
+         with motion.touchdown_press_current_a in amps, negate and swap travel bounds, \
+         flip direction normal/reversed, and set schema_version = 3"
     )]
     ProfileVersion2Retired {
         /// Selected Machine-profile path.
@@ -652,6 +654,11 @@ fn validate_lift_axis(lift_axis: &LiftAxisProfile, problems: &mut Vec<String>) {
         && lift_axis.travel_minimum_mm < lift_axis.travel_maximum_mm)
     {
         problems.push(format!("{name} travel bounds must be finite and ordered"));
+    }
+    if lift_axis.travel_maximum_mm > 0.0 {
+        problems.push(format!(
+            "{name}.travel_maximum_mm must be at most 0: Home is 0 and downward travel is negative"
+        ));
     }
     for (field, value) in [
         ("position_tolerance_mm", lift_axis.position_tolerance_mm),
