@@ -29,14 +29,14 @@ urgent_deadline_ms = 50
 # scanning.
 # Lift millimetres are 0 at Home and negative downward; set direction so this holds.
 # mm_per_turn is travel per MOTOR turn, including gearbox reduction.
-# For a 10:1 reduction: pulley travel per revolution / 10.
+# Bought 20-tooth T2.5 pulley with 10:1 reduction: 20 * 2.5 / 10 = 5 mm per motor turn.
 # The tuning values below are provisional until #60 measures them. Each must be
 # positive and finite; the saturation percent is at most 100 and the hold depth
 # is at most a 5 mm software policy cap.
 #
 # [odrive.lift_axis]
 # direction = "<normal-or-reversed>"
-# mm_per_turn = <positive>
+# mm_per_turn = 5.0
 # travel_minimum_mm = <negative-lower-soft-bound>
 # travel_maximum_mm = <upper-soft-bound-at-most-zero>
 # position_tolerance_mm = <positive>

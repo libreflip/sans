@@ -14,9 +14,9 @@ travel bounds and motion settings. Home is 0 mm; downward travel is negative.
 Set `direction` so descending reads negative. Camera identities and page-width
 bounds still need valid values, though this tool does not open cameras.
 
-For the 10:1 reduction, `mm_per_turn = pulley travel per revolution / 10`.
-For a toothed pulley, that travel is tooth count × belt pitch. Keep
-`mm_per_turn` positive; `direction` handles the sign.
+The bought 20-tooth T2.5 pulley gives 20 × 2.5 = 50 mm per pulley revolution.
+With the 10:1 reduction, use `mm_per_turn = 5.0` for that pulley.
+Keep this value positive; `direction` handles the sign.
 
 Profiles now use schema version 3. To convert a version 2 lift profile, flip
 `direction` and set `new_min = -old_max`, `new_max = -old_min`. Leave positive
