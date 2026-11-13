@@ -13,9 +13,9 @@ pub use crate::camera::{
     capture_configured_camera, CameraDiagnosticError, V4lCameraMachineFactory,
 };
 pub use crate::camera::{
-    CameraCaptureError, CameraPairSetupError, CameraRole, CapturePair, CapturePairError,
-    CapturePairMachine, CapturedFrame, FrameBuildError, FrameCrop, NativeDetailPreviewError,
-    PreviewImage, RoleCamera,
+    capture_lit_pair, CameraCaptureError, CameraPairSetupError, CameraRole, CapturePair,
+    CapturePairError, CapturePairMachine, CapturedFrame, FrameBuildError, FrameCrop,
+    NativeDetailPreviewError, PreviewImage, RoleCamera, CAPTURE_LIGHT_SETTLE,
 };
 pub use crate::config::{
     prepare_machine_profile, resolve_machine_profile_path, BoardProfile, CameraProfiles,

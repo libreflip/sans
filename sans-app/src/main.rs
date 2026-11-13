@@ -1,6 +1,7 @@
 //! Native portrait touchscreen entry point for Sans.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use clap::Parser;
@@ -8,12 +9,13 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, MachineBoard, MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection,
-    MonospaceEventKind, MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker,
-    SetupDiagnostic,
+    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineBoard,
+    MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection, MonospaceEventKind,
+    MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
+    CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
-use sans_core::{CameraCaptureError, CameraRole, CapturePair, CapturePairError, ControllerMachine};
+use sans_core::{CameraCaptureError, CameraRole};
 
 const MONOSPACE_BOOT_DELAY: Duration = Duration::from_millis(2_500);
 
@@ -25,23 +27,35 @@ struct Arguments {
     config: Option<PathBuf>,
 }
 
+/// One Monospace connection, shared by the controller's board and the
+/// Machine's capture light. Each command holds the lock only for its own
+/// reply, so the light never holds up `ALL OFF` for longer than one command.
+type SharedMonospace = Arc<Mutex<MonospaceConnection>>;
+
+fn lock(monospace: &SharedMonospace) -> MutexGuard<'_, MonospaceConnection> {
+    monospace.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 struct BootstrapMachineFactory<CameraFactory> {
     cameras: CameraFactory,
+    /// The opened Monospace, handed to the Machine for the capture light.
+    monospace: Option<SharedMonospace>,
 }
 
 /// Monospace as the controller's relay board.
-struct MonospaceBoard(MonospaceConnection);
+struct MonospaceBoard(SharedMonospace);
 
 impl MachineBoard for MonospaceBoard {
     fn all_off(&mut self, within: Duration) -> Result<(), String> {
-        self.0
+        lock(&self.0)
             .client
             .all_off_within(within)
             .map_err(|error| error.to_string())
     }
 
     fn poll(&mut self) -> Option<MachineEvent> {
-        while let Ok(event) = self.0.events.try_recv() {
+        let monospace = lock(&self.0);
+        while let Ok(event) = monospace.events.try_recv() {
             if let Some(event) = monospace_machine_event(event.epoch.get(), event.kind) {
                 return Some(event);
             }
@@ -50,8 +64,28 @@ impl MachineBoard for MonospaceBoard {
     }
 }
 
+/// The Cameras, lit by Monospace while they capture.
+struct BootstrapMachine<CameraMachine> {
+    cameras: CameraMachine,
+    light: Option<SharedMonospace>,
+}
+
+impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<CameraMachine> {
+    fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        let Some(light) = &self.light else {
+            return self.cameras.capture_pair();
+        };
+        let cameras = &mut self.cameras;
+        capture_lit_pair(
+            |on| lock(light).client.set_light(on),
+            CAPTURE_LIGHT_SETTLE,
+            || cameras.capture_pair(),
+        )
+    }
+}
+
 impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<CameraFactory> {
-    type Machine = CameraFactory::Machine;
+    type Machine = BootstrapMachine<CameraFactory::Machine>;
 
     fn odrive_opener(&mut self) -> Box<dyn sans_core::FibreOpener> {
         self.cameras.odrive_opener()
@@ -65,6 +99,8 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
             MonospaceClient::connect(path, MONOSPACE_BOOT_DELAY, open_timeout, reply_timeout)
                 .map(|monospace| {
                     let epoch = monospace.client.epoch().get();
+                    let monospace = Arc::new(Mutex::new(monospace));
+                    self.monospace = Some(Arc::clone(&monospace));
                     let board: Box<dyn MachineBoard> = Box::new(MonospaceBoard(monospace));
                     let diagnostic = SetupDiagnostic::ready(
                         "Monospace",
@@ -80,11 +116,16 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
         self,
         profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
-        self.cameras.open(profile)
+        let (cameras, diagnostics) = self.cameras.open(profile)?;
+        let machine = BootstrapMachine {
+            cameras,
+            light: self.monospace,
+        };
+        Ok((machine, diagnostics))
     }
 
     fn poll_machine(machine: &mut Self::Machine) -> Option<MachineEvent> {
-        CameraFactory::poll_machine(machine)
+        CameraFactory::poll_machine(&mut machine.cameras)
     }
 }
 
@@ -163,6 +204,7 @@ fn main() -> eframe::Result {
         arguments.config.as_deref(),
         BootstrapMachineFactory {
             cameras: camera_factory,
+            monospace: None,
         },
     );
     let startup = Startup::from_bootstrap(startup);

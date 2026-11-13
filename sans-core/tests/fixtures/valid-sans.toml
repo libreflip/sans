@@ -15,6 +15,7 @@ urgent_deadline_ms = 50
 [cameras.left]
 identity = "/dev/v4l/by-id/left-camera"
 rotation_degrees = 90
+exposure_100us = 150
 [cameras.left.crop]
 x = 10
 y = 20

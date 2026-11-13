@@ -225,9 +225,11 @@ fn timeout_closes_both_connection_halves() {
         reader.read_line(&mut command).unwrap();
         let mut shutdown = String::new();
         reader.read_line(&mut shutdown).unwrap();
+        let mut light_off = String::new();
+        reader.read_line(&mut light_off).unwrap();
         let mut trailing = String::new();
         (
-            [command, shutdown],
+            [command, shutdown, light_off],
             reader.read_line(&mut trailing).unwrap(),
         )
     });
@@ -242,8 +244,39 @@ fn timeout_closes_both_connection_halves() {
         Err(HwError::ReplyTimeout)
     ));
     let (commands, bytes_after_retirement) = board_thread.join().unwrap();
-    assert_eq!(commands, ["VACUUM ON\n", "ALL OFF\n"]);
+    assert_eq!(commands, ["VACUUM ON\n", "ALL OFF\n", "LIGHT OFF\n"]);
     assert_eq!(bytes_after_retirement, 0);
+}
+
+#[test]
+fn light_command_timeout_switches_the_light_off_before_retiring() {
+    let (host_reader, host, board_thread) = run_board(move |board| {
+        let mut reader = BufReader::new(board.try_clone().unwrap());
+        let mut writer = board;
+        acknowledge_readiness(&mut reader, &mut writer);
+        let mut commands = Vec::new();
+        for _ in 0..3 {
+            let mut command = String::new();
+            reader.read_line(&mut command).unwrap();
+            commands.push(command);
+        }
+        commands
+    });
+    let mut connection =
+        MonospaceClient::connect_streams(host_reader, host, Duration::from_millis(20)).unwrap();
+
+    assert!(matches!(
+        connection.client.set_light(true),
+        Err(HwError::ReplyTimeout)
+    ));
+    assert!(matches!(
+        connection.client.set_light(false),
+        Err(HwError::Poisoned(_))
+    ));
+    assert_eq!(
+        board_thread.join().unwrap(),
+        ["LIGHT ON\n", "ALL OFF\n", "LIGHT OFF\n"]
+    );
 }
 
 #[test]

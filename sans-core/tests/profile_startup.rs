@@ -191,6 +191,11 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "quarter turn",
         ),
         ("width = 2000", "width = 0", "crop dimensions"),
+        (
+            "exposure_100us = 150",
+            "exposure_100us = 0",
+            "exposure_100us must be positive",
+        ),
         ("x = 10", "x = 2160", "crop must intersect"),
         ("minimum_mm = 100.0", "minimum_mm = 0.0", "minimum_mm"),
         ("command_ms = 2000", "command_ms = 0", "command_ms"),
