@@ -196,6 +196,11 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "exposure_100us = 0",
             "exposure_100us must be positive",
         ),
+        (
+            "white_balance_kelvin = 4600",
+            "white_balance_kelvin = 0",
+            "white_balance_kelvin must be positive",
+        ),
         ("x = 10", "x = 2160", "crop must intersect"),
         ("minimum_mm = 100.0", "minimum_mm = 0.0", "minimum_mm"),
         ("command_ms = 2000", "command_ms = 0", "command_ms"),
