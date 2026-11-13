@@ -35,6 +35,15 @@ cargo run -p sans-core --bin lift_diag --locked -- \
   --log sans-core/test-results/commissioning/run-01.csv
 ```
 
+To build, upload and run it on the Pi over SSH:
+
+```sh
+scripts/pi-run --bin lift_diag pi@sans-pi.local -- \
+  --config /home/pi/sans.toml --log /home/pi/lift-01.csv
+```
+
+Those profile and CSV paths are on the Pi; the CSV stays there.
+
 Use a new CSV filename each time. Startup leaves the axis idle and the air
 actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 

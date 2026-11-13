@@ -41,24 +41,27 @@ The active production workspace contains `sans-app/` and `sans-core/`. The old H
 
 ## Run on a Raspberry Pi over SSH
 
-`scripts/pi-run` builds Sans for a 64-bit Raspberry Pi, uploads it, and runs it in the foreground on the Pi's touchscreen:
+`scripts/pi-run` builds a binary for a 64-bit Raspberry Pi, uploads it, and runs it in the foreground. Sans uses the Pi's touchscreen; diagnostics use the SSH terminal:
 
 ```sh
 scripts/pi-run pi@sans-pi.local
 scripts/pi-run pi@sans-pi.local -- --config /home/pi/sans-test.toml
 scripts/pi-run --binary ./sans --env WAYLAND_DISPLAY=wayland-1 sans-pi
+scripts/pi-run --bin hw_diag pi@sans-pi.local -- --port /dev/ttyACM0
+scripts/pi-run --bin lift_diag pi@sans-pi.local -- \
+  --config /home/pi/sans.toml --log /home/pi/lift-01.csv
 ```
 
-The command builds with `cross build --package sans --release --locked --target aarch64-unknown-linux-gnu`, the same recipe as the CI `pi-binary` job, and honors `CARGO_TARGET_DIR`. Pass `--binary <local-path>` to skip the build and upload an existing aarch64 `sans`, such as the binary extracted from a CI `sans-aarch64-<sha>.tar.gz` artifact. Arguments after `--` reach Sans unchanged, and each `--env NAME=VALUE` is set on the Pi before the display is chosen.
+`--bin` selects `sans` by default, or `hw_diag` or `lift_diag`. The build uses `cross build --package <package> --bin <name> --release --locked --target aarch64-unknown-linux-gnu` and honors `CARGO_TARGET_DIR`. Sans is in package `sans`; both diagnostics are in `sans-core`. Pass `--binary <local-path>` to upload a prebuilt aarch64 binary instead, keeping `--bin` to select its remote name and desktop requirements. Arguments after `--` reach the selected program unchanged. Each `--env NAME=VALUE` is set on the Pi before Sans chooses its display.
 
-The binary is streamed over SSH to `~/.local/bin/sans-dev`, so the production executable is never overwritten. The upload goes to a temporary file beside it; the byte count is checked, and the file is renamed into place only if it matches, so a broken upload leaves the previous `sans-dev` as it was. Sans then runs through `ssh -tt`, and the command exits with Sans's status. Both connections pass `-x`, so a `ForwardX11 yes` SSH setting cannot send the UI to your own display. Build, upload, and display failures stop the command with a nonzero status.
+The binary is streamed over SSH to `~/.local/bin/<name>-dev`, so each tool has its own development executable. The upload goes to a temporary file beside it; the byte count is checked, and the file is renamed into place only if it matches, so a broken upload leaves the previous executable as it was. The program runs through `ssh -tt`, and its exit status is returned. Both connections pass `-x`, so a `ForwardX11 yes` SSH setting cannot send the UI to your own display. Build, upload, and display failures stop the command with a nonzero status.
 
 Sans selects the Machine profile on the Pi exactly as it does locally, from `$XDG_CONFIG_HOME/sans/sans.toml` or `~/.config/sans/sans.toml` there. The script never copies, edits, or uploads a profile, and it does not forward your local `XDG_CONFIG_HOME`.
 
 Requirements:
 
 - 64-bit Raspberry Pi OS on a Pi 4 or newer, with the runtime libraries the CI binary links against (`libv4l` and the desktop's Wayland or X11 client libraries).
-- An active desktop session on the Pi, owned by the SSH user. An existing `DISPLAY` or `WAYLAND_DISPLAY` is kept. Otherwise the script uses the first `wayland-*` socket in the remote `XDG_RUNTIME_DIR`, skipping lock files. If there is no socket, it stops and suggests `--env WAYLAND_DISPLAY=wayland-0` or `--env DISPLAY=:0`. A Wayland display name such as `wayland-0` resolves inside `XDG_RUNTIME_DIR`, so if the SSH session does not set it, also pass `--env XDG_RUNTIME_DIR=/run/user/<uid>`.
+- For `sans`, an active desktop session on the Pi, owned by the SSH user. An existing `DISPLAY` or `WAYLAND_DISPLAY` is kept. Otherwise the script uses the first `wayland-*` socket in the remote `XDG_RUNTIME_DIR`, skipping lock files. If there is no socket, it stops and suggests `--env WAYLAND_DISPLAY=wayland-0` or `--env DISPLAY=:0`. A Wayland display name such as `wayland-0` resolves inside `XDG_RUNTIME_DIR`, so if the SSH session does not set it, also pass `--env XDG_RUNTIME_DIR=/run/user/<uid>`. Diagnostics do not need a desktop session.
 - Locally, `cross` with a running Docker engine, or `--binary`. The cross 0.2.5 images exist only for `linux/amd64`, so the script runs `cross` with `DOCKER_DEFAULT_PLATFORM=linux/amd64`. On Apple Silicon this runs the build under amd64 emulation (OrbStack or Docker Desktop with Rosetta), which is slower than a native build. Podman ignores that variable; on an arm64 host, use Docker or `--binary`.
 - `<host>` is passed to `ssh` unchanged: either `user@hostname`, or an SSH config alias whose `HostName` and `User` come from your SSH configuration. Port, identity, and jump hosts also come from that configuration. Key authentication is recommended, because the command connects twice.
 - A POSIX login shell on the Pi. The script never uses `sudo`, installs packages, or kills remote processes.
