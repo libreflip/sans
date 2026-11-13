@@ -8,6 +8,7 @@ mod lift_axis;
 mod preview;
 mod screen;
 mod stop;
+mod workflow;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use sans_core::{
     CapturePair, ControllerHandle, ControllerIntent, ControllerSnapshot, LinkPhase, MachineScreen,
-    SetupState, StartupError,
+    ScanReadiness, SetupState, StartupError,
 };
 
 use crate::lift_axis::{reconnect_action, show_lift_axis};
@@ -76,6 +77,8 @@ enum StartupView {
 pub struct SansApp {
     startup: StartupView,
     preview_textures: Option<PreviewTextures>,
+    /// Digits typed on the page-width keypad, not yet sent.
+    page_width_draft: String,
 }
 
 impl SansApp {
@@ -95,6 +98,7 @@ impl SansApp {
         Self {
             startup,
             preview_textures: None,
+            page_width_draft: String::new(),
         }
     }
 }
@@ -114,6 +118,13 @@ impl eframe::App for SansApp {
                 }
                 let latest_pair = latest.as_deref().and_then(latest_complete_pair);
                 sync_preview_textures(&context, &mut self.preview_textures, latest_pair.cloned());
+                // A draft lives only while its entry screen is shown.
+                if !latest
+                    .as_deref()
+                    .is_some_and(|snapshot| matches!(snapshot.screen, MachineScreen::PageWidth(_)))
+                {
+                    self.page_width_draft.clear();
+                }
                 show_controller(
                     ui,
                     &context,
@@ -121,6 +132,7 @@ impl eframe::App for SansApp {
                     latest.as_deref(),
                     exit_requested_at,
                     self.preview_textures.as_ref(),
+                    &mut self.page_width_draft,
                 );
             }
         }
@@ -130,7 +142,13 @@ impl eframe::App for SansApp {
 fn latest_complete_pair(snapshot: &ControllerSnapshot) -> Option<&Arc<CapturePair>> {
     match &snapshot.screen {
         MachineScreen::CapturePreview(preview) => preview.latest_complete_pair.as_ref(),
-        MachineScreen::Setup(_) | MachineScreen::Exited => None,
+        MachineScreen::Scanning(view) => view.capture.latest_complete_pair.as_ref(),
+        MachineScreen::Setup(_)
+        | MachineScreen::Homing
+        | MachineScreen::Idle
+        | MachineScreen::PageWidth(_)
+        | MachineScreen::Ready { .. }
+        | MachineScreen::Exited => None,
     }
 }
 
@@ -156,8 +174,11 @@ fn show_controller(
     snapshot: Option<&ControllerSnapshot>,
     exit_requested_at: &mut Option<Instant>,
     textures: Option<&PreviewTextures>,
+    page_width_draft: &mut String,
 ) {
     let screen = snapshot.map(|snapshot| &snapshot.screen);
+    let home_allowed =
+        snapshot.is_some_and(|snapshot| snapshot.scan_readiness == ScanReadiness::Enabled);
     if matches!(screen, Some(MachineScreen::Exited)) {
         context.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
@@ -219,11 +240,20 @@ fn show_controller(
                     })
                     .and(reconnect)
                     .is_err();
+                    if home_allowed {
+                        closed |= workflow::home_action(ui, handle).is_err();
+                    }
                     exit(ui);
                 },
                 |ui, _| {
                     show_stop(ui, stop);
-                    ui.label("Scanning is disabled. Non-actuating diagnostics remain available.");
+                    if home_allowed {
+                        workflow::show_home_consent(ui);
+                    } else {
+                        ui.label(
+                            "Scanning is disabled. Non-actuating diagnostics remain available.",
+                        );
+                    }
                     ui.add_space(12.0);
                     for reason in reasons {
                         ui.label(format!("• {}", reason.summary));
@@ -238,7 +268,11 @@ fn show_controller(
         Some(MachineScreen::Setup(SetupState::Ready { diagnostics })) => {
             screen::show(
                 ui,
-                header("Machine ready", egui::Color32::LIGHT_GREEN),
+                if home_allowed {
+                    header("Home required", egui::Color32::LIGHT_GREEN)
+                } else {
+                    header("Machine ready", egui::Color32::LIGHT_GREEN)
+                },
                 |ui| {
                     let mut capture = Ok(());
                     closed = stop_actions(ui, handle, stop, |ui| {
@@ -249,11 +283,17 @@ fn show_controller(
                     })
                     .and(capture)
                     .is_err();
+                    if home_allowed {
+                        closed |= workflow::home_action(ui, handle).is_err();
+                    }
                     closed |= reconnect_action(ui, handle).is_err();
                     exit(ui);
                 },
                 |ui, _| {
                     show_stop(ui, stop);
+                    if home_allowed {
+                        workflow::show_home_consent(ui);
+                    }
                     for diagnostic in diagnostics {
                         ui.label(format!("{}: {}", diagnostic.component, diagnostic.summary));
                     }
@@ -265,7 +305,45 @@ fn show_controller(
             }
         }
         Some(MachineScreen::CapturePreview(preview)) => {
-            if show_capture_preview(ui, context, handle, preview, stop, textures, exit).is_err() {
+            let mut home = Ok(());
+            let more = |ui: &mut egui::Ui| {
+                if home_allowed {
+                    home = workflow::home_action(ui, handle);
+                }
+                exit(ui);
+            };
+            let shown = show_capture_preview(ui, context, handle, preview, stop, textures, more);
+            if shown.and(home).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        Some(MachineScreen::Homing) => {
+            if workflow::show_homing(ui, handle, stop).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        Some(MachineScreen::Idle) => {
+            if workflow::show_idle(ui, handle, stop, exit).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        Some(MachineScreen::PageWidth(entry)) => {
+            if workflow::show_page_width(ui, handle, stop, entry, page_width_draft).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        Some(MachineScreen::Ready {
+            page_width_mm,
+            notice,
+        }) => {
+            let notice = notice.as_deref();
+            if workflow::show_ready(ui, handle, stop, *page_width_mm, notice, exit).is_err() {
+                context.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+        Some(MachineScreen::Scanning(view)) => {
+            let pressure = snapshot.and_then(|snapshot| snapshot.pressure_mbar);
+            if workflow::show_scanning(ui, handle, stop, view, pressure, textures, exit).is_err() {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
@@ -295,7 +373,13 @@ fn screen_needs_polling(screen: Option<&MachineScreen>) -> bool {
     matches!(
         screen,
         None | Some(
-            MachineScreen::Setup(SetupState::Ready { .. }) | MachineScreen::CapturePreview(_)
+            MachineScreen::Setup(SetupState::Ready { .. })
+                | MachineScreen::CapturePreview(_)
+                | MachineScreen::Homing
+                | MachineScreen::Idle
+                | MachineScreen::PageWidth(_)
+                | MachineScreen::Ready { .. }
+                | MachineScreen::Scanning(_)
         )
     )
 }

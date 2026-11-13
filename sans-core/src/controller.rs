@@ -1,15 +1,18 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use thiserror::Error;
 
 use crate::camera::{CapturePair, CapturePairError};
-use crate::lift::{LiftEvent, LiftFault, LiftOperations, LiftOutcome, StopCause};
+use crate::lift::{
+    LiftEvent, LiftFault, LiftOperations, LiftOutcome, LiftRejection, LiftRequest, OperationId,
+    StopCause, VacuumEvidence,
+};
 use crate::odrive::{
     spawn_link, DiscoveryRecord, FibreOpener, LinkCommand, LinkConfig, LinkEvent, LinkHandle,
     LinkPhase, LinkRunner, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket,
@@ -18,24 +21,39 @@ use crate::stop::{Relays, StopControl, StopStatus, StopVerdict};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
 mod machine;
+mod workflow;
 
 use machine::{setup_state, spawn_machine, MachineRequest};
+use workflow::{create_session_directory, ScanSession, Workflow};
 
 /// Telemetry-only snapshot changes publish at most four times a second.
 const TELEMETRY_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The complete set of UI-to-controller actions.
 ///
-/// No intent arms, homes or moves the lift axis. Only `ClearStop` clears
-/// its errors, and only after a Confirmed Stop.
+/// `Home` is the only intent that moves the lift axis, and only with the
+/// operator's explicit consent. No intent arms or moves it otherwise. Only
+/// `ClearStop` clears its errors, and only after a Confirmed Stop. The
+/// physical button sends `NewBook`, `Start` or `Stop` by state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerIntent {
     /// Latch Stop: urgently disarm the lift axis and switch Monospace `ALL OFF`.
     Stop,
     /// Clear a Confirmed Stop's lift-axis errors and latch. Never arms.
     ClearStop,
-    /// Acquire one complete stationary Capture pair.
+    /// Acquire one complete stationary Capture pair for diagnostics, in Setup only.
     CapturePair,
+    /// Consent to native Home. Accepted in Setup while the live gates pass.
+    Home,
+    /// Prepare a new book: go to page-width entry from Idle or Ready.
+    NewBook,
+    /// Enter the book's page width in whole millimetres.
+    SetPageWidth {
+        /// Page width in millimetres, checked against the Machine profile.
+        millimetres: u16,
+    },
+    /// Create the Scan session from Ready and capture its first pair.
+    Start,
     /// End the current lift-axis connection and run the connection gate once more.
     ReconnectLiftAxis,
     /// Terminate the controller without starting more Machine work.
@@ -92,25 +110,18 @@ pub struct TelemetrySummary {
     pub cycle_ms: u64,
 }
 
-/// Whether an operator can start a Scan session.
+/// Whether the live gates allow Home and scanning. Position trust is
+/// separate: the workflow screen shows whether Home is still needed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScanReadiness {
-    /// Production scanning is disabled in this build whatever the lift-axis
-    /// phase or the profile says.
+    /// A live gate fails, so Home and Start are refused.
     Disabled {
         /// Why scanning is unavailable.
         reason: String,
     },
-}
-
-impl ScanReadiness {
-    fn current() -> Self {
-        Self::Disabled {
-            reason: "production scanning is not available in this build; a verified lift axis \
-                     enables diagnostics only"
-                .into(),
-        }
-    }
+    /// Cameras and Monospace are live, the lift axis is verified and no Stop
+    /// is latched.
+    Enabled,
 }
 
 /// One operator-facing reason live Machine setup cannot proceed.
@@ -188,13 +199,71 @@ pub struct CapturePreview {
     pub preview_warning: Option<String>,
 }
 
+/// Page-width entry, with the Machine profile's bounds in whole millimetres.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageWidthEntry {
+    /// Smallest accepted page width.
+    pub minimum_mm: u16,
+    /// Largest accepted page width.
+    pub maximum_mm: u16,
+    /// The last entry outside the bounds.
+    pub rejected_mm: Option<u16>,
+}
+
+/// A running Scan session and its current Capture cycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanView {
+    /// The Scan session directory under the storage root.
+    pub directory: PathBuf,
+    /// The operator-entered page width.
+    pub page_width_mm: u16,
+    /// The one-based Capture cycle number.
+    pub capture_cycle: u32,
+    /// The Left Page record's reserved Sequence number (even).
+    pub left_sequence: u32,
+    /// The Right Page record's reserved Sequence number (odd).
+    pub right_sequence: u32,
+    /// The one-based Capture attempt within the Capture cycle.
+    pub attempt: u32,
+    /// Capture state and the canonical Capture pair, once acquired.
+    pub capture: CapturePreview,
+}
+
+/// The status LED colour, projected from the workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Led {
+    /// Setup, Home consent, Idle and page-width entry.
+    Blue,
+    /// Ready.
+    Green,
+    /// Home or scanning in progress.
+    Amber,
+    /// Stop latched.
+    Red,
+}
+
 /// Authoritative workflow projection rendered by the native UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MachineScreen {
-    /// The non-actuating live-readiness screen.
+    /// The non-actuating live-readiness screen. Home consent is given here.
     Setup(SetupState),
-    /// Complete-pair acquisition and its latest presentation-safe result.
+    /// Diagnostic complete-pair acquisition and its latest presentation-safe result.
     CapturePreview(CapturePreview),
+    /// Native Home is running.
+    Homing,
+    /// Position trust is held; New Book is next.
+    Idle,
+    /// Page-width entry.
+    PageWidth(PageWidthEntry),
+    /// The page width is accepted; Start is next.
+    Ready {
+        /// The accepted page width.
+        page_width_mm: u16,
+        /// Why the last Start did not create a Scan session.
+        notice: Option<String>,
+    },
+    /// A Scan session is running.
+    Scanning(ScanView),
     /// The controller accepted `Exit` and has stopped processing intents.
     Exited,
 }
@@ -208,10 +277,12 @@ pub struct ControllerSnapshot {
     pub screen: MachineScreen,
     /// Lift-axis link status, independent of the Camera screen.
     pub lift_axis: LiftAxisStatus,
-    /// Scanning stays disabled in this build.
+    /// Whether the live gates allow Home and scanning.
     pub scan_readiness: ScanReadiness,
     /// The latched Stop, if any.
     pub stop: Option<StopStatus>,
+    /// The latest Monospace pressure reading in millibar, if any arrived.
+    pub pressure_mbar: Option<f32>,
 }
 
 /// Machine-thread-owned Camera behavior. Blocking work runs here, never on
@@ -219,6 +290,12 @@ pub struct ControllerSnapshot {
 pub trait ControllerMachine: 'static {
     /// Acquire one complete pair or reject it without publishing a partial pair.
     fn capture_pair(&mut self) -> Result<CapturePair, CapturePairError>;
+
+    /// Acquire a Scan session's pair. The controller has already switched
+    /// the light on and it stays on, so this must not switch it off.
+    fn capture_session_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        self.capture_pair()
+    }
 }
 
 /// The relay board as the Stop path uses it. It is owned by the controller
@@ -227,18 +304,32 @@ pub trait MachineBoard: Send + 'static {
     /// Send `ALL OFF` and wait at most `within` for its exact `OK`.
     fn all_off(&mut self, within: Duration) -> Result<(), String>;
 
-    /// The next button press or failure, without blocking.
+    /// The next button press, pressure reading or failure, without blocking.
     fn poll(&mut self) -> Option<MachineEvent>;
+
+    /// Send ordinary `LIGHT ON` and wait for its `OK`.
+    fn light_on(&mut self) -> Result<(), String> {
+        Err("this board cannot switch the light".into())
+    }
+
+    /// Show `led` on the status LED. The LED is only a projection, so a
+    /// board without one may ignore it.
+    fn set_led(&mut self, _led: Led) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// The board as the factory opened it, or why it did not open.
 pub type OpenedBoard = Result<(Box<dyn MachineBoard>, SetupDiagnostic), SetupBlocker>;
 
 /// Something a live board or Machine reported between intents.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MachineEvent {
-    /// The physical button was pressed; it means Stop.
-    StopButton,
+    /// The physical button was pressed. It means New Book, Start or Stop
+    /// by workflow state, and nothing elsewhere.
+    Button,
+    /// A Monospace pressure reading in millibar.
+    Pressure(f32),
     /// A live resource failed. A lost board also latches Stop.
     Lost(SetupBlocker),
 }
@@ -473,16 +564,27 @@ fn spawn_controller<Factory: MachineFactory>(
             let machine = spawn_machine(Arc::clone(&profile), factory, machine_events);
             let mut board: Option<Box<dyn MachineBoard>> = None;
             let mut board_setup: Option<Result<SetupDiagnostic, SetupBlocker>> = None;
-            let mut cameras_live = false;
-            let mut capturing = false;
+            let mut capturing: Option<CaptureFor> = None;
+            let page_width = &profile.profile().page_width;
             let mut state = Projection {
                 revision: 0,
                 opened: false,
                 screen: MachineScreen::Setup(SetupState::Blocked {
                     reasons: Vec::new(),
                 }),
+                setup: SetupState::Blocked {
+                    reasons: Vec::new(),
+                },
                 latest_complete_pair: None,
                 snapshots: snapshot_sender,
+                workflow: Workflow::setup(),
+                page_width_mm: (
+                    page_width.minimum_mm.ceil() as u16,
+                    page_width.maximum_mm.floor() as u16,
+                ),
+                cameras_live: false,
+                pressure_mbar: None,
+                shown_led: None,
             };
             // Without a Machine thread the lift axis and Stop still run.
             let machine = match machine {
@@ -490,12 +592,12 @@ fn spawn_controller<Factory: MachineFactory>(
                 Err(error) => {
                     log::error!("cannot start the Machine thread: {error}");
                     state.opened = true;
-                    state.screen = MachineScreen::Setup(SetupState::Blocked {
+                    state.set_setup(SetupState::Blocked {
                         reasons: vec![SetupBlocker::new(format!(
                             "cannot start the Machine thread: {error}"
                         ))],
                     });
-                    if !state.publish(&mut lift) {
+                    if !state.publish(&mut lift, &mut board) {
                         return;
                     }
                     None
@@ -504,7 +606,16 @@ fn spawn_controller<Factory: MachineFactory>(
 
             loop {
                 // Lift deadlines run on every pass: a busy inbox never times out.
-                if lift.poll(Instant::now(), &mut relays(&mut board)) && !state.publish(&mut lift) {
+                if lift.poll(Instant::now(), &mut relays(&mut board))
+                    && !state.publish(&mut lift, &mut board)
+                {
+                    return;
+                }
+                let mut home_changed = false;
+                for (id, outcome) in lift.take_finished() {
+                    home_changed |= state.workflow.home_finished(id, &outcome);
+                }
+                if home_changed && !state.publish(&mut lift, &mut board) {
                     return;
                 }
                 // Wake for whichever comes first: the next poll of a live
@@ -531,7 +642,9 @@ fn spawn_controller<Factory: MachineFactory>(
                     (None, Some(wait)) => match inbox.recv_timeout(wait) {
                         Ok(message) => message,
                         Err(RecvTimeoutError::Timeout) => {
-                            if lift.refresh_due(Instant::now()) && !state.publish(&mut lift) {
+                            if lift.refresh_due(Instant::now())
+                                && !state.publish(&mut lift, &mut board)
+                            {
                                 return;
                             }
                             continue;
@@ -542,26 +655,48 @@ fn spawn_controller<Factory: MachineFactory>(
                 if let Inbox::Intent(intent) = &message {
                     log::info!("operator requested {intent:?}");
                 }
+                // The physical button is the touchscreen intent the workflow
+                // gives it, or nothing.
+                let (message, stopped_by) = match message {
+                    Inbox::BoardEvent(MachineEvent::Button)
+                    | Inbox::Machine(MachineEvent::Button) => {
+                        match state.workflow.button_intent() {
+                            Some(intent) => {
+                                log::info!("physical button pressed: {intent:?}");
+                                (Inbox::Intent(intent), "physical button")
+                            }
+                            None => {
+                                log::info!("physical button pressed: inert in this state");
+                                continue;
+                            }
+                        }
+                    }
+                    message => (message, "touchscreen Stop"),
+                };
                 match message {
                     Inbox::Intent(ControllerIntent::Stop) => {
-                        let cause = StopCause::Requested("touchscreen Stop".into());
+                        let cause = StopCause::Requested(stopped_by.into());
                         lift.stop(Instant::now(), cause, &mut relays(&mut board));
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
                     Inbox::Intent(ControllerIntent::ClearStop) => {
                         lift.clear_stop(Instant::now());
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
                     Inbox::Intent(ControllerIntent::CapturePair) => {
-                        if !cameras_live {
+                        if !matches!(state.workflow, Workflow::Setup { .. }) {
+                            log::warn!("ignored CapturePair: the capture preview is a Setup step");
+                            continue;
+                        }
+                        if !state.cameras_live {
                             log::warn!("ignored CapturePair: the Cameras are not live");
                             continue;
                         }
-                        if capturing {
+                        if capturing.is_some() {
                             log::warn!("ignored CapturePair: a capture is already running");
                             continue;
                         }
@@ -570,29 +705,131 @@ fn spawn_controller<Factory: MachineFactory>(
                         });
                         if !sent {
                             log::error!("CapturePair failed: the Machine thread is gone");
-                            cameras_live = false;
+                            state.cameras_live = false;
                             continue;
                         }
-                        capturing = true;
+                        capturing = Some(CaptureFor::Preview);
                         state.screen = capture_preview(
                             CaptureStatus::Capturing,
                             state.latest_complete_pair.clone(),
                         );
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
+                            return;
+                        }
+                    }
+                    Inbox::Intent(ControllerIntent::Home) => {
+                        let setup = matches!(state.workflow, Workflow::Setup { .. });
+                        let ready = state.readiness(&lift, board.is_some()).is_enabled();
+                        if !setup || !ready || capturing.is_some() {
+                            continue;
+                        }
+                        // Homing leaves the diagnostic preview behind.
+                        state.screen = MachineScreen::Setup(state.setup.clone());
+                        state.workflow = match lift.home(Instant::now()) {
+                            Ok(id) => Workflow::Homing(id),
+                            Err(rejection) => Workflow::Setup {
+                                home_failure: Some(format!("Home was refused: {rejection:?}")),
+                            },
+                        };
+                        if !state.publish(&mut lift, &mut board) {
+                            return;
+                        }
+                    }
+                    Inbox::Intent(ControllerIntent::NewBook) => {
+                        if !matches!(
+                            state.workflow,
+                            Workflow::Idle | Workflow::PageWidth { .. } | Workflow::Ready { .. }
+                        ) {
+                            continue;
+                        }
+                        state.workflow = Workflow::PageWidth { rejected_mm: None };
+                        if !state.publish(&mut lift, &mut board) {
+                            return;
+                        }
+                    }
+                    Inbox::Intent(ControllerIntent::SetPageWidth { millimetres }) => {
+                        if !matches!(state.workflow, Workflow::PageWidth { .. }) {
+                            continue;
+                        }
+                        let bounds = &profile.profile().page_width;
+                        let width = f32::from(millimetres);
+                        state.workflow = if (bounds.minimum_mm..=bounds.maximum_mm).contains(&width)
+                        {
+                            Workflow::Ready {
+                                page_width_mm: millimetres,
+                                notice: None,
+                            }
+                        } else {
+                            Workflow::PageWidth {
+                                rejected_mm: Some(millimetres),
+                            }
+                        };
+                        if !state.publish(&mut lift, &mut board) {
+                            return;
+                        }
+                    }
+                    Inbox::Intent(ControllerIntent::Start) => {
+                        // Gates or Position trust lost since the last
+                        // snapshot send the workflow back to Setup first.
+                        state.reconcile(&lift, board.is_some());
+                        let Workflow::Ready { page_width_mm, .. } = state.workflow else {
+                            continue;
+                        };
+                        if capturing.is_some() {
+                            continue;
+                        }
+                        state.workflow = match create_session_directory(
+                            profile.data_root(),
+                            SystemTime::now(),
+                        ) {
+                            Err(error) => Workflow::Ready {
+                                page_width_mm,
+                                notice: Some(format!(
+                                    "cannot create the Scan session directory: {error}"
+                                )),
+                            },
+                            Ok(directory) => {
+                                let mut session = ScanSession::new(directory, page_width_mm);
+                                let lit = board
+                                    .as_mut()
+                                    .map_or(Err("no Monospace connection".into()), |board| {
+                                        board.light_on()
+                                    });
+                                let sent = machine.as_ref().is_some_and(|machine| {
+                                    lit.is_ok()
+                                        && machine.send(MachineRequest::SessionCapture).is_ok()
+                                });
+                                match lit {
+                                    Err(error) => {
+                                        session.capture = CaptureStatus::Blocked {
+                                            reason: format!("LIGHT ON failed: {error}"),
+                                        }
+                                    }
+                                    Ok(()) if sent => capturing = Some(CaptureFor::Session),
+                                    Ok(()) => {
+                                        session.capture = CaptureStatus::Blocked {
+                                            reason: "the Camera thread has stopped".into(),
+                                        }
+                                    }
+                                }
+                                Workflow::Scanning(session)
+                            }
+                        };
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
                     Inbox::Intent(ControllerIntent::ReconnectLiftAxis) => lift.reconnect(),
                     Inbox::Intent(ControllerIntent::Exit) => {
                         state.screen = MachineScreen::Exited;
-                        let _ = state.publish(&mut lift);
+                        let _ = state.publish(&mut lift, &mut board);
                         return;
                     }
                     Inbox::Link(event) => {
                         let now = Instant::now();
                         let stop_changed = lift.handle(now, &event, &mut relays(&mut board));
                         let publish = lift.apply(event) || stop_changed || lift.refresh_due(now);
-                        if publish && !state.publish(&mut lift) {
+                        if publish && !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
@@ -613,43 +850,64 @@ fn spawn_controller<Factory: MachineFactory>(
                                 log::error!("Camera setup: {}", blocker.summary)
                             }),
                         }
-                        cameras_live = opened.is_ok();
-                        state.screen = MachineScreen::Setup(setup_state(opened, &board_setup));
+                        state.cameras_live = opened.is_ok();
+                        state.set_setup(setup_state(opened, &board_setup));
                         state.opened = true;
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
                     Inbox::Captured(result) => {
-                        capturing = false;
-                        let status = match result {
-                            Ok(pair) => {
-                                log::info!("captured a complete pair");
-                                state.latest_complete_pair = Some(Arc::new(pair));
-                                CaptureStatus::Ready
-                            }
-                            Err(error) => {
-                                log::error!("CapturePair failed: {error}");
-                                CaptureStatus::Blocked {
-                                    reason: error.to_string(),
+                        match capturing.take() {
+                            Some(CaptureFor::Session) => {
+                                // Attempt 1's first valid complete pair is
+                                // canonical. A session Stop already ended
+                                // drops its late result.
+                                if let Workflow::Scanning(session) = &mut state.workflow {
+                                    session.capture = match result {
+                                        Ok(pair) => {
+                                            log::info!("Scan session captured its first pair");
+                                            session.canonical = Some(Arc::new(pair));
+                                            CaptureStatus::Ready
+                                        }
+                                        Err(error) => {
+                                            log::error!("Scan session capture failed: {error}");
+                                            CaptureStatus::Blocked {
+                                                reason: error.to_string(),
+                                            }
+                                        }
+                                    };
                                 }
                             }
-                        };
-                        // A Setup failure during the capture keeps its screen.
-                        if matches!(state.screen, MachineScreen::CapturePreview(_)) {
-                            state.screen =
-                                capture_preview(status, state.latest_complete_pair.clone());
+                            _ => {
+                                let status = match result {
+                                    Ok(pair) => {
+                                        log::info!("captured a complete pair");
+                                        state.latest_complete_pair = Some(Arc::new(pair));
+                                        CaptureStatus::Ready
+                                    }
+                                    Err(error) => {
+                                        log::error!("CapturePair failed: {error}");
+                                        CaptureStatus::Blocked {
+                                            reason: error.to_string(),
+                                        }
+                                    }
+                                };
+                                // A Setup failure during the capture keeps its screen.
+                                if matches!(state.screen, MachineScreen::CapturePreview(_)) {
+                                    state.screen =
+                                        capture_preview(status, state.latest_complete_pair.clone());
+                                }
+                            }
                         }
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
-                    Inbox::BoardEvent(MachineEvent::StopButton)
-                    | Inbox::Machine(MachineEvent::StopButton) => {
-                        log::info!("physical Stop button pressed");
-                        let cause = StopCause::Requested("physical button".into());
-                        lift.stop(Instant::now(), cause, &mut relays(&mut board));
-                        if !state.publish(&mut lift) {
+                    Inbox::BoardEvent(MachineEvent::Pressure(mbar))
+                    | Inbox::Machine(MachineEvent::Pressure(mbar)) => {
+                        state.pressure_mbar = Some(mbar);
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
@@ -660,24 +918,27 @@ fn spawn_controller<Factory: MachineFactory>(
                         lift.stop(Instant::now(), cause, &mut relays(&mut board));
                         board = None;
                         // Captures need the board's light, and the blocker stays shown.
-                        cameras_live = false;
-                        state.screen = MachineScreen::Setup(SetupState::Blocked {
+                        state.cameras_live = false;
+                        state.set_setup(SetupState::Blocked {
                             reasons: vec![blocker],
                         });
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
                     Inbox::Machine(MachineEvent::Lost(blocker)) => {
                         log::error!("Machine lost: {}", blocker.summary);
-                        cameras_live = false;
-                        state.screen = MachineScreen::Setup(SetupState::Blocked {
+                        state.cameras_live = false;
+                        state.set_setup(SetupState::Blocked {
                             reasons: vec![blocker],
                         });
-                        if !state.publish(&mut lift) {
+                        if !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
+                    // Mapped to an intent above.
+                    Inbox::BoardEvent(MachineEvent::Button)
+                    | Inbox::Machine(MachineEvent::Button) => {}
                     Inbox::MachinePanicked => {
                         log::error!("the Machine thread panicked; the controller is stopping");
                         return;
@@ -695,30 +956,145 @@ fn spawn_controller<Factory: MachineFactory>(
     })
 }
 
+/// Which request the one Capture pair in flight answers.
+enum CaptureFor {
+    /// A diagnostic capture from Setup.
+    Preview,
+    /// The Scan session's first Capture pair.
+    Session,
+}
+
 struct Projection {
     revision: u64,
     /// Nothing is published before the Machine thread reports its Cameras.
     opened: bool,
+    /// Setup or the diagnostic preview; workflow screens replace it.
     screen: MachineScreen,
+    /// The live Setup result, restored when Home leaves the preview.
+    setup: SetupState,
     latest_complete_pair: Option<Arc<CapturePair>>,
     snapshots: Arc<LatestSnapshot>,
+    workflow: Workflow,
+    /// The Machine profile's page-width bounds in whole millimetres.
+    page_width_mm: (u16, u16),
+    cameras_live: bool,
+    pressure_mbar: Option<f32>,
+    /// The LED colour last sent to the board.
+    shown_led: Option<Led>,
 }
 
 impl Projection {
-    /// Replace the pending snapshot with the current projection.
-    fn publish(&mut self, lift: &mut LiftAxis) -> bool {
+    fn set_setup(&mut self, setup: SetupState) {
+        self.screen = MachineScreen::Setup(setup.clone());
+        self.setup = setup;
+    }
+
+    /// The live gates for Home and scanning.
+    fn readiness(&self, lift: &LiftAxis, board_live: bool) -> ScanReadiness {
+        let reason = if !self.cameras_live {
+            "the Cameras are not ready"
+        } else if !board_live {
+            "Monospace is not connected"
+        } else if lift.status.phase != LinkPhase::Verified {
+            "the lift axis is not verified"
+        } else if lift.stop.status().is_some() {
+            "Stop is latched"
+        } else {
+            return ScanReadiness::Enabled;
+        };
+        ScanReadiness::Disabled {
+            reason: reason.into(),
+        }
+    }
+
+    /// Return to Setup, dropping any in-memory Scan session, when a live
+    /// gate fails or Position trust is lost. Home consent is then needed
+    /// again. #30 will keep the interrupted Capture cycle instead.
+    fn reconcile(&mut self, lift: &LiftAxis, board_live: bool) {
+        let enabled = self.readiness(lift, board_live).is_enabled();
+        let keep = match self.workflow {
+            // A running Home always ends in exactly one finish, Stop included,
+            // so Homing waits for it and the button keeps meaning Stop.
+            Workflow::Setup { .. } | Workflow::Homing(_) => true,
+            _ => enabled && lift.ops.status().position_trusted,
+        };
+        if !keep {
+            self.workflow = Workflow::setup();
+        }
+    }
+
+    /// The screen the workflow shows.
+    fn project(&self) -> MachineScreen {
+        if self.screen == MachineScreen::Exited {
+            return MachineScreen::Exited;
+        }
+        match &self.workflow {
+            Workflow::Setup { home_failure: None } => self.screen.clone(),
+            Workflow::Setup {
+                home_failure: Some(failure),
+            } => {
+                let mut reasons = match &self.setup {
+                    SetupState::Blocked { reasons } => reasons.clone(),
+                    SetupState::Ready { .. } => Vec::new(),
+                };
+                reasons.push(SetupBlocker::new(failure.clone()));
+                MachineScreen::Setup(SetupState::Blocked { reasons })
+            }
+            Workflow::Homing(_) => MachineScreen::Homing,
+            Workflow::Idle => MachineScreen::Idle,
+            Workflow::PageWidth { rejected_mm } => MachineScreen::PageWidth(PageWidthEntry {
+                minimum_mm: self.page_width_mm.0,
+                maximum_mm: self.page_width_mm.1,
+                rejected_mm: *rejected_mm,
+            }),
+            Workflow::Ready {
+                page_width_mm,
+                notice,
+            } => MachineScreen::Ready {
+                page_width_mm: *page_width_mm,
+                notice: notice.clone(),
+            },
+            Workflow::Scanning(session) => MachineScreen::Scanning(ScanView {
+                directory: session.directory.clone(),
+                page_width_mm: session.page_width_mm,
+                capture_cycle: session.left_sequence / 2 + 1,
+                left_sequence: session.left_sequence,
+                right_sequence: session.left_sequence + 1,
+                attempt: session.attempt,
+                capture: capture_preview_state(session.capture.clone(), session.canonical.clone()),
+            }),
+        }
+    }
+
+    /// Reconcile the workflow, show its LED colour, and replace the pending
+    /// snapshot with the current projection.
+    fn publish(&mut self, lift: &mut LiftAxis, board: &mut Option<Box<dyn MachineBoard>>) -> bool {
+        self.reconcile(lift, board.is_some());
+        let led = self.workflow.led(lift.stop.status().is_some());
+        if let Some(board) = board.as_mut().filter(|_| self.shown_led != Some(led)) {
+            // A dead board surfaces as `Lost`; the LED is only a projection.
+            let _ = board.set_led(led);
+            self.shown_led = Some(led);
+        }
         if !self.opened {
             return true;
         }
         let snapshot = ControllerSnapshot {
             revision: self.revision,
-            screen: self.screen.clone(),
+            screen: self.project(),
+            scan_readiness: self.readiness(lift, board.is_some()),
             lift_axis: lift.status(Instant::now()),
-            scan_readiness: ScanReadiness::current(),
             stop: lift.stop.status(),
+            pressure_mbar: self.pressure_mbar,
         };
         self.revision += 1;
         self.snapshots.send(snapshot).is_ok()
+    }
+}
+
+impl ScanReadiness {
+    fn is_enabled(&self) -> bool {
+        *self == Self::Enabled
     }
 }
 
@@ -754,6 +1130,8 @@ struct LiftAxis {
     latest: Option<TelemetrySample>,
     /// When a snapshot last carried this projection.
     last_publish: Option<Instant>,
+    /// Lift operations that finished since the controller last asked.
+    finished: Vec<(OperationId, LiftOutcome)>,
 }
 
 impl LiftAxis {
@@ -771,6 +1149,7 @@ impl LiftAxis {
             status: LiftAxisStatus::starting(),
             latest: None,
             last_publish: None,
+            finished: Vec::new(),
         };
         let config = match LinkConfig::from_profile(profile.profile()) {
             Ok(config) => config,
@@ -798,6 +1177,19 @@ impl LiftAxis {
         self.stop.stop(now, cause, &mut self.ops, &mut link, relays);
         drop(link);
         self.settle(now, relays);
+    }
+
+    /// Start native Home from idle. It never arms.
+    fn home(&mut self, now: Instant) -> Result<OperationId, LiftRejection> {
+        let mut link = port(&self.link);
+        // Home commands no descent, so vacuum evidence is not needed.
+        let vacuum = VacuumEvidence::NotConfirmedOff;
+        self.ops.start(now, LiftRequest::Home, vacuum, &mut link)
+    }
+
+    /// Lift operations that finished since the last call.
+    fn take_finished(&mut self) -> Vec<(OperationId, LiftOutcome)> {
+        std::mem::take(&mut self.finished)
     }
 
     fn clear_stop(&mut self, now: Instant) {
@@ -830,6 +1222,9 @@ impl LiftAxis {
         while let Some(event) = self.ops.take_event() {
             log_lift_event(&event);
             self.stop.note(&event);
+            if let LiftEvent::Finished { id, outcome, .. } = event {
+                self.finished.push((id, outcome));
+            }
         }
         self.stop.observe(now, &self.ops, relays);
         let stop = self.stop.status();
@@ -974,14 +1369,21 @@ fn capture_preview(
     status: CaptureStatus,
     latest_complete_pair: Option<Arc<CapturePair>>,
 ) -> MachineScreen {
+    MachineScreen::CapturePreview(capture_preview_state(status, latest_complete_pair))
+}
+
+fn capture_preview_state(
+    status: CaptureStatus,
+    latest_complete_pair: Option<Arc<CapturePair>>,
+) -> CapturePreview {
     let preview_warning = latest_complete_pair
         .as_deref()
         .and_then(native_detail_preview_warning);
-    MachineScreen::CapturePreview(CapturePreview {
+    CapturePreview {
         status,
         latest_complete_pair,
         preview_warning,
-    })
+    }
 }
 
 fn native_detail_preview_warning(pair: &CapturePair) -> Option<String> {
@@ -1040,8 +1442,9 @@ mod tests {
                 revision: 1,
                 screen: capture_preview(CaptureStatus::Ready, Some(first)),
                 lift_axis: LiftAxisStatus::starting(),
-                scan_readiness: ScanReadiness::current(),
+                scan_readiness: ScanReadiness::Enabled,
                 stop: None,
+                pressure_mbar: None,
             })
             .unwrap();
         let latest = pair(2);
@@ -1049,8 +1452,9 @@ mod tests {
             revision: 2,
             screen: capture_preview(CaptureStatus::Ready, Some(latest)),
             lift_axis: LiftAxisStatus::starting(),
-            scan_readiness: ScanReadiness::current(),
+            scan_readiness: ScanReadiness::Enabled,
             stop: None,
+            pressure_mbar: None,
         };
         snapshots.send(expected.clone()).unwrap();
 
@@ -1072,8 +1476,9 @@ mod tests {
             revision: 3,
             screen: MachineScreen::Exited,
             lift_axis: LiftAxisStatus::starting(),
-            scan_readiness: ScanReadiness::current(),
+            scan_readiness: ScanReadiness::Enabled,
             stop: None,
+            pressure_mbar: None,
         };
         snapshots.send(exited.clone()).unwrap();
         snapshots.close();

@@ -94,8 +94,8 @@ fn load_texture(
 
 /// Show the Capture preview screen for `preview`.
 ///
-/// The action bar holds Stop beside the state's capture action, then `exit`. A
-/// latched Stop replaces the header status and leads the body.
+/// The action bar holds Stop beside the state's capture action, then `more`
+/// (Home and Exit). A latched Stop replaces the header status and leads the body.
 pub(crate) fn show_capture_preview(
     ui: &mut egui::Ui,
     context: &egui::Context,
@@ -103,7 +103,7 @@ pub(crate) fn show_capture_preview(
     preview: &CapturePreview,
     stop: Option<&StopStatus>,
     textures: Option<&PreviewTextures>,
-    exit: impl FnOnce(&mut egui::Ui),
+    more: impl FnOnce(&mut egui::Ui),
 ) -> Result<(), ControllerClosed> {
     let (status, colour) = match &preview.status {
         CaptureStatus::Ready => ("Cameras ready", egui::Color32::LIGHT_GREEN),
@@ -132,7 +132,7 @@ pub(crate) fn show_capture_preview(
                 capture = show_capture_action(ui, context, handle, &preview.status);
             })
             .and(capture);
-            exit(ui);
+            more(ui);
         },
         |ui, viewport_height| {
             show_stop(ui, stop);
@@ -179,7 +179,11 @@ fn show_capture_action(
 /// The Full-page previews take whatever height the body viewport has left
 /// after the content above them, their labels and captions, and the 100% row,
 /// down to [`FULL_PAGE_MIN_HEIGHT`]. Below that floor the body scrolls instead.
-fn render_four_views(ui: &mut egui::Ui, textures: &PreviewTextures, viewport_height: f32) {
+pub(crate) fn render_four_views(
+    ui: &mut egui::Ui,
+    textures: &PreviewTextures,
+    viewport_height: f32,
+) {
     let spacing = ui.spacing().item_spacing;
     let column_width = (ui.available_width() - spacing.x) / 2.0;
     let detail_side = column_width.min(DETAIL_MAX_SIDE);

@@ -1,8 +1,7 @@
 //! Compact lift-axis status for a screen body, and its reconnect action.
 //!
 //! The only action is a reconnect, which belongs in the action bar. Nothing here
-//! arms, homes, moves or clears errors, and scanning stays disabled whatever it
-//! shows.
+//! arms, homes, moves or clears errors.
 
 use eframe::egui;
 use sans_core::{
@@ -116,8 +115,10 @@ pub(crate) fn show_lift_axis(
                 ui.colored_label(egui::Color32::YELLOW, freshness);
             }
         }
-        let ScanReadiness::Disabled { reason } = scan_readiness;
-        ui.small(format!("Scanning disabled: {reason}"));
+        match scan_readiness {
+            ScanReadiness::Disabled { reason } => ui.small(format!("Scanning disabled: {reason}")),
+            ScanReadiness::Enabled => ui.small("Live gates pass: Home and scanning are available."),
+        };
     });
 }
 

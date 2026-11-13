@@ -37,6 +37,33 @@ fn write_headless_fixture_renders() {
             }
         }
     }
+    // The scan workflow, from Home consent to the first Capture pair.
+    let scanner_renderer = renderer("headless fixture renders")
+        .expect("SANS_SCREENSHOT_DIR is set but no wgpu adapter can render");
+    let mut session = Session::scanner_rendered(portrait_full_frame(), T1, Some(scanner_renderer));
+    let shoot = |session: &mut Session, name: &str| {
+        session
+            .render()
+            .save(directory.join(format!("headless-fixture-T1-{name}.png")))
+            .unwrap();
+    };
+    shoot(&mut session, "home-required");
+    session.tap_label("Home lift axis");
+    session.wait_for_label("Idle");
+    shoot(&mut session, "idle");
+    session.tap_label("New Book");
+    session.wait_for_label("Enter page width");
+    for key in ["2", "1", "0"] {
+        session.tap_label(key);
+    }
+    shoot(&mut session, "page-width");
+    session.tap_label("Set 210 mm");
+    session.wait_for_label("Page width: 210 mm");
+    shoot(&mut session, "ready");
+    session.tap_label("Start");
+    session.wait_for_label("First pair captured");
+    shoot(&mut session, "scanning");
+
     // A latched Stop. The fixture Machine has no Monospace, so it is Unconfirmed.
     let renderer = renderer("headless fixture renders")
         .expect("SANS_SCREENSHOT_DIR is set but no wgpu adapter can render");
