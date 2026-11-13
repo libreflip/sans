@@ -12,7 +12,7 @@ use sans_core::{
     bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineBoard,
     MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection, MonospaceEventKind,
     MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
-    CAPTURE_LIGHT_SETTLE,
+    StartupError, CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{CameraCaptureError, CameraRole};
@@ -25,6 +25,30 @@ struct Arguments {
     /// Use an explicit Machine profile instead of the normal user config path.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Log more to stderr: `-v` operator operations, Stop and link changes;
+    /// `-vv` also every Monospace and ODrive command; `-vvv` also ODrive
+    /// reads. Errors and warnings are always logged. `RUST_LOG` overrides.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+}
+
+/// The `env_logger` filter for a `-v` count: other crates stay at warnings.
+fn log_filter(verbose: u8) -> String {
+    let level = match verbose {
+        0 => return "warn".into(),
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    format!("warn,sans={level},sans_core={level}")
+}
+
+/// Log to stderr. `RUST_LOG`, when set, replaces the `-v` filter.
+fn init_logging(verbose: u8) {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(log_filter(verbose)),
+    )
+    .init();
 }
 
 /// One Monospace connection, shared by the controller's board and the
@@ -134,7 +158,7 @@ fn monospace_machine_event(epoch: u64, event: MonospaceEventKind) -> Option<Mach
         MonospaceEventKind::Pressure(_) => None,
         MonospaceEventKind::ButtonPressed => Some(MachineEvent::StopButton),
         MonospaceEventKind::UnknownEvent(payload) => {
-            eprintln!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
+            log::warn!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
             None
         }
         MonospaceEventKind::Disconnected => Some(MachineEvent::Lost(SetupBlocker::new(format!(
@@ -196,6 +220,7 @@ impl MachineFactory for UnsupportedCameraFactory {
 
 fn main() -> eframe::Result {
     let arguments = Arguments::parse();
+    init_logging(arguments.verbose);
     #[cfg(target_os = "linux")]
     let camera_factory = V4lCameraMachineFactory;
     #[cfg(not(target_os = "linux"))]
@@ -207,6 +232,11 @@ fn main() -> eframe::Result {
             monospace: None,
         },
     );
+    match &startup {
+        Err(error @ StartupError::TemplateCreated { .. }) => log::warn!("{error}"),
+        Err(error) => log::error!("startup failed: {error}"),
+        Ok(_) => {}
+    }
     let startup = Startup::from_bootstrap(startup);
     let options = eframe::NativeOptions {
         viewport: window_request(),
@@ -224,7 +254,15 @@ fn main() -> eframe::Result {
 mod tests {
     use sans_core::{MachineEvent, MonospaceEventKind, MonospaceFault, SetupBlocker};
 
-    use super::{monospace_fault_summary, monospace_machine_event};
+    use super::{log_filter, monospace_fault_summary, monospace_machine_event};
+
+    #[test]
+    fn verbosity_raises_only_the_sans_crates() {
+        assert_eq!(log_filter(0), "warn");
+        assert_eq!(log_filter(1), "warn,sans=info,sans_core=info");
+        assert_eq!(log_filter(2), "warn,sans=debug,sans_core=debug");
+        assert_eq!(log_filter(5), "warn,sans=trace,sans_core=trace");
+    }
 
     #[test]
     fn setup_fault_summaries_preserve_the_failure_class() {

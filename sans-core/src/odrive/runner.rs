@@ -286,7 +286,7 @@ impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
             return;
         };
         if let Err(reason) = half.shutdown(RELEASE_SLICE) {
-            eprintln!("ODrive transport still held, retrying its release: {reason}");
+            log::warn!("ODrive transport still held, retrying its release: {reason}");
         } else {
             drop(half);
             self.barrier.half_released();
@@ -302,7 +302,7 @@ impl<T: DeviceHalf> Drop for ReleaseOnExit<T> {
                 }
             });
         if reaper.is_err() {
-            eprintln!("cannot start the ODrive release reaper; the next connection attempt retries the release");
+            log::error!("cannot start the ODrive release reaper; the next connection attempt retries the release");
         }
     }
 }

@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::camera::{CapturePair, CapturePairError};
-use crate::lift::{LiftOperations, StopCause};
+use crate::lift::{LiftEvent, LiftOperations, LiftOutcome, StopCause};
 use crate::odrive::{
     spawn_link, DiscoveryRecord, FibreOpener, LinkCommand, LinkConfig, LinkEvent, LinkHandle,
     LinkPhase, LinkRunner, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket,
 };
-use crate::stop::{Relays, StopControl, StopStatus};
+use crate::stop::{Relays, StopControl, StopStatus, StopVerdict};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
 mod machine;
@@ -488,6 +488,7 @@ fn spawn_controller<Factory: MachineFactory>(
             let machine = match machine {
                 Ok(machine) => Some(machine),
                 Err(error) => {
+                    log::error!("cannot start the Machine thread: {error}");
                     state.opened = true;
                     state.screen = MachineScreen::Setup(SetupState::Blocked {
                         reasons: vec![SetupBlocker::new(format!(
@@ -538,6 +539,9 @@ fn spawn_controller<Factory: MachineFactory>(
                         Err(RecvTimeoutError::Disconnected) => return,
                     },
                 };
+                if let Inbox::Intent(intent) = &message {
+                    log::info!("operator requested {intent:?}");
+                }
                 match message {
                     Inbox::Intent(ControllerIntent::Stop) => {
                         let cause = StopCause::Requested("touchscreen Stop".into());
@@ -553,13 +557,19 @@ fn spawn_controller<Factory: MachineFactory>(
                         }
                     }
                     Inbox::Intent(ControllerIntent::CapturePair) => {
-                        if !cameras_live || capturing {
+                        if !cameras_live {
+                            log::warn!("ignored CapturePair: the Cameras are not live");
+                            continue;
+                        }
+                        if capturing {
+                            log::warn!("ignored CapturePair: a capture is already running");
                             continue;
                         }
                         let sent = machine.as_ref().is_some_and(|machine| {
                             machine.send(MachineRequest::CapturePair).is_ok()
                         });
                         if !sent {
+                            log::error!("CapturePair failed: the Machine thread is gone");
                             cameras_live = false;
                             continue;
                         }
@@ -587,12 +597,22 @@ fn spawn_controller<Factory: MachineFactory>(
                         }
                     }
                     Inbox::Board(opened) => {
+                        match &opened {
+                            Ok((_, diagnostic)) => log_ready(diagnostic),
+                            Err(blocker) => log::error!("board setup: {}", blocker.summary),
+                        }
                         board_setup = Some(opened.map(|(opened, diagnostic)| {
                             board = Some(opened);
                             diagnostic
                         }));
                     }
                     Inbox::Cameras(opened) => {
+                        match &opened {
+                            Ok(diagnostics) => diagnostics.iter().for_each(log_ready),
+                            Err(blockers) => blockers.iter().for_each(|blocker| {
+                                log::error!("Camera setup: {}", blocker.summary)
+                            }),
+                        }
                         cameras_live = opened.is_ok();
                         state.screen = MachineScreen::Setup(setup_state(opened, &board_setup));
                         state.opened = true;
@@ -604,12 +624,16 @@ fn spawn_controller<Factory: MachineFactory>(
                         capturing = false;
                         let status = match result {
                             Ok(pair) => {
+                                log::info!("captured a complete pair");
                                 state.latest_complete_pair = Some(Arc::new(pair));
                                 CaptureStatus::Ready
                             }
-                            Err(error) => CaptureStatus::Blocked {
-                                reason: error.to_string(),
-                            },
+                            Err(error) => {
+                                log::error!("CapturePair failed: {error}");
+                                CaptureStatus::Blocked {
+                                    reason: error.to_string(),
+                                }
+                            }
                         };
                         // A Setup failure during the capture keeps its screen.
                         if matches!(state.screen, MachineScreen::CapturePreview(_)) {
@@ -622,6 +646,7 @@ fn spawn_controller<Factory: MachineFactory>(
                     }
                     Inbox::BoardEvent(MachineEvent::StopButton)
                     | Inbox::Machine(MachineEvent::StopButton) => {
+                        log::info!("physical Stop button pressed");
                         let cause = StopCause::Requested("physical button".into());
                         lift.stop(Instant::now(), cause, &mut relays(&mut board));
                         if !state.publish(&mut lift) {
@@ -629,6 +654,7 @@ fn spawn_controller<Factory: MachineFactory>(
                         }
                     }
                     Inbox::BoardEvent(MachineEvent::Lost(blocker)) => {
+                        log::error!("board lost: {}", blocker.summary);
                         // Stop while the board may still switch its relays off.
                         let cause = StopCause::LinkLost(blocker.summary.clone());
                         lift.stop(Instant::now(), cause, &mut relays(&mut board));
@@ -643,6 +669,7 @@ fn spawn_controller<Factory: MachineFactory>(
                         }
                     }
                     Inbox::Machine(MachineEvent::Lost(blocker)) => {
+                        log::error!("Machine lost: {}", blocker.summary);
                         cameras_live = false;
                         state.screen = MachineScreen::Setup(SetupState::Blocked {
                             reasons: vec![blocker],
@@ -651,7 +678,10 @@ fn spawn_controller<Factory: MachineFactory>(
                             return;
                         }
                     }
-                    Inbox::MachinePanicked => return,
+                    Inbox::MachinePanicked => {
+                        log::error!("the Machine thread panicked; the controller is stopping");
+                        return;
+                    }
                 }
             }
         })
@@ -718,6 +748,8 @@ struct LiftAxis {
     stop: StopControl,
     /// The Stop status the last snapshot carried.
     shown_stop: Option<StopStatus>,
+    /// The Stop status last logged.
+    logged_stop: Option<StopStatus>,
     status: LiftAxisStatus,
     latest: Option<TelemetrySample>,
     /// When a snapshot last carried this projection.
@@ -735,6 +767,7 @@ impl LiftAxis {
             ops: LiftOperations::new(profile.profile()),
             stop: StopControl::new(profile.profile()),
             shown_stop: None,
+            logged_stop: None,
             status: LiftAxisStatus::starting(),
             latest: None,
             last_publish: None,
@@ -742,15 +775,18 @@ impl LiftAxis {
         let config = match LinkConfig::from_profile(profile.profile()) {
             Ok(config) => config,
             Err(problems) => {
-                lift.status = LiftAxisStatus::unavailable(problems.join("; "));
+                let reason = problems.join("; ");
+                log::error!("lift axis unavailable: {reason}");
+                lift.status = LiftAxisStatus::unavailable(reason);
                 return lift;
             }
         };
         match spawn_link(config, opener, events) {
             Ok(link) => lift.link = Some(link),
             Err(error) => {
-                lift.status =
-                    LiftAxisStatus::unavailable(format!("cannot start the lift-axis link: {error}"))
+                let reason = format!("cannot start the lift-axis link: {error}");
+                log::error!("{reason}");
+                lift.status = LiftAxisStatus::unavailable(reason);
             }
         }
         lift
@@ -766,8 +802,10 @@ impl LiftAxis {
 
     fn clear_stop(&mut self, now: Instant) {
         let mut link = port(&self.link);
-        // A refusal is recorded in the Stop status.
-        let _ = self.stop.clear(now, &mut self.ops, &mut link);
+        // A refusal is also recorded in the Stop status.
+        if let Err(refused) = self.stop.clear(now, &mut self.ops, &mut link) {
+            log::error!("Clear Stop refused: {refused:?}");
+        }
     }
 
     /// Feed one link event to lift-axis policy; true when the Stop changed.
@@ -790,9 +828,15 @@ impl LiftAxis {
 
     fn settle(&mut self, now: Instant, relays: &mut Relays<'_>) {
         while let Some(event) = self.ops.take_event() {
+            log_lift_event(&event);
             self.stop.note(&event);
         }
         self.stop.observe(now, &self.ops, relays);
+        let stop = self.stop.status();
+        if stop != self.logged_stop {
+            log_stop_change(self.logged_stop.as_ref(), stop.as_ref());
+            self.logged_stop = stop;
+        }
     }
 
     fn stop_changed(&self) -> bool {
@@ -809,8 +853,9 @@ impl LiftAxis {
     }
 
     fn reconnect(&self) {
-        if let Some((handle, _)) = &self.link {
-            handle.reconnect();
+        match &self.link {
+            Some((handle, _)) => handle.reconnect(),
+            None => log::error!("ReconnectLiftAxis failed: the lift-axis link is not running"),
         }
     }
 
@@ -875,6 +920,48 @@ impl LiftAxis {
                 cycle_ms: sample.cycle_duration().as_millis() as u64,
             });
         status
+    }
+}
+
+fn log_ready(diagnostic: &SetupDiagnostic) {
+    log::info!("{} ready: {}", diagnostic.component, diagnostic.summary);
+}
+
+fn log_lift_event(event: &LiftEvent) {
+    match event {
+        LiftEvent::Finished {
+            id,
+            epoch,
+            outcome: LiftOutcome::Fault(fault),
+        } => log::error!("lift operation {id:?} on epoch {epoch} failed: {fault:?}"),
+        LiftEvent::Finished { id, epoch, outcome } => {
+            log::info!("lift operation {id:?} on epoch {epoch} finished: {outcome:?}")
+        }
+        LiftEvent::TurnBlowerCutoff { id } => {
+            log::debug!("lift operation {id:?} passed the Turn blower cutoff")
+        }
+    }
+}
+
+/// Log a Stop latch, verdict or clear. Clear refusals are logged where they happen.
+fn log_stop_change(last: Option<&StopStatus>, stop: Option<&StopStatus>) {
+    let Some(stop) = stop else {
+        log::info!("Stop cleared");
+        return;
+    };
+    if last.is_none_or(|last| last.cause != stop.cause) {
+        match &stop.cause {
+            StopCause::Requested(_) => log::warn!("Stop latched: {:?}", stop.cause),
+            _ => log::error!("Stop latched: {:?}", stop.cause),
+        }
+    }
+    if last.is_some_and(|last| last.verdict == stop.verdict) {
+        return;
+    }
+    match &stop.verdict {
+        StopVerdict::Confirming => {}
+        StopVerdict::Confirmed => log::info!("Stop confirmed"),
+        StopVerdict::Unconfirmed { reason } => log::error!("Stop unconfirmed: {reason}"),
     }
 }
 

@@ -13,6 +13,8 @@ eframe = { version = "0.36.1", default-features = false, features = [
     "wayland",
     "x11",
 ] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+log = "0.4"
 sans-core = { path = "../sans-core" }
 
 [dev-dependencies]
