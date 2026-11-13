@@ -1,4 +1,7 @@
 //! sans-core – Libreflip backend daemon core library
+//!
+//! Diagnostics and failures go through the `log` facade; each executable
+//! installs the logger that prints them.
 
 mod camera;
 mod config;

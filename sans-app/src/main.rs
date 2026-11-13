@@ -43,12 +43,21 @@ fn log_filter(verbose: u8) -> String {
     format!("warn,sans={level},sans_core={level}")
 }
 
-/// Log to stderr. `RUST_LOG`, when set, replaces the `-v` filter.
+/// The stderr logger: the `-v` filter, then `RUST_LOG`'s directives on top.
+/// A `RUST_LOG` directive replaces only the one for the same module, so
+/// naming one module keeps warnings from every other.
+fn logger(verbose: u8, rust_log: Option<&str>) -> env_logger::Builder {
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters(&log_filter(verbose));
+    if let Some(rust_log) = rust_log {
+        builder.parse_filters(rust_log);
+    }
+    builder
+}
+
 fn init_logging(verbose: u8) {
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(log_filter(verbose)),
-    )
-    .init();
+    let rust_log = std::env::var("RUST_LOG").ok();
+    logger(verbose, rust_log.as_deref()).init();
 }
 
 /// One Monospace connection, shared by the controller's board and the
@@ -254,7 +263,28 @@ fn main() -> eframe::Result {
 mod tests {
     use sans_core::{MachineEvent, MonospaceEventKind, MonospaceFault, SetupBlocker};
 
-    use super::{log_filter, monospace_fault_summary, monospace_machine_event};
+    use log::{Level, Log, Record};
+
+    use super::{log_filter, logger, monospace_fault_summary, monospace_machine_event};
+
+    #[test]
+    fn rust_log_for_one_module_keeps_warnings_from_the_others() {
+        let logger = logger(0, Some("sans_core::hardware=debug")).build();
+        let enabled = |target: &str, level: Level| {
+            logger.enabled(
+                &Record::builder()
+                    .target(target)
+                    .level(level)
+                    .build()
+                    .metadata()
+                    .clone(),
+            )
+        };
+        assert!(enabled("sans_core::hardware", Level::Debug));
+        assert!(enabled("sans_core::controller", Level::Warn));
+        assert!(enabled("sans", Level::Warn));
+        assert!(!enabled("sans_core::controller", Level::Info));
+    }
 
     #[test]
     fn verbosity_raises_only_the_sans_crates() {

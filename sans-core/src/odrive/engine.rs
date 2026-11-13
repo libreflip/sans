@@ -1354,13 +1354,13 @@ impl LinkEngine {
         let lane = if urgent { "urgent" } else { "ordinary" };
         match spec {
             RequestSpec::Write(endpoint, value) => log::debug!(
-                "ODrive epoch {epoch} sequence {sequence} -> write {endpoint:?} = {value:?} ({lane})"
+                "ODrive epoch {epoch} sequence {sequence} queued write {endpoint:?} = {value:?} ({lane})"
             ),
             RequestSpec::Call(endpoint) => {
-                log::debug!("ODrive epoch {epoch} sequence {sequence} -> call {endpoint:?} ({lane})")
+                log::debug!("ODrive epoch {epoch} sequence {sequence} queued call {endpoint:?} ({lane})")
             }
             RequestSpec::Read(_) | RequestSpec::Chunk(_) => log::trace!(
-                "ODrive epoch {epoch} sequence {sequence} -> {} ({lane})",
+                "ODrive epoch {epoch} sequence {sequence} queued {} ({lane})",
                 spec.label()
             ),
         }

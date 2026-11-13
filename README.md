@@ -31,7 +31,7 @@ Sans opens maximized with its window decorations, so the desktop decides the usa
 
 Use `cargo run -p sans -- --config /path/to/sans.toml` for an explicit development or deployment profile. The normal path is `$XDG_CONFIG_HOME/sans/sans.toml`, falling back to `~/.config/sans/sans.toml`.
 
-Sans logs to stderr. Errors and warnings, such as a failed Capture pair, a refused Monospace command or an unconfirmed Stop, are always logged. Add `-v` for operator operations, Stop changes and lift-axis link changes, `-vv` for every Monospace command and reply and every ODrive command and write, and `-vvv` for ODrive reads as well. `RUST_LOG`, when set, replaces the `-v` filter, for example `RUST_LOG=sans_core::hardware=debug`.
+Sans logs to stderr. Errors and warnings, such as a failed Capture pair, a refused Monospace command or an unconfirmed Stop, are always logged. Pass `-v` after Cargo's `--` (`cargo run -p sans -- -v`) for operator operations, Stop changes and lift-axis link changes, `-vv` for every Monospace command and reply and every ODrive command and queued write, and `-vvv` for ODrive reads as well. `RUST_LOG` adds directives on top of that filter, for example `RUST_LOG=sans_core::hardware=debug`; a directive replaces only the one for the module it names, so other modules keep their warnings.
 
 On first start, Sans writes the parseable [sans.example.toml](sans.example.toml) template to the selected path and opens a fatal screen naming that path. Close Sans, fill every `<...>` placeholder, commission both zero page-width bounds, then restart. A relative `data_root` is resolved against the profile location and must be writable.
 

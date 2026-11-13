@@ -26,7 +26,7 @@ This repository is a Rust workspace. `sans-app/` builds the native `sans` touchs
 - `cargo fmt --all -- --check` checks formatting without rewriting files.
 - `cargo clippy --workspace --all-targets -- -D warnings` treats lint findings as failures.
 - `SANS_SCREENSHOT_DIR=<dir> cargo test -p sans --test screenshots` writes headless fixture renders as PNGs, for example for PR screenshots.
-- `cargo run -p sans` starts the native application with the normal user Machine profile; use `-- --config <path>` for an explicit profile. Add `-v`, `-vv` or `-vvv` to log operator operations, then board commands, then ODrive reads to stderr; errors and warnings always log.
+- `cargo run -p sans` starts the native application with the normal user Machine profile; use `-- --config <path>` for an explicit profile. Pass verbosity after Cargo's `--`, as in `cargo run -p sans -- -v`, `-- -vv` or `-- -vvv`, to log operator operations, then board commands, then ODrive reads to stderr. Errors and warnings log by default; `RUST_LOG` adds directives on top, and can lower a module it names.
 - `cross build --target aarch64-unknown-linux-gnu` mirrors the 64-bit Raspberry Pi 4+ target used by CI.
 - `scripts/pi-run [--binary <path>] [--env NAME=VALUE]... <host> [-- <sans-arg>...]` builds the release binary with `cross` unless `--binary` supplies one, uploads it to `~/.local/bin/sans-dev` on the Pi, and runs it there over SSH. `sans-app/tests/pi_run.rs` tests it with fake `cross` and `ssh` on `PATH`. Agents must not run it against a real Pi: like `hw_diag`, it drives real hardware and needs a supervised session.
 

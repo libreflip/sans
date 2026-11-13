@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use crate::camera::{CapturePair, CapturePairError};
-use crate::lift::{LiftEvent, LiftOperations, LiftOutcome, StopCause};
+use crate::lift::{LiftEvent, LiftFault, LiftOperations, LiftOutcome, StopCause};
 use crate::odrive::{
     spawn_link, DiscoveryRecord, FibreOpener, LinkCommand, LinkConfig, LinkEvent, LinkHandle,
     LinkPhase, LinkRunner, LinkStatus, Priority, TelemetrySample, TelemetryValues, Ticket,
@@ -929,6 +929,11 @@ fn log_ready(diagnostic: &SetupDiagnostic) {
 
 fn log_lift_event(event: &LiftEvent) {
     match event {
+        LiftEvent::Finished {
+            id,
+            epoch,
+            outcome: LiftOutcome::Fault(fault @ LiftFault::Stopped(StopCause::Requested(_))),
+        } => log::warn!("lift operation {id:?} on epoch {epoch} ended: {fault:?}"),
         LiftEvent::Finished {
             id,
             epoch,

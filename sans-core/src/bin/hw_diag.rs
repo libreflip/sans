@@ -31,6 +31,13 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 fn main() {
     let args = Args::parse();
+    // Monospace failures and ignored frames log at warn; `RUST_LOG` adds directives.
+    let mut logger = env_logger::Builder::new();
+    logger.parse_filters("warn");
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        logger.parse_filters(&rust_log);
+    }
+    logger.init();
 
     let csv_writer: Option<Arc<Mutex<Writer<std::fs::File>>>> = args.log.as_ref().map(|path| {
         let file = std::fs::File::create(path).expect("failed to create --log file");

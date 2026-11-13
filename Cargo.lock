@@ -2867,6 +2867,7 @@ dependencies = [
  "chrono",
  "clap",
  "csv",
+ "env_logger",
  "image",
  "log",
  "nusb",
