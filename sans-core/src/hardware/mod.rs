@@ -495,6 +495,10 @@ impl MonospaceClient {
                 .next_timeout()
                 .and_then(|timeout| self.expect_ok_with_timeout(command, timeout));
             if let Err(error) = result {
+                log::error!(
+                    "Monospace epoch {} readiness gate failed at {command:?}: {error}",
+                    self.epoch.get()
+                );
                 self.state.poison();
                 best_effort_all_off_and_close(&self.write_half);
                 return Err(
@@ -535,6 +539,17 @@ impl MonospaceClient {
     }
 
     fn send_raw_with_timeout(&mut self, line: &str, timeout: Duration) -> Result<String, HwError> {
+        let epoch = self.epoch.get();
+        log::debug!("Monospace epoch {epoch} -> {line:?}");
+        let result = self.send_raw_unlogged(line, timeout);
+        match &result {
+            Ok(reply) => log::debug!("Monospace epoch {epoch} <- {reply:?}"),
+            Err(error) => log::error!("Monospace epoch {epoch} command {line:?} failed: {error}"),
+        }
+        result
+    }
+
+    fn send_raw_unlogged(&mut self, line: &str, timeout: Duration) -> Result<String, HwError> {
         validate_command_line(line).map_err(|reason| {
             let reason = match reason {
                 InvalidCommandLine::ControlByte => "embedded CR, LF, or NUL".into(),
@@ -619,6 +634,10 @@ impl MonospaceClient {
 
     fn poison(&self, fault: MonospaceFault) {
         if self.state.poison() {
+            log::error!(
+                "Monospace connection epoch {} poisoned: {fault:?}",
+                self.epoch.get()
+            );
             self.events.send(MonospaceEvent {
                 epoch: self.epoch,
                 kind: MonospaceEventKind::Fault(fault),
@@ -632,13 +651,25 @@ impl MonospaceClient {
     }
 
     fn expect_ok_with_timeout(&mut self, command: &str, timeout: Duration) -> Result<(), HwError> {
-        match self.send_raw_with_timeout(command, timeout)?.as_str() {
-            "OK" => Ok(()),
+        let result = match self.send_raw_with_timeout(command, timeout)?.as_str() {
+            "OK" => return Ok(()),
             reply if reply.starts_with("ERR ") => Err(HwError::Firmware(reply[4..].to_string())),
             reply => {
                 self.poison(MonospaceFault::UnexpectedReply(reply.to_string()));
                 Err(HwError::UnexpectedReply(reply.to_string()))
             }
+        };
+        self.log_rejected(command, &result);
+        result
+    }
+
+    /// Log a reply that arrived but did not accept `command`.
+    fn log_rejected<T>(&self, command: &str, result: &Result<T, HwError>) {
+        if let Err(error) = result {
+            log::error!(
+                "Monospace epoch {} rejected {command:?}: {error}",
+                self.epoch.get()
+            );
         }
     }
 
@@ -678,14 +709,16 @@ impl MonospaceClient {
     /// Read one averaged pressure sample in millibar.
     pub fn press_once(&mut self) -> Result<f32, HwError> {
         let reply = self.send_raw("PRESS?")?;
-        match classify_line(&reply) {
-            LineKind::OkPress(mbar) => Ok(mbar),
+        let result = match classify_line(&reply) {
+            LineKind::OkPress(mbar) => return Ok(mbar),
             LineKind::Err(reason) => Err(HwError::Firmware(reason)),
             _ => {
                 self.poison(MonospaceFault::UnexpectedReply(reply.clone()));
                 Err(HwError::UnexpectedReply(reply))
             }
-        }
+        };
+        self.log_rejected("PRESS?", &result);
+        result
     }
 
     /// Start streamed pressure telemetry.
@@ -707,9 +740,12 @@ impl MonospaceClient {
 impl MonospaceUrgentWriter {
     /// Dispatch `ALL OFF` and poison the untagged response FIFO.
     pub fn all_off(&self) -> Result<(), HwError> {
+        let epoch = self.epoch.get();
         if !self.state.is_active() {
-            return Err(HwError::Poisoned(self.epoch.get()));
+            log::error!("Monospace epoch {epoch} urgent ALL OFF refused: connection is not active");
+            return Err(HwError::Poisoned(epoch));
         }
+        log::debug!("Monospace epoch {epoch} -> {ALL_OFF_COMMAND:?} (urgent)");
         if self.state.poison() {
             self.events.send(MonospaceEvent {
                 epoch: self.epoch,
@@ -730,6 +766,9 @@ impl MonospaceUrgentWriter {
             writer.take();
             result
         };
+        if let Err(error) = &write_result {
+            log::error!("Monospace epoch {epoch} urgent ALL OFF failed: {error}");
+        }
         write_result?;
         Err(HwError::AmbiguousUrgentWrite)
     }
@@ -761,8 +800,12 @@ fn best_effort_all_off_and_close(write_half: &SharedWriter) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(writer) = writer.as_mut() {
-        let _ = write_line(writer.as_mut(), ALL_OFF_COMMAND)
-            .and_then(|()| write_line(writer.as_mut(), LIGHT_OFF_COMMAND));
+        log::debug!("Monospace -> {ALL_OFF_COMMAND:?}, {LIGHT_OFF_COMMAND:?} (closing connection)");
+        if let Err(error) = write_line(writer.as_mut(), ALL_OFF_COMMAND)
+            .and_then(|()| write_line(writer.as_mut(), LIGHT_OFF_COMMAND))
+        {
+            log::error!("Monospace closing ALL OFF and LIGHT OFF failed: {error}");
+        }
     }
     writer.take();
 }
@@ -799,7 +842,7 @@ fn read_lines(
                 let frame = line.trim_end_matches(['\r', '\n']).to_string();
                 line.clear();
                 if !state.is_active() {
-                    eprintln!(
+                    log::warn!(
                         "ignored stale Monospace frame for retired connection epoch {}: {:?}",
                         epoch.get(),
                         frame
@@ -849,7 +892,7 @@ fn read_lines(
                             best_effort_all_off_and_close(write_half);
                             let _ = responses.send(ReaderReply::Malformed(frame));
                         } else {
-                            eprintln!(
+                            log::warn!(
                                 "ignored stale malformed Monospace frame for retired connection epoch {}: {:?}",
                                 epoch.get(),
                                 frame
@@ -879,7 +922,7 @@ fn read_lines(
                                 return;
                             }
                             ResponseDisposition::Retired => {
-                                eprintln!(
+                                log::warn!(
                                     "ignored stale Monospace response for retired connection epoch {}: {:?}",
                                     epoch.get(),
                                     frame
@@ -901,7 +944,7 @@ fn read_lines(
             Err(error) => {
                 let previous = state.poison_and_get_previous();
                 if previous == ConnectionStatus::Retired {
-                    eprintln!(
+                    log::warn!(
                         "ignored stale Monospace read failure for retired connection epoch {}: {}",
                         epoch.get(),
                         error

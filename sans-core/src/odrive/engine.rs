@@ -970,6 +970,11 @@ impl LinkEngine {
         priority: Priority,
     ) {
         self.expire(now);
+        log::debug!(
+            "ODrive epoch {} command {command:?} submitted ({priority:?}, ticket {})",
+            self.epoch,
+            ticket.0
+        );
         let usable = self.connection.as_ref().is_some_and(Connection::usable);
         if !usable {
             self.finish(
@@ -1059,7 +1064,17 @@ impl LinkEngine {
 
     /// The next event.
     pub fn take_event(&mut self) -> Option<LinkEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        if let LinkEvent::CommandResult {
+            ticket,
+            epoch,
+            command,
+            result,
+        } = &event
+        {
+            log_command_result(*ticket, *epoch, command, result);
+        }
+        Some(event)
     }
 
     /// The earliest time `poll` has work to do.
@@ -1236,6 +1251,7 @@ impl LinkEngine {
             return;
         };
         if connection.fault.is_none() {
+            log::error!("ODrive epoch {} link fault: {reason}", connection.epoch);
             connection.fault = Some(reason);
         }
         self.retire_queue();
@@ -1335,6 +1351,19 @@ impl LinkEngine {
                 RequestSpec::Chunk(_) => unreachable!(),
             }
         };
+        let lane = if urgent { "urgent" } else { "ordinary" };
+        match spec {
+            RequestSpec::Write(endpoint, value) => log::debug!(
+                "ODrive epoch {epoch} sequence {sequence} queued write {endpoint:?} = {value:?} ({lane})"
+            ),
+            RequestSpec::Call(endpoint) => {
+                log::debug!("ODrive epoch {epoch} sequence {sequence} queued call {endpoint:?} ({lane})")
+            }
+            RequestSpec::Read(_) | RequestSpec::Chunk(_) => log::trace!(
+                "ODrive epoch {epoch} sequence {sequence} queued {} ({lane})",
+                spec.label()
+            ),
+        }
         let deadline = now
             + if urgent {
                 self.config.urgent_deadline
@@ -1799,7 +1828,7 @@ impl LinkEngine {
         self.unmatched_replies += 1;
         let count = self.unmatched_replies;
         if count <= 8 || count.is_power_of_two() {
-            eprintln!("ODrive link ignored {what} ({count} ignored so far)");
+            log::warn!("ODrive link ignored {what} ({count} ignored so far)");
         }
     }
 
@@ -2430,10 +2459,47 @@ impl LinkEngine {
     }
 
     fn emit_status(&mut self, status: LinkStatus) {
+        log_status_change(self.last_status.as_ref(), &status);
         self.last_status = Some(status.clone());
         self.last_count_publish = self.clock;
         self.count_pending = false;
         self.events.push_back(LinkEvent::Status(status));
+    }
+}
+
+/// Log a phase or blocker change; a change of only the counts is not logged.
+fn log_status_change(last: Option<&LinkStatus>, status: &LinkStatus) {
+    let changed = last.is_none_or(|last| {
+        last.epoch != status.epoch || last.phase != status.phase || last.blockers != status.blockers
+    });
+    if !changed {
+        return;
+    }
+    let (epoch, phase) = (status.epoch, status.phase);
+    if status.blockers.is_empty() {
+        log::info!("ODrive epoch {epoch} link {phase:?}");
+        return;
+    }
+    log::error!(
+        "ODrive epoch {epoch} link {phase:?}: {}",
+        status.blockers.join("; ")
+    );
+}
+
+/// Log one command's outcome; anything but a confirmed command is an error,
+/// except a command retired before it left the host, which is a warning.
+fn log_command_result(ticket: Ticket, epoch: u64, command: &LinkCommand, result: &CommandResult) {
+    let ticket = ticket.0;
+    match result {
+        CommandResult::Completed => {
+            log::debug!("ODrive epoch {epoch} command {command:?} (ticket {ticket}) completed")
+        }
+        CommandResult::Retired { transmitted: false } => log::warn!(
+            "ODrive epoch {epoch} command {command:?} (ticket {ticket}) retired before it was sent"
+        ),
+        result => log::error!(
+            "ODrive epoch {epoch} command {command:?} (ticket {ticket}) failed: {result:?}"
+        ),
     }
 }
 
