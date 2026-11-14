@@ -51,9 +51,11 @@
 //!   entry by observing the homing state.
 //! - Home completion (reference): the first fresh sample after that
 //!   confirmation that reads idle. Success needs all four error words zero,
-//!   `is_homed` true, encoder ready, trajectory done, stationary velocity and position within
-//!   the position tolerance of 0. An idle sample without that evidence is a
-//!   clean `HomeFailed`; any other state or the Home timeout is Stop. Upstream
+//!   `is_homed` true, encoder ready and trajectory done; with that evidence
+//!   Home then waits for a stationary sample, wherever the idle axis comes to
+//!   rest, since the encoder tracks it from the reference Home set. An idle
+//!   sample without that evidence is a clean `HomeFailed`; any other state or
+//!   the Home timeout is Stop. Upstream
 //!   clears `is_homed` on entry and sets it true on every exit, including
 //!   after a fault or an interrupting state request, and an interrupted run
 //!   rewrites the encoder count. So `is_homed` alone is never evidence, and an
@@ -1206,13 +1208,15 @@ fn sample_step(
         Phase::Home => match values.axis_state {
             AxisState::Homing => Step::Wait,
             AxisState::Idle => {
-                if errors_zero
+                let clean = errors_zero
                     && values.is_homed
                     && values.encoder_ready
-                    && values.trajectory_done
-                    && stationary
-                    && position.abs() <= tolerance
-                {
+                    && values.trajectory_done;
+                // The idle axis may still coast; the Home timeout bounds the wait.
+                // Wherever it rests, the encoder tracks it from Home's reference.
+                if clean && !stationary {
+                    Step::Wait
+                } else if clean {
                     Step::Finish(LiftOutcome::Completed(None))
                 } else {
                     Step::Finish(LiftOutcome::Fault(LiftFault::HomeFailed(format!(

@@ -507,10 +507,28 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
 }
 
 #[test]
+fn home_waits_for_the_axis_to_settle_wherever_it_comes_to_rest() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    let id = rig.start(Home, Unknown).unwrap();
+    rig.run_for(5);
+    // Idle with clean evidence, still coasting after the firmware's final move.
+    finish_home(&mut rig);
+    rig.axis(0.8, 2.0, 0.0);
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), None, "a moving axis has not settled");
+
+    // At rest off 0: the encoder reference Home set still tracks it.
+    rig.axis(0.9, 0.0, 0.0);
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert!(rig.ops.status().position_trusted);
+}
+
+#[test]
 fn idle_without_clean_evidence_is_home_failed() {
     let spoils: [fn(&mut Rig); 4] = [
         |rig| rig.board.set_i32(AXIS_ERROR, 0x800),
-        |rig| rig.axis(3.0, 0.0, 0.0),
+        |rig| rig.board.set_bool(TRAJECTORY_DONE, false),
         |rig| rig.board.set_bool(IS_HOMED, false),
         |rig| rig.board.set_bool(ENCODER_IS_READY, false),
     ];
