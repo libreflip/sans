@@ -30,10 +30,6 @@ direction = "normal"
 mm_per_turn = 8.0
 travel_minimum_mm = 0.0
 travel_maximum_mm = 300.0
-current_limit_a = 4.0
-velocity_limit_mm_s = 6.0
-acceleration_limit_mm_s2 = 4.0
-deceleration_limit_mm_s2 = 2.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -735,7 +731,7 @@ fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence(
     }
     rig.settle();
     assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     assert_eq!(
         rig.outcome(id),
         None,
@@ -1252,7 +1248,7 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
     rig.settle();
     rig.run_for(50);
     assert_eq!(rig.moves(), moves, "no deferred motion");
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     assert_eq!(rig.finishes(id).len(), 1);
     assert!(matches!(
         rig.outcome(id),
@@ -1320,7 +1316,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     let mark = rig.board.writes.len();
     let park = rig.start(MoveTo { position_mm: 50.0 }, Unknown).unwrap();
     assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     arrive(&mut rig);
     assert_eq!(rig.outcome(park), Some(LiftOutcome::Completed(None)));
 }
@@ -1394,6 +1390,47 @@ fn resting_on_the_pressed_minimum_endstop_is_not_an_odrive_error() {
         rig.ops.status().latch,
         Some(StopCause::AxisError(_))
     ));
+}
+
+#[test]
+fn a_touchdown_press_above_the_odrives_own_current_limit_is_rejected() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_f32(CURRENT_LIM, 1.5);
+    rig.connect();
+    home(&mut rig);
+    arm(&mut rig);
+
+    let request = Touchdown {
+        post_turn_page_width_mm: None,
+    };
+    assert_eq!(
+        rig.start(request, Off),
+        Err(LiftRejection::PressAboveBoardLimit {
+            press_a: PRESS_A,
+            board_a: Some(1.5),
+        })
+    );
+    assert!(rig.board.writes_to(CURRENT_LIM).is_empty());
+}
+
+#[test]
+fn after_a_reconnect_under_the_press_limit_the_odrives_own_limit_is_restored() {
+    let mut rig = lifted_away();
+    assert_eq!(rig.board.f32_value(CURRENT_LIM), PRESS_A);
+
+    // The new connection reads the press current back as the board's limit.
+    rig.connect();
+    rig.run_for(25);
+    assert!(
+        rig.ops.status().latch.is_some(),
+        "a reconnect while armed stops"
+    );
+    let clear = rig.clear_fault().unwrap();
+    rig.run_for(50);
+    assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
+    home(&mut rig);
+
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
 }
 
 // ----- 10. Cross-board Stop -----------------------------------------------------

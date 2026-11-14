@@ -99,7 +99,7 @@
 //!   settled position by more than the position tolerance, or Stop or a new
 //!   epoch ends it, no current limit is written and Home and every descent
 //!   are rejected. The first upward move therefore runs at the press limit,
-//!   and the next motion restores the commissioned limit first. A routine
+//!   and the next motion restores the ODrive's own limit first. A routine
 //!   cancel keeps the press limit and the hold. The hold is independent of
 //!   Position trust; without trust the only way out is Stop. Unverified:
 //!   #60 must check that the press current can lift the loaded suction box
@@ -211,6 +211,14 @@ pub enum LiftRejection {
     InHold,
     /// Clearing the fault needs a fresh sample reading idle.
     NotIdle,
+    /// The profile's Touchdown press current exceeds the ODrive's own current
+    /// limit, or that limit was not read at connection.
+    PressAboveBoardLimit {
+        /// `motion.touchdown_press_current_a`.
+        press_a: f32,
+        /// The ODrive's `current_lim`, if read.
+        board_a: Option<f32>,
+    },
 }
 
 /// Why Stop latched.
@@ -342,8 +350,13 @@ pub struct LiftOperations {
     live_hold_mm: Option<f32>,
     applied_limit_a: Option<f32>,
     /// A Touchdown's press limit may still be in force on the board, across
-    /// reconnects too, so the next Home or move restores `current_limit_a`.
+    /// reconnects too, so the next Home or move restores `board_current_a`.
     press_limit: bool,
+    /// The ODrive's own `current_lim`, read at connection. It is not re-read
+    /// while a press limit may be in force, so it stays the value to restore.
+    board_current_a: Option<f32>,
+    /// The ODrive's own trajectory deceleration in mm/s², read at connection.
+    board_deceleration_mm_s2: Option<f32>,
     latch: Option<StopCause>,
     stop_disarm: Option<Ticket>,
     stop_confirmed_at: Option<Instant>,
@@ -437,6 +450,8 @@ impl LiftOperations {
             live_hold_mm: None,
             applied_limit_a: None,
             press_limit: false,
+            board_current_a: None,
+            board_deceleration_mm_s2: None,
             latch: None,
             stop_disarm: None,
             stop_confirmed_at: None,
@@ -748,6 +763,16 @@ impl LiftOperations {
                 Some(previous - self.motion.blower_off_descent_percent / 100.0 * width)
             }
         };
+        let press_a = self.motion.touchdown_press_current_a;
+        if !self
+            .board_current_a
+            .is_some_and(|board_a| press_a <= board_a)
+        {
+            return Err(LiftRejection::PressAboveBoardLimit {
+                press_a,
+                board_a: self.board_current_a,
+            });
+        }
         let axis = self.axis();
         let limit_mm = axis.travel_maximum_mm - axis.touchdown_hold_depth_mm;
         if !(limit_mm >= axis.travel_minimum_mm
@@ -759,7 +784,7 @@ impl LiftOperations {
         Ok(Touchdown {
             start_mm,
             limit_mm,
-            press_a: self.motion.touchdown_press_percent / 100.0 * axis.current_limit_a,
+            press_a,
             cutoff_mm,
         })
     }
@@ -792,9 +817,7 @@ impl LiftOperations {
         }
         // Otherwise the ODrive's own current limit applies; Sans writes one
         // only to press during a Touchdown and to undo that press.
-        let restore_a = self
-            .press_limit
-            .then(|| self.axis.as_ref().expect("commissioned").current_limit_a);
+        let restore_a = self.board_current_a.filter(|_| self.press_limit);
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
             Phase::Home => (restore_a, LinkCommand::Home),
@@ -854,11 +877,20 @@ impl LiftOperations {
             return self.stop(cause, link);
         };
         let speed = velocity.abs();
+        let deceleration = self
+            .board_deceleration_mm_s2
+            .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
         let reach = if speed <= axis.stationary_velocity_mm_s {
             0.0
-        } else {
+        } else if let Some(deceleration) = deceleration {
             speed * (self.max_age + self.urgent_deadline).as_secs_f32()
-                + speed * speed / (2.0 * axis.deceleration_limit_mm_s2)
+                + speed * speed / (2.0 * deceleration)
+        } else {
+            let cause = StopCause::Uncertain(
+                "cancel braking reach is unknown: the ODrive deceleration limit was not read"
+                    .into(),
+            );
+            return self.stop(cause, link);
         };
         let end = position + velocity.signum() * reach;
         let inside = |mm: f32| mm >= axis.travel_minimum_mm && mm <= axis.travel_maximum_mm;
@@ -909,6 +941,15 @@ impl LiftOperations {
             self.live_hold_mm = None;
             self.latest = None;
             self.applied_limit_a = None;
+        }
+        if let Some(discovery) = &status.discovery {
+            // Under a press limit the board reads the press current, not its own.
+            if let Some(amps) = discovery.current_limit_a.filter(|_| !self.press_limit) {
+                self.board_current_a = Some(amps);
+            }
+            if let (Some(turns), Some(axis)) = (discovery.deceleration_turns_per_s2, &self.axis) {
+                self.board_deceleration_mm_s2 = Some(turns * axis.mm_per_turn);
+            }
         }
         self.epoch = status.epoch;
         self.verified = verified;

@@ -22,10 +22,6 @@ direction = "normal"
 mm_per_turn = 8.0
 travel_minimum_mm = 0.0
 travel_maximum_mm = 300.0
-current_limit_a = 4.0
-velocity_limit_mm_s = 6.0
-acceleration_limit_mm_s2 = 4.0
-deceleration_limit_mm_s2 = 2.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -406,7 +402,7 @@ fn the_gate_writes_no_limits_so_the_odrives_own_apply() {
 }
 
 #[test]
-fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_unsent() {
+fn current_limit_is_written_and_read_back_and_a_non_positive_value_is_rejected_unsent() {
     let mut link = verified(commissioned(), FakeFibre::compatible());
     let gate_writes = link.board.writes_to(CURRENT_LIM).len();
 
@@ -417,7 +413,7 @@ fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_un
     );
     link.submit(
         2,
-        LinkCommand::SetCurrentLimit { amps: 4.01 },
+        LinkCommand::SetCurrentLimit { amps: 0.0 },
         Priority::Ordinary,
     );
     link.run_for(5);

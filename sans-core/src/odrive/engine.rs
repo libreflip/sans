@@ -40,7 +40,7 @@ const COUNT_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CONFIRM_REREAD_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Identity and status reads made once per connection, in order.
-const IDENTITY_READS: [Endpoint; 10] = [
+const IDENTITY_READS: [Endpoint; 12] = [
     Endpoint::SerialNumber,
     Endpoint::HwVersionMajor,
     Endpoint::HwVersionMinor,
@@ -51,6 +51,8 @@ const IDENTITY_READS: [Endpoint; 10] = [
     Endpoint::FwVersionUnreleased,
     Endpoint::VbusVoltage,
     Endpoint::MotorArmedState,
+    Endpoint::CurrentLimit,
+    Endpoint::TrapDecelLimit,
 ];
 
 /// One telemetry cycle reads every telemetry row of the capability table.
@@ -115,9 +117,9 @@ pub enum LinkCommand {
     },
     /// Write `motor.config.current_lim`; confirmed when it reads back the
     /// written value. Accepted only on a verified, unfaulted, commissioned
-    /// link, for a finite positive value at most the commissioned current
-    /// limit; any other value is rejected, never clamped. Not an energizing
-    /// write.
+    /// link, for a finite positive value; any other value is rejected, never
+    /// clamped. The lift module keeps it at most the ODrive's own limit read
+    /// at connection. Not an energizing write.
     SetCurrentLimit {
         /// Motor current limit in amps.
         amps: f32,
@@ -194,6 +196,10 @@ pub struct DiscoveryRecord {
     pub vbus_voltage: Option<f32>,
     /// `motor.armed_state`, raw and uninterpreted.
     pub armed_state: Option<i32>,
+    /// `motor.config.current_lim` in amps, the ODrive's own limit Sans leaves in place.
+    pub current_limit_a: Option<f32>,
+    /// `trap_traj.config.decel_limit` in motor turns per second squared.
+    pub deceleration_turns_per_s2: Option<f32>,
 }
 
 /// A snapshot of link state.
@@ -733,6 +739,8 @@ struct IdentityReads {
     firmware: [Option<u8>; 4],
     vbus_voltage: Option<f32>,
     armed_state: Option<i32>,
+    current_limit_a: Option<f32>,
+    deceleration_turns_per_s2: Option<f32>,
 }
 
 impl IdentityReads {
@@ -748,6 +756,10 @@ impl IdentityReads {
             (Endpoint::FwVersionUnreleased, WireValue::U8(v)) => self.firmware[3] = Some(v),
             (Endpoint::VbusVoltage, WireValue::F32(v)) => self.vbus_voltage = Some(v),
             (Endpoint::MotorArmedState, WireValue::I32(v)) => self.armed_state = Some(v),
+            (Endpoint::CurrentLimit, WireValue::F32(v)) => self.current_limit_a = Some(v),
+            (Endpoint::TrapDecelLimit, WireValue::F32(v)) => {
+                self.deceleration_turns_per_s2 = Some(v)
+            }
             (endpoint, value) => {
                 return Err(format!("identity read {endpoint:?} returned {value:?}"));
             }
@@ -1690,14 +1702,11 @@ impl LinkEngine {
                 ))
             }
             LinkCommand::SetCurrentLimit { amps } => {
-                let Some(lift_axis) = self.config.lift_axis.as_ref() else {
+                if self.config.lift_axis.is_none() {
                     return Err("the lift axis is uncommissioned".into());
-                };
-                if !(amps.is_finite() && amps > 0.0 && amps <= lift_axis.current_limit_a) {
-                    return Err(format!(
-                        "current limit {amps} A is not positive, finite and at most the commissioned {} A",
-                        lift_axis.current_limit_a
-                    ));
+                }
+                if !(amps.is_finite() && amps > 0.0) {
+                    return Err(format!("current limit {amps} A is not positive and finite"));
                 }
                 let connection = self.connection.as_ref().expect("checked by caller");
                 if let Some(fault) = &connection.fault {
@@ -2194,6 +2203,8 @@ impl LinkEngine {
         };
         record.vbus_voltage = reads.vbus_voltage;
         record.armed_state = reads.armed_state;
+        record.current_limit_a = reads.current_limit_a;
+        record.deceleration_turns_per_s2 = reads.deceleration_turns_per_s2;
         match reads.serial_number {
             Some(board_serial) if board_serial == expected => self.set_gate(GateStep::IdleWrite),
             board_serial => self.fail_gate(Some(format!(

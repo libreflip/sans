@@ -140,7 +140,7 @@ fn camera_preview_ready(screen: &MachineScreen) -> bool {
 #[test]
 fn invalid_or_version_1_profile_never_asks_the_factory_for_the_odrive_opener() {
     for profile in [
-        VALID_PROFILE.replace("schema_version = 2", "schema_version = 1"),
+        VALID_PROFILE.replace("schema_version = 3", "schema_version = 1"),
         VALID_PROFILE.replace("poll_interval_ms = 20", "poll_interval_ms = 1"),
     ] {
         let temp = tempfile::tempdir().unwrap();
