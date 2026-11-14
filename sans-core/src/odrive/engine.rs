@@ -9,8 +9,10 @@
 //!
 //! There is no public raw read or write: every write Sans can make is a named
 //! typed command, and Sans never writes control mode, input mode or any stored
-//! configuration other than the gate's limits, and never calls save, erase,
-//! reboot or DFU functions.
+//! configuration, and never calls save, erase, reboot or DFU functions. The
+//! gate writes no limits, so the ODrive's own velocity, acceleration and
+//! current limits apply; the only limit Sans writes is a Touchdown's reduced
+//! press current and its restore.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -24,7 +26,7 @@ use super::protocol::{
     AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, DESCRIPTOR_CHUNK_REQUEST_LEN,
     INPUT_MODE_TRAP_TRAJ, SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
 };
-use crate::config::{odrive_profile_problems, LiftAxisProfile, LiftDirection, MotorLimits};
+use crate::config::{odrive_profile_problems, LiftAxisProfile, LiftDirection};
 use crate::MachineProfile;
 
 /// Largest descriptor the engine accepts before blocking the link.
@@ -658,7 +660,6 @@ enum GateStep {
     Identity { next: usize, reads: IdentityReads },
     IdleWrite,
     IdleRead { not_before: Instant },
-    Limit { index: usize, readback: bool },
     FirstCycle,
 }
 
@@ -671,7 +672,6 @@ impl GateStep {
             Self::Identity { .. } => "Identity",
             Self::IdleWrite => "IdleWrite",
             Self::IdleRead { .. } => "IdleRead",
-            Self::Limit { .. } => "Limit",
             Self::FirstCycle => "FirstCycle",
         }
     }
@@ -1564,31 +1564,7 @@ impl LinkEngine {
                 RequestSpec::Write(Endpoint::RequestedState, WireValue::I32(AXIS_STATE_IDLE))
             }
             GateStep::IdleRead { .. } => RequestSpec::Read(Endpoint::CurrentState),
-            GateStep::Limit { index, readback } => {
-                let (endpoint, value) = self.limit_writes()?[*index];
-                if *readback {
-                    RequestSpec::Read(endpoint)
-                } else {
-                    RequestSpec::Write(endpoint, WireValue::F32(value))
-                }
-            }
         })
-    }
-
-    fn limit_writes(&self) -> Option<[(Endpoint, f32); 5]> {
-        let MotorLimits {
-            current_a,
-            velocity_turns_per_s,
-            acceleration_turns_per_s2,
-            deceleration_turns_per_s2,
-        } = self.config.lift_axis.as_ref()?.motor_limits();
-        Some([
-            (Endpoint::CurrentLimit, current_a),
-            (Endpoint::ControllerVelLimit, velocity_turns_per_s),
-            (Endpoint::TrapVelLimit, velocity_turns_per_s),
-            (Endpoint::TrapAccelLimit, acceleration_turns_per_s2),
-            (Endpoint::TrapDecelLimit, deceleration_turns_per_s2),
-        ])
     }
 
     fn op_request(&self, op: &Operation) -> Option<RequestSpec> {
@@ -2150,49 +2126,8 @@ impl LinkEngine {
                         connection.freshness_reference = Some(now);
                     }
                 } else {
-                    self.set_gate(GateStep::Limit {
-                        index: 0,
-                        readback: false,
-                    });
-                }
-            }
-            (
-                GateStep::Limit {
-                    index,
-                    readback: false,
-                },
-                Reply::Ack,
-            ) => {
-                self.set_gate(GateStep::Limit {
-                    index,
-                    readback: true,
-                });
-            }
-            (
-                GateStep::Limit {
-                    index,
-                    readback: true,
-                },
-                Reply::Value(value),
-            ) => {
-                let limits = self.limit_writes().expect("commissioned");
-                let (endpoint, written) = limits[index];
-                if !same_bits(value, WireValue::F32(written)) {
-                    self.fail_gate(Some(format!(
-                        "{endpoint:?} read back {value:?} after Sans wrote {written}"
-                    )));
-                    return;
-                }
-                if index + 1 < limits.len() {
-                    self.set_gate(GateStep::Limit {
-                        index: index + 1,
-                        readback: false,
-                    });
-                } else {
+                    // The ODrive's own limits apply: the gate writes none.
                     self.set_gate(GateStep::FirstCycle);
-                    if let Some(connection) = self.connection.as_mut() {
-                        connection.next_cycle_at = now;
-                    }
                 }
             }
             (step, reply) => self.fail_gate(Some(format!(

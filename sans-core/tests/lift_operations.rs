@@ -495,7 +495,8 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
 
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
-    assert_eq!(rig.write_order_since(6), vec![CURRENT_LIM, REQUESTED_STATE]);
+    // The gate's only write is the idle request; Home writes no current limit.
+    assert_eq!(rig.write_order_since(1), vec![REQUESTED_STATE]);
     assert_eq!(rig.outcome(id), None, "entering homing is not completion");
     finish_home(&mut rig);
     rig.run_for(25);
@@ -683,7 +684,19 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
 // ----- 4. Moves and cancel ------------------------------------------------------
 
 #[test]
-fn a_move_sets_its_limit_first_and_completes_only_on_later_evidence() {
+fn a_move_writes_no_current_limit_so_the_odrives_own_applies() {
+    let mut rig = armed();
+    let mark = rig.board.writes.len();
+    let id = rig.start(MoveTo { position_mm: 10.0 }, Off).unwrap();
+    rig.run_for(5);
+    assert_eq!(rig.write_order_since(mark), vec![INPUT_POS]);
+    arrive(&mut rig);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert!(rig.board.writes_to(CURRENT_LIM).is_empty());
+}
+
+#[test]
+fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence() {
     let mut rig = lifted_away();
     let mark = rig.board.writes.len();
     // The board already reads at the target with its trajectory done, and a
@@ -842,17 +855,7 @@ fn reconnect_mid_operation_gives_one_fault_and_no_writes_beyond_the_gate() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
-    assert_eq!(
-        rig.write_order_since(mark),
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-        ]
-    );
+    assert_eq!(rig.write_order_since(mark), vec![REQUESTED_STATE]);
     let status = rig.ops.status();
     assert_eq!(status.epoch, 2);
     assert!(!status.position_trusted);

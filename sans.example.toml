@@ -26,7 +26,10 @@ urgent_deadline_ms = 50
 # substitutes a default mechanism value. Limits are bounded by software policy
 # caps of 4.8 A, 1 motor turn per second and 1 motor turn per second squared.
 # Those caps are arbitrary conservative host policy, not measured or physically
-# qualified limits; #60 reviews them. Commissioning does not enable scanning.
+# qualified limits; #60 reviews them. For now Sans writes none of these limits
+# to the ODrive, so its own stored limits apply; current_limit_a is only the
+# reference a Touchdown presses at a percentage of, and deceleration only
+# estimates a cancel's braking reach. Commissioning does not enable scanning.
 # Lift millimetres are 0 at Home and increase downward; set direction so this holds.
 # The tuning values below are provisional until #60 measures them. Each must be
 # positive and finite; the saturation percent is at most 100 and the hold depth

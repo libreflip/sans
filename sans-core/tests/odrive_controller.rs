@@ -194,17 +194,8 @@ fn compatible_device_and_commissioned_profile_reach_verified_with_the_preview_re
     assert_eq!(telemetry.values.position_mm, Some(0.0));
     let board = started.opener.board.lock().unwrap();
     let writes: Vec<u16> = board.writes.iter().map(|(endpoint, _)| *endpoint).collect();
-    assert_eq!(
-        writes,
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-        ]
-    );
+    // The ODrive's own limits apply: the gate writes only the idle request.
+    assert_eq!(writes, vec![REQUESTED_STATE]);
     assert_eq!(board.requested_states(), vec![1]);
 }
 

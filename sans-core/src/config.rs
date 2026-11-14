@@ -184,13 +184,19 @@ pub struct LiftAxisProfile {
     pub travel_minimum_mm: f32,
     /// Highest commissioned soft bound for absolute moves.
     pub travel_maximum_mm: f32,
-    /// Motor current limit written to the board; positive, at most the 4.8 A policy cap.
+    /// Reference motor current: a Touchdown presses at a percentage of it and
+    /// the next motion restores it. Otherwise the ODrive's own limit applies.
+    /// Positive, at most the 4.8 A policy cap.
     pub current_limit_a: f32,
-    /// Velocity limit; at most 1 motor turn per second after conversion.
+    /// Not written to the board for now; the ODrive's own limit applies. At
+    /// most 1 motor turn per second after conversion.
     pub velocity_limit_mm_s: f32,
-    /// Trajectory acceleration limit; at most 1 motor turn per second squared after conversion.
+    /// Not written to the board for now; the ODrive's own limit applies. At
+    /// most 1 motor turn per second squared after conversion.
     pub acceleration_limit_mm_s2: f32,
-    /// Trajectory deceleration limit; at most 1 motor turn per second squared after conversion.
+    /// Not written to the board for now; the ODrive's own limit applies, and
+    /// this value only estimates a cancel's braking reach, so it should match
+    /// the board. At most 1 motor turn per second squared after conversion.
     pub deceleration_limit_mm_s2: f32,
     /// How close a position must be to a target to count as there.
     pub position_tolerance_mm: f32,
@@ -337,7 +343,7 @@ pub(crate) struct MotorLimits {
 }
 
 impl LiftAxisProfile {
-    /// Convert the commissioned limits to motor units, the values written to the board.
+    /// Convert the commissioned limits to motor units, for the policy caps.
     pub(crate) fn motor_limits(&self) -> MotorLimits {
         MotorLimits {
             current_a: self.current_limit_a,

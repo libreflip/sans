@@ -339,6 +339,9 @@ pub struct LiftOperations {
     /// A live hold's own reference, kept apart from trust and `touchdown_mm`.
     live_hold_mm: Option<f32>,
     applied_limit_a: Option<f32>,
+    /// A Touchdown's press limit may still be in force on the board, across
+    /// reconnects too, so the next Home or move restores `current_limit_a`.
+    press_limit: bool,
     latch: Option<StopCause>,
     stop_disarm: Option<Ticket>,
     stop_confirmed_at: Option<Instant>,
@@ -431,6 +434,7 @@ impl LiftOperations {
             touchdown_mm: None,
             live_hold_mm: None,
             applied_limit_a: None,
+            press_limit: false,
             latch: None,
             stop_disarm: None,
             stop_confirmed_at: None,
@@ -784,12 +788,16 @@ impl LiftOperations {
             let cause = StopCause::Uncertain("Position trust lost before motion".into());
             return self.stop(cause, link);
         }
-        let commissioned_a = self.axis.as_ref().expect("commissioned").current_limit_a;
+        // Otherwise the ODrive's own current limit applies; Sans writes one
+        // only to press during a Touchdown and to undo that press.
+        let restore_a = self
+            .press_limit
+            .then(|| self.axis.as_ref().expect("commissioned").current_limit_a);
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
-            Phase::Home => (Some(commissioned_a), LinkCommand::Home),
+            Phase::Home => (restore_a, LinkCommand::Home),
             Phase::Move { target_mm } => (
-                Some(commissioned_a),
+                restore_a,
                 LinkCommand::MoveAbsolute {
                     position_mm: target_mm,
                 },
@@ -807,6 +815,9 @@ impl LiftOperations {
             Some(amps) if self.applied_limit_a != Some(amps) && self.live_hold_mm.is_none() => {
                 active.limit_a = Some(amps);
                 self.applied_limit_a = None;
+                if matches!(active.phase, Phase::Descend { .. }) {
+                    self.press_limit = true;
+                }
                 self.submit(
                     LinkCommand::SetCurrentLimit { amps },
                     Priority::Ordinary,
@@ -942,6 +953,9 @@ impl LiftOperations {
         }
         if let Some(amps) = active.limit_a.take() {
             self.applied_limit_a = Some(amps);
+            if !matches!(active.phase, Phase::Descend { .. }) {
+                self.press_limit = false;
+            }
             return self.submit_phase(link);
         }
         if matches!(active.phase, Phase::Arm) {
