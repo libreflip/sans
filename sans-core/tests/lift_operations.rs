@@ -1341,7 +1341,7 @@ fn an_odrive_error_latches_stop_and_clear_stop_clears_it() {
     rig.run_for(25);
     let status = rig.ops.status();
     assert!(
-        matches!(&status.latch, Some(StopCause::AxisError(errors)) if errors.contains("motor 0x40")),
+        matches!(&status.latch, Some(StopCause::AxisError(errors)) if errors.contains("motor BrakeCurrentOutOfRange (0x40)")),
         "{:?}",
         status.latch
     );

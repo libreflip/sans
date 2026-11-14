@@ -1116,12 +1116,7 @@ fn odrive_errors(values: &TelemetryValues) -> Option<String> {
         && values.motor_error == 0
         && values.encoder_error == 0
         && values.controller_error == 0;
-    (!clear).then(|| {
-        format!(
-            "ODrive errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
-            values.axis_error, values.motor_error, values.encoder_error, values.controller_error
-        )
-    })
+    (!clear).then(|| format!("ODrive errors {}", values.describe_errors()))
 }
 
 /// Judge one fresh sample taken after the active command's confirmation.

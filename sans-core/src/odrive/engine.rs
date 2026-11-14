@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use super::descriptor::{check_capabilities, flatten, value_type, Endpoint, ResolvedEndpoints};
 use super::protocol::{
-    decode_reply, descriptor_crc16, encode_descriptor_read, encode_request, WireValue,
-    AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
+    decode_reply, describe_error_words, descriptor_crc16, encode_descriptor_read, encode_request,
+    WireValue, AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
     AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, DESCRIPTOR_CHUNK_REQUEST_LEN,
     INPUT_MODE_TRAP_TRAJ, SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
 };
@@ -303,6 +303,16 @@ impl TelemetryValues {
         )
     }
 
+    /// The error words with their upstream flag names.
+    pub fn describe_errors(&self) -> String {
+        describe_error_words(
+            self.axis_error,
+            self.motor_error,
+            self.encoder_error,
+            self.controller_error,
+        )
+    }
+
     fn error_words_zero(&self) -> bool {
         self.axis_error == 0
             && self.motor_error == 0
@@ -324,14 +334,11 @@ fn log_condition_change(previous: Option<&TelemetryValues>, values: &TelemetryVa
     };
     log::log!(
         level,
-        "ODrive axis {:?}: errors axis {:#x} motor {:#x} encoder {:#x} controller {:#x}; \
+        "ODrive axis {:?}: errors {}; \
          homed {}, min endstop {}, motor calibrated {}, encoder ready {}, trajectory done {}; \
          control mode {}, input mode {}",
         values.axis_state,
-        values.axis_error,
-        values.motor_error,
-        values.encoder_error,
-        values.controller_error,
+        values.describe_errors(),
         values.is_homed,
         values.min_endstop_pressed,
         values.motor_calibrated,

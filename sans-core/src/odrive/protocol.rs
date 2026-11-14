@@ -32,6 +32,94 @@ pub(crate) const INPUT_MODE_TRAP_TRAJ: i32 = 5;
 /// (`Firmware/MotorControl/axis.cpp` `Axis::check_for_errors`).
 pub(crate) const AXIS_ERROR_MIN_ENDSTOP_PRESSED: u32 = 1 << 12;
 
+/// `ODrive.Axis.Error` flag names by bit (`odrive-interface.yaml`, `fw-v0.5.1`).
+const AXIS_ERRORS: &[&str] = &[
+    "InvalidState",
+    "DcBusUnderVoltage",
+    "DcBusOverVoltage",
+    "CurrentMeasurementTimeout",
+    "BrakeResistorDisarmed",
+    "MotorDisarmed",
+    "MotorFailed",
+    "SensorlessEstimatorFailed",
+    "EncoderFailed",
+    "ControllerFailed",
+    "PosCtrlDuringSensorless",
+    "WatchdogTimerExpired",
+    "MinEndstopPressed",
+    "MaxEndstopPressed",
+    "EstopRequested",
+    "HomingWithoutEndstop",
+    "OverTemp",
+];
+/// `ODrive.Motor.Error` flag names by bit.
+const MOTOR_ERRORS: &[&str] = &[
+    "PhaseResistanceOutOfRange",
+    "PhaseInductanceOutOfRange",
+    "AdcFailed",
+    "DrvFault",
+    "ControlDeadlineMissed",
+    "NotImplementedMotorType",
+    "BrakeCurrentOutOfRange",
+    "ModulationMagnitude",
+    "BrakeDeadtimeViolation",
+    "UnexpectedTimerCallback",
+    "CurrentSenseSaturation",
+    "CurrentLimitViolation",
+    "BrakeDutyCycleNan",
+    "DcBusOverRegenCurrent",
+    "DcBusOverCurrent",
+];
+/// `ODrive.Encoder.Error` flag names by bit.
+const ENCODER_ERRORS: &[&str] = &[
+    "UnstableGain",
+    "CprPolepairsMismatch",
+    "NoResponse",
+    "UnsupportedEncoderMode",
+    "IllegalHallState",
+    "IndexNotFoundYet",
+    "AbsSpiTimeout",
+    "AbsSpiComFail",
+    "AbsSpiNotReady",
+];
+/// `ODrive.Controller.Error` flag names by bit.
+const CONTROLLER_ERRORS: &[&str] = &[
+    "Overspeed",
+    "InvalidInputMode",
+    "UnstableGain",
+    "InvalidMirrorAxis",
+    "InvalidLoadEncoder",
+    "InvalidEstimate",
+];
+
+/// The four error words with their upstream flag names, for logs and the
+/// Stop screen: `axis MotorDisarmed|ControllerFailed (0x220), motor none, ...`.
+pub(crate) fn describe_error_words(axis: u32, motor: u32, encoder: u32, controller: u32) -> String {
+    [
+        ("axis", axis, AXIS_ERRORS),
+        ("motor", motor, MOTOR_ERRORS),
+        ("encoder", encoder, ENCODER_ERRORS),
+        ("controller", controller, CONTROLLER_ERRORS),
+    ]
+    .iter()
+    .map(|&(word, bits, names)| {
+        if bits == 0 {
+            return format!("{word} none");
+        }
+        let flags: Vec<String> = (0..32)
+            .filter(|bit| bits & (1 << bit) != 0)
+            .map(|bit| {
+                names
+                    .get(bit)
+                    .map_or(format!("bit{bit}"), |name| (*name).into())
+            })
+            .collect();
+        format!("{word} {} (0x{bits:x})", flags.join("|"))
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
 /// A property value encoding on the wire, little-endian.
 ///
 /// Sizes follow the POD serialization in `docs/protocol.md` ("an int32
@@ -209,6 +297,15 @@ pub(crate) fn descriptor_crc16(descriptor: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_words_are_named_by_upstream_flag() {
+        assert_eq!(
+            describe_error_words(0x220, 0x10, 0, 0x1 | 1 << 31),
+            "axis MotorDisarmed|ControllerFailed (0x220), motor ControlDeadlineMissed (0x10), \
+             encoder none, controller Overspeed|bit31 (0x80000001)"
+        );
+    }
 
     const RECONSTRUCTED_DESCRIPTOR: &[u8] =
         include_bytes!("../../tests/fixtures/odrive/descriptor-RECONSTRUCTED-2026-11-10.json");
