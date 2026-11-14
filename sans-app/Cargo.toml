@@ -21,4 +21,5 @@ sans-core = { path = "../sans-core" }
 egui_kittest = { version = "0.36.1", features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "1"
+serde_json = "1"
 tempfile = "3"

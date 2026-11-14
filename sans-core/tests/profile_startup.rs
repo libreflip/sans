@@ -17,7 +17,7 @@ fn missing_profile_creates_parseable_template_and_stops_startup() {
     ));
     let template = fs::read_to_string(&profile_path).unwrap();
     let parsed = toml::from_str::<toml::Value>(&template).unwrap();
-    assert_eq!(parsed["schema_version"].as_integer(), Some(2));
+    assert_eq!(parsed["schema_version"].as_integer(), Some(3));
     assert!(parsed["odrive"].get("lift_axis").is_none());
     assert!(parsed["boards"].get("ligature_path").is_none());
     let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
@@ -70,13 +70,13 @@ fn valid_profile_resolves_and_creates_relative_data_root() {
 fn structural_mistakes_are_reported_with_the_selected_profile_path() {
     let cases = [
         (
-            "schema_version = 2",
             "schema_version = 3",
-            "unsupported schema_version 3",
+            "schema_version = 4",
+            "unsupported schema_version 4",
         ),
         (
-            "schema_version = 2",
-            "schema_version = \"2\"",
+            "schema_version = 3",
+            "schema_version = \"3\"",
             "unsupported schema_version",
         ),
         (
@@ -220,9 +220,9 @@ fn structural_mistakes_are_reported_with_the_selected_profile_path() {
             "confirmation_samples",
         ),
         (
-            "touchdown_press_percent = 50.0",
-            "touchdown_press_percent = 50.1",
-            "immutable 50%",
+            "touchdown_press_current_a = 2.0",
+            "touchdown_press_current_a = 0.0",
+            "motion.touchdown_press_current_a must be positive and finite",
         ),
         (
             "final_lift_percent = 105.0",
@@ -355,6 +355,25 @@ monospace_path = "/dev/serial/by-id/monospace"
 "#;
 
 #[test]
+fn version_2_profile_is_rejected_with_limit_removal_guidance() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile_path = temp.path().join("sans.toml");
+    fs::write(
+        &profile_path,
+        VALID_PROFILE.replace("schema_version = 3", "schema_version = 2"),
+    )
+    .unwrap();
+
+    let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
+
+    assert!(matches!(error, StartupError::ProfileVersion2Retired { .. }));
+    let message = error.to_string();
+    assert!(message.contains("current_limit_a"), "{message}");
+    assert!(message.contains("touchdown_press_current_a"), "{message}");
+    assert!(message.contains("schema_version = 3"), "{message}");
+}
+
+#[test]
 fn version_1_profile_is_rejected_with_odrive_migration_guidance() {
     let temp = tempfile::tempdir().unwrap();
     let profile_path = temp.path().join("sans.toml");
@@ -376,10 +395,6 @@ direction = "reversed"
 mm_per_turn = 8.0
 travel_minimum_mm = 0.0
 travel_maximum_mm = 300.0
-current_limit_a = 4.8
-velocity_limit_mm_s = 8.0
-acceleration_limit_mm_s2 = 8.0
-deceleration_limit_mm_s2 = 4.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -419,37 +434,11 @@ fn complete_lift_axis_table_prepares_as_commissioned() {
     let lift_axis = prepared.profile().odrive.lift_axis.as_ref().unwrap();
     assert_eq!(lift_axis.direction, sans_core::LiftDirection::Reversed);
     assert_eq!(lift_axis.mm_per_turn, 8.0);
-    assert_eq!(lift_axis.current_limit_a, 4.8);
 }
 
 #[test]
-fn lift_axis_limits_above_software_policy_caps_are_reported() {
+fn invalid_lift_axis_values_are_reported() {
     let cases = [
-        (
-            "current_limit_a = 4.8",
-            "current_limit_a = 4.81",
-            "odrive.lift_axis.current_limit_a exceeds the 4.8 A software policy cap",
-        ),
-        (
-            "current_limit_a = 4.8",
-            "current_limit_a = 0.0",
-            "odrive.lift_axis.current_limit_a must be positive and finite",
-        ),
-        (
-            "velocity_limit_mm_s = 8.0",
-            "velocity_limit_mm_s = 8.1",
-            "odrive.lift_axis.velocity_limit_mm_s exceeds the 1 motor turn per second software policy cap",
-        ),
-        (
-            "acceleration_limit_mm_s2 = 8.0",
-            "acceleration_limit_mm_s2 = 8.1",
-            "odrive.lift_axis.acceleration_limit_mm_s2 exceeds the 1 motor turn per second squared software policy cap",
-        ),
-        (
-            "deceleration_limit_mm_s2 = 4.0",
-            "deceleration_limit_mm_s2 = 8.1",
-            "odrive.lift_axis.deceleration_limit_mm_s2 exceeds the 1 motor turn per second squared software policy cap",
-        ),
         (
             "travel_maximum_mm = 300.0",
             "travel_maximum_mm = -1.0",
@@ -464,11 +453,6 @@ fn lift_axis_limits_above_software_policy_caps_are_reported() {
             "direction = \"reversed\"",
             "direction = \"sideways\"",
             "direction",
-        ),
-        (
-            "deceleration_limit_mm_s2 = 4.0\n",
-            "",
-            "deceleration_limit_mm_s2",
         ),
         (
             "touchdown_dwell_ms = 100\n",
@@ -499,46 +483,6 @@ fn lift_axis_limits_above_software_policy_caps_are_reported() {
             .to_string();
 
         assert!(message.contains(&profile_path.display().to_string()));
-        assert!(
-            message.contains(expected),
-            "expected {expected:?} in {message:?}"
-        );
-    }
-}
-
-#[test]
-fn limits_that_convert_to_zero_or_infinity_are_reported() {
-    let cases = [
-        // 1e-10 mm/s over 3e38 mm per turn underflows to zero turns per second.
-        (
-            vec![
-                ("mm_per_turn = 8.0", "mm_per_turn = 3.0e38"),
-                ("velocity_limit_mm_s = 8.0", "velocity_limit_mm_s = 1.0e-10"),
-            ],
-            "odrive.lift_axis.velocity_limit_mm_s must convert to a positive finite motor value",
-        ),
-        // A subnormal mm per turn overflows the conversion to infinity.
-        (
-            vec![("mm_per_turn = 8.0", "mm_per_turn = 1.0e-45")],
-            "odrive.lift_axis.acceleration_limit_mm_s2 must convert to a positive finite motor value",
-        ),
-    ];
-    for (index, (replacements, expected)) in cases.into_iter().enumerate() {
-        let temp = tempfile::tempdir().unwrap();
-        let profile_path = temp.path().join(format!("conversion-{index}.toml"));
-        let table = replacements
-            .iter()
-            .fold(LIFT_AXIS_TABLE.to_string(), |table, (from, to)| {
-                let replaced = table.replacen(from, to, 1);
-                assert_ne!(replaced, table, "{from}");
-                replaced
-            });
-        fs::write(&profile_path, format!("{VALID_PROFILE}{table}")).unwrap();
-
-        let message = prepare_machine_profile(Some(&profile_path))
-            .unwrap_err()
-            .to_string();
-
         assert!(
             message.contains(expected),
             "expected {expected:?} in {message:?}"

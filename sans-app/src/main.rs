@@ -9,10 +9,10 @@ use sans::{window_request, SansApp, Startup};
 #[cfg(target_os = "linux")]
 use sans_core::V4lCameraMachineFactory;
 use sans_core::{
-    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, MachineBoard,
-    MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection, MonospaceEventKind,
-    MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker, SetupDiagnostic,
-    StartupError, CAPTURE_LIGHT_SETTLE,
+    bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, Led,
+    MachineBoard, MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection,
+    MonospaceEventKind, MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker,
+    SetupDiagnostic, StartupError, CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
 use sans_core::{CameraCaptureError, CameraRole};
@@ -99,6 +99,26 @@ impl MachineBoard for MonospaceBoard {
         }
         None
     }
+
+    fn set_light(&mut self, on: bool) -> Result<(), String> {
+        lock(&self.0)
+            .client
+            .set_light(on)
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_led(&mut self, led: Led) -> Result<(), String> {
+        let (red, green, blue) = match led {
+            Led::Blue => (0, 0, 255),
+            Led::Green => (0, 255, 0),
+            Led::Amber => (255, 120, 0),
+            Led::Red => (255, 0, 0),
+        };
+        lock(&self.0)
+            .client
+            .set_led(red, green, blue)
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// The Cameras, lit by Monospace while they capture.
@@ -118,6 +138,13 @@ impl<CameraMachine: ControllerMachine> ControllerMachine for BootstrapMachine<Ca
             CAPTURE_LIGHT_SETTLE,
             || cameras.capture_pair(),
         )
+    }
+
+    /// The controller switched the light on for the Scan session and it stays
+    /// on, so wait for it to settle and capture without touching it.
+    fn capture_session_pair(&mut self) -> Result<CapturePair, CapturePairError> {
+        std::thread::sleep(CAPTURE_LIGHT_SETTLE);
+        self.cameras.capture_pair()
     }
 }
 
@@ -168,8 +195,8 @@ impl<CameraFactory: MachineFactory> MachineFactory for BootstrapMachineFactory<C
 
 fn monospace_machine_event(epoch: u64, event: MonospaceEventKind) -> Option<MachineEvent> {
     match event {
-        MonospaceEventKind::Pressure(_) => None,
-        MonospaceEventKind::ButtonPressed => Some(MachineEvent::StopButton),
+        MonospaceEventKind::Pressure(mbar) => Some(MachineEvent::Pressure(mbar)),
+        MonospaceEventKind::ButtonPressed => Some(MachineEvent::Button),
         MonospaceEventKind::UnknownEvent(payload) => {
             log::warn!("ignored unknown Monospace event on epoch {epoch}: {payload:?}");
             None
@@ -319,15 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn typed_monospace_events_map_the_button_to_stop_and_failures_to_lost() {
+    fn typed_monospace_events_map_the_button_and_pressure_and_failures_to_lost() {
         let lost = |summary: &str| Some(MachineEvent::Lost(SetupBlocker::new(summary)));
         assert_eq!(
             monospace_machine_event(8, MonospaceEventKind::Pressure(1_013.0)),
-            None
+            Some(MachineEvent::Pressure(1_013.0))
         );
         assert_eq!(
             monospace_machine_event(8, MonospaceEventKind::ButtonPressed),
-            Some(MachineEvent::StopButton)
+            Some(MachineEvent::Button)
         );
         assert_eq!(
             monospace_machine_event(8, MonospaceEventKind::UnknownEvent("BUTTON UP".into())),

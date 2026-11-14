@@ -92,5 +92,6 @@ fn describe(cause: &StopCause) -> String {
         StopCause::Requested(by) => format!("requested by {by}"),
         StopCause::LinkLost(reason) => format!("link lost: {reason}"),
         StopCause::Uncertain(reason) => format!("uncertain motion: {reason}"),
+        StopCause::AxisError(errors) => errors.clone(),
     }
 }
