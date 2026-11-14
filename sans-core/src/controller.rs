@@ -726,10 +726,16 @@ fn spawn_controller<Factory: MachineFactory>(
                         // Homing leaves the diagnostic preview behind.
                         state.screen = MachineScreen::Setup(state.setup.clone());
                         state.workflow = match lift.home(Instant::now()) {
-                            Ok(id) => Workflow::Homing(id),
-                            Err(rejection) => Workflow::Setup {
-                                home_failure: Some(format!("Home was refused: {rejection:?}")),
-                            },
+                            Ok(id) => {
+                                log::info!("Home started as lift operation {id:?}");
+                                Workflow::Homing(id)
+                            }
+                            Err(rejection) => {
+                                log::error!("Home refused: {rejection:?}");
+                                Workflow::Setup {
+                                    home_failure: Some(format!("Home was refused: {rejection:?}")),
+                                }
+                            }
                         };
                         if !state.publish(&mut lift, &mut board) {
                             return;
@@ -782,13 +788,17 @@ fn spawn_controller<Factory: MachineFactory>(
                             profile.data_root(),
                             SystemTime::now(),
                         ) {
-                            Err(error) => Workflow::Ready {
-                                page_width_mm,
-                                notice: Some(format!(
-                                    "cannot create the Scan session directory: {error}"
-                                )),
-                            },
+                            Err(error) => {
+                                log::error!("Start failed: cannot create the Scan session directory: {error}");
+                                Workflow::Ready {
+                                    page_width_mm,
+                                    notice: Some(format!(
+                                        "cannot create the Scan session directory: {error}"
+                                    )),
+                                }
+                            }
                             Ok(directory) => {
+                                log::info!("Scan session started in {}", directory.display());
                                 let mut session = ScanSession::new(directory, page_width_mm);
                                 let lit = board
                                     .as_mut()
@@ -801,12 +811,14 @@ fn spawn_controller<Factory: MachineFactory>(
                                 });
                                 match lit {
                                     Err(error) => {
+                                        log::error!("Scan session LIGHT ON failed: {error}");
                                         session.capture = CaptureStatus::Blocked {
                                             reason: format!("LIGHT ON failed: {error}"),
                                         }
                                     }
                                     Ok(()) if sent => capturing = Some(CaptureFor::Session),
                                     Ok(()) => {
+                                        log::error!("Scan session capture failed: the Camera thread has stopped");
                                         session.capture = CaptureStatus::Blocked {
                                             reason: "the Camera thread has stopped".into(),
                                         }
@@ -1073,7 +1085,9 @@ impl Projection {
         let led = self.workflow.led(lift.stop.status().is_some());
         if let Some(board) = board.as_mut().filter(|_| self.shown_led != Some(led)) {
             // A dead board surfaces as `Lost`; the LED is only a projection.
-            let _ = board.set_led(led);
+            if let Err(error) = board.set_led(led) {
+                log::warn!("cannot set the status LED to {led:?}: {error}");
+            }
             self.shown_led = Some(led);
         }
         if !self.opened {
