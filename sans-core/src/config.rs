@@ -280,7 +280,8 @@ pub struct PickupProfile {
 #[serde(deny_unknown_fields)]
 pub struct MotionProfile {
     /// Motor current limit a Touchdown presses at, in amps; at most the
-    /// ODrive's own `current_lim`, which the next motion restores.
+    /// ODrive's own `current_lim`. The lift-away move keeps the press limit;
+    /// the motion after it restores the board's own.
     pub touchdown_press_current_a: f32,
     /// Lift percentage at which pressure classification begins.
     pub classification_start_percent: f32,
