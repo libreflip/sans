@@ -117,7 +117,7 @@ pub(crate) fn show_lift_axis(
         }
         match scan_readiness {
             ScanReadiness::Disabled { reason } => ui.small(format!("Scanning disabled: {reason}")),
-            ScanReadiness::Enabled => ui.small("Live gates pass: Home and scanning are available."),
+            ScanReadiness::Enabled => ui.small("Live gates pass."),
         };
     });
 }

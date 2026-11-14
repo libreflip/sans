@@ -184,7 +184,7 @@ impl MachineBoard for QuietBoard {
         None
     }
 
-    fn light_on(&mut self) -> Result<(), String> {
+    fn set_light(&mut self, _on: bool) -> Result<(), String> {
         Ok(())
     }
 }

@@ -152,8 +152,9 @@ pub enum LiftDirection {
     Reversed,
 }
 
-/// Commissioned lift-axis mechanism values. Sans writes no velocity,
-/// acceleration or current limits: the ODrive's own stored limits apply.
+/// Commissioned lift-axis mechanism values. Sans writes no velocity or
+/// acceleration limits and sets a current limit only to press during a
+/// Touchdown; otherwise the ODrive's own stored limits apply.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiftAxisProfile {

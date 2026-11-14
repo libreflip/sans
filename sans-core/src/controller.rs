@@ -307,8 +307,8 @@ pub trait MachineBoard: Send + 'static {
     /// The next button press, pressure reading or failure, without blocking.
     fn poll(&mut self) -> Option<MachineEvent>;
 
-    /// Send ordinary `LIGHT ON` and wait for its `OK`.
-    fn light_on(&mut self) -> Result<(), String> {
+    /// Send ordinary `LIGHT ON` or `LIGHT OFF` and wait for its `OK`.
+    fn set_light(&mut self, _on: bool) -> Result<(), String> {
         Err("this board cannot switch the light".into())
     }
 
@@ -585,6 +585,7 @@ fn spawn_controller<Factory: MachineFactory>(
                 cameras_live: false,
                 pressure_mbar: None,
                 shown_led: None,
+                light_lit: false,
             };
             // Without a Machine thread the lift axis and Stop still run.
             let machine = match machine {
@@ -720,7 +721,10 @@ fn spawn_controller<Factory: MachineFactory>(
                     Inbox::Intent(ControllerIntent::Home) => {
                         let setup = matches!(state.workflow, Workflow::Setup { .. });
                         let ready = state.readiness(&lift, board.is_some()).is_enabled();
-                        if !setup || !ready || capturing.is_some() {
+                        // A Scan session's capture never blocks Home: Stop
+                        // ended its session, so its late result is dropped.
+                        let previewing = matches!(capturing, Some(CaptureFor::Preview));
+                        if !setup || !ready || previewing {
                             continue;
                         }
                         // Homing leaves the diagnostic preview behind.
@@ -782,6 +786,7 @@ fn spawn_controller<Factory: MachineFactory>(
                             continue;
                         };
                         if capturing.is_some() {
+                            log::warn!("ignored Start: an earlier capture is still running");
                             continue;
                         }
                         state.workflow = match create_session_directory(
@@ -803,8 +808,9 @@ fn spawn_controller<Factory: MachineFactory>(
                                 let lit = board
                                     .as_mut()
                                     .map_or(Err("no Monospace connection".into()), |board| {
-                                        board.light_on()
+                                        board.set_light(true)
                                     });
+                                state.light_lit = lit.is_ok();
                                 let sent = machine.as_ref().is_some_and(|machine| {
                                     lit.is_ok()
                                         && machine.send(MachineRequest::SessionCapture).is_ok()
@@ -918,8 +924,13 @@ fn spawn_controller<Factory: MachineFactory>(
                     }
                     Inbox::BoardEvent(MachineEvent::Pressure(mbar))
                     | Inbox::Machine(MachineEvent::Pressure(mbar)) => {
+                        // Every reading is kept; snapshots for it publish at
+                        // the telemetry rate, so the next one carries the latest.
                         state.pressure_mbar = Some(mbar);
-                        if !state.publish(&mut lift, &mut board) {
+                        let due = lift.last_publish.is_none_or(|last| {
+                            last.elapsed() >= TELEMETRY_PUBLISH_INTERVAL
+                        });
+                        if due && !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
@@ -993,6 +1004,8 @@ struct Projection {
     pressure_mbar: Option<f32>,
     /// The LED colour last sent to the board.
     shown_led: Option<Led>,
+    /// The capture light this workflow switched on for a Scan session.
+    light_lit: bool,
 }
 
 impl Projection {
@@ -1082,6 +1095,19 @@ impl Projection {
     /// snapshot with the current projection.
     fn publish(&mut self, lift: &mut LiftAxis, board: &mut Option<Box<dyn MachineBoard>>) -> bool {
         self.reconcile(lift, board.is_some());
+        // `ALL OFF` leaves the light alone, so a session that ends, blocks
+        // or exits switches off the light it switched on.
+        let keep_light = self.screen != MachineScreen::Exited
+            && matches!(&self.workflow, Workflow::Scanning(session)
+                if !matches!(session.capture, CaptureStatus::Blocked { .. }));
+        if self.light_lit && !keep_light {
+            self.light_lit = false;
+            if let Some(board) = board.as_mut() {
+                if let Err(error) = board.set_light(false) {
+                    log::error!("cannot switch the capture light off: {error}");
+                }
+            }
+        }
         let led = self.workflow.led(lift.stop.status().is_some());
         if let Some(board) = board.as_mut().filter(|_| self.shown_led != Some(led)) {
             // A dead board surfaces as `Lost`; the LED is only a projection.

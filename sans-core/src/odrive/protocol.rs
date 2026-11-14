@@ -32,64 +32,66 @@ pub(crate) const INPUT_MODE_TRAP_TRAJ: i32 = 5;
 /// (`Firmware/MotorControl/axis.cpp` `Axis::check_for_errors`).
 pub(crate) const AXIS_ERROR_MIN_ENDSTOP_PRESSED: u32 = 1 << 12;
 
-/// `ODrive.Axis.Error` flag names by bit (`odrive-interface.yaml`, `fw-v0.5.1`).
-const AXIS_ERRORS: &[&str] = &[
-    "InvalidState",
-    "DcBusUnderVoltage",
-    "DcBusOverVoltage",
-    "CurrentMeasurementTimeout",
-    "BrakeResistorDisarmed",
-    "MotorDisarmed",
-    "MotorFailed",
-    "SensorlessEstimatorFailed",
-    "EncoderFailed",
-    "ControllerFailed",
-    "PosCtrlDuringSensorless",
-    "WatchdogTimerExpired",
-    "MinEndstopPressed",
-    "MaxEndstopPressed",
-    "EstopRequested",
-    "HomingWithoutEndstop",
-    "OverTemp",
+/// `ODrive.Axis.Error` flags by bit (`odrive-interface.yaml`, `fw-v0.5.1`). Flags
+/// follow one another unless the YAML gives a `bit`, as it does for
+/// `HomingWithoutEndstop` (17) and `CurrentLimitViolation` (12).
+const AXIS_ERRORS: &[(u32, &str)] = &[
+    (0, "InvalidState"),
+    (1, "DcBusUnderVoltage"),
+    (2, "DcBusOverVoltage"),
+    (3, "CurrentMeasurementTimeout"),
+    (4, "BrakeResistorDisarmed"),
+    (5, "MotorDisarmed"),
+    (6, "MotorFailed"),
+    (7, "SensorlessEstimatorFailed"),
+    (8, "EncoderFailed"),
+    (9, "ControllerFailed"),
+    (10, "PosCtrlDuringSensorless"),
+    (11, "WatchdogTimerExpired"),
+    (12, "MinEndstopPressed"),
+    (13, "MaxEndstopPressed"),
+    (14, "EstopRequested"),
+    (17, "HomingWithoutEndstop"),
+    (18, "OverTemp"),
 ];
-/// `ODrive.Motor.Error` flag names by bit.
-const MOTOR_ERRORS: &[&str] = &[
-    "PhaseResistanceOutOfRange",
-    "PhaseInductanceOutOfRange",
-    "AdcFailed",
-    "DrvFault",
-    "ControlDeadlineMissed",
-    "NotImplementedMotorType",
-    "BrakeCurrentOutOfRange",
-    "ModulationMagnitude",
-    "BrakeDeadtimeViolation",
-    "UnexpectedTimerCallback",
-    "CurrentSenseSaturation",
-    "CurrentLimitViolation",
-    "BrakeDutyCycleNan",
-    "DcBusOverRegenCurrent",
-    "DcBusOverCurrent",
+/// `ODrive.Motor.Error` flags by bit.
+const MOTOR_ERRORS: &[(u32, &str)] = &[
+    (0, "PhaseResistanceOutOfRange"),
+    (1, "PhaseInductanceOutOfRange"),
+    (2, "AdcFailed"),
+    (3, "DrvFault"),
+    (4, "ControlDeadlineMissed"),
+    (5, "NotImplementedMotorType"),
+    (6, "BrakeCurrentOutOfRange"),
+    (7, "ModulationMagnitude"),
+    (8, "BrakeDeadtimeViolation"),
+    (9, "UnexpectedTimerCallback"),
+    (10, "CurrentSenseSaturation"),
+    (12, "CurrentLimitViolation"),
+    (13, "BrakeDutyCycleNan"),
+    (14, "DcBusOverRegenCurrent"),
+    (15, "DcBusOverCurrent"),
 ];
-/// `ODrive.Encoder.Error` flag names by bit.
-const ENCODER_ERRORS: &[&str] = &[
-    "UnstableGain",
-    "CprPolepairsMismatch",
-    "NoResponse",
-    "UnsupportedEncoderMode",
-    "IllegalHallState",
-    "IndexNotFoundYet",
-    "AbsSpiTimeout",
-    "AbsSpiComFail",
-    "AbsSpiNotReady",
+/// `ODrive.Encoder.Error` flags by bit.
+const ENCODER_ERRORS: &[(u32, &str)] = &[
+    (0, "UnstableGain"),
+    (1, "CprPolepairsMismatch"),
+    (2, "NoResponse"),
+    (3, "UnsupportedEncoderMode"),
+    (4, "IllegalHallState"),
+    (5, "IndexNotFoundYet"),
+    (6, "AbsSpiTimeout"),
+    (7, "AbsSpiComFail"),
+    (8, "AbsSpiNotReady"),
 ];
-/// `ODrive.Controller.Error` flag names by bit.
-const CONTROLLER_ERRORS: &[&str] = &[
-    "Overspeed",
-    "InvalidInputMode",
-    "UnstableGain",
-    "InvalidMirrorAxis",
-    "InvalidLoadEncoder",
-    "InvalidEstimate",
+/// `ODrive.Controller.Error` flags by bit.
+const CONTROLLER_ERRORS: &[(u32, &str)] = &[
+    (0, "Overspeed"),
+    (1, "InvalidInputMode"),
+    (2, "UnstableGain"),
+    (3, "InvalidMirrorAxis"),
+    (4, "InvalidLoadEncoder"),
+    (5, "InvalidEstimate"),
 ];
 
 /// The four error words with their upstream flag names, for logs and the
@@ -110,8 +112,9 @@ pub(crate) fn describe_error_words(axis: u32, motor: u32, encoder: u32, controll
             .filter(|bit| bits & (1 << bit) != 0)
             .map(|bit| {
                 names
-                    .get(bit)
-                    .map_or(format!("bit{bit}"), |name| (*name).into())
+                    .iter()
+                    .find(|(named, _)| *named == bit)
+                    .map_or(format!("bit{bit}"), |(_, name)| (*name).into())
             })
             .collect();
         format!("{word} {} (0x{bits:x})", flags.join("|"))
@@ -304,6 +307,12 @@ mod tests {
             describe_error_words(0x220, 0x10, 0, 0x1 | 1 << 31),
             "axis MotorDisarmed|ControllerFailed (0x220), motor ControlDeadlineMissed (0x10), \
              encoder none, controller Overspeed|bit31 (0x80000001)"
+        );
+        // Explicit YAML bits: the axis skips 15 and 16, the motor skips 11.
+        assert_eq!(
+            describe_error_words(1 << 15 | 1 << 17 | 1 << 18, 1 << 11 | 1 << 12, 0, 0),
+            "axis bit15|HomingWithoutEndstop|OverTemp (0x68000), \
+             motor bit11|CurrentLimitViolation (0x1800), encoder none, controller none"
         );
     }
 

@@ -114,6 +114,7 @@ pub(crate) fn show_page_width(
     stop: Option<&StopStatus>,
     entry: &PageWidthEntry,
     draft: &mut String,
+    exit: impl FnOnce(&mut egui::Ui),
 ) -> Result<(), ControllerClosed> {
     // The bar edits the draft; the body shows it as it was at the frame's start.
     let shown = if draft.is_empty() {
@@ -144,6 +145,7 @@ pub(crate) fn show_page_width(
             })
             .and(set);
             show_keypad(ui, draft);
+            exit(ui);
         },
         |ui, _| {
             show_stop(ui, stop);

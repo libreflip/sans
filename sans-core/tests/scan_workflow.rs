@@ -42,8 +42,9 @@ impl MachineBoard for Board {
         self.events.try_recv().ok()
     }
 
-    fn light_on(&mut self) -> Result<(), String> {
-        self.log.lock().unwrap().push("LIGHT ON".into());
+    fn set_light(&mut self, on: bool) -> Result<(), String> {
+        let command = if on { "LIGHT ON" } else { "LIGHT OFF" };
+        self.log.lock().unwrap().push(command.into());
         Ok(())
     }
 
@@ -425,6 +426,12 @@ fn a_failed_first_capture_blocks_without_a_canonical_pair() {
     let view = scanning(&snapshot).unwrap();
     assert_eq!(view.capture.latest_complete_pair, None);
     assert_eq!((view.left_sequence, view.attempt), (0, 1));
+    // A blocked first capture does not leave the light on.
+    assert!(
+        started.log().ends_with(&["LIGHT OFF".to_string()]),
+        "{:?}",
+        started.log()
+    );
 }
 
 #[test]
@@ -518,6 +525,36 @@ fn the_led_follows_setup_idle_ready_scanning_and_stop() {
             "LED Red"
         ]
     );
+}
+
+#[test]
+fn stop_during_the_first_capture_switches_the_light_off_and_does_not_block_home() {
+    let started = start(homing_board(), vec![pair(1), pair(2)]);
+    home(&started);
+    ready(&started, 200);
+    // The Cameras never answer while the test holds the gate.
+    let gate = started.gate.lock().unwrap();
+    started.send(ControllerIntent::Start);
+    started.until(|snapshot| {
+        scanning(snapshot).is_some_and(|view| view.capture.status == CaptureStatus::Capturing)
+    });
+
+    started.send(ControllerIntent::Stop);
+    started.until(|snapshot| {
+        snapshot.stop.as_ref().map(|stop| &stop.verdict) == Some(&StopVerdict::Confirmed)
+    });
+    let log = started.log();
+    let on = log.iter().position(|entry| entry == "LIGHT ON").unwrap();
+    assert!(log[on..].contains(&"LIGHT OFF".to_string()), "{log:?}");
+    started.send(ControllerIntent::ClearStop);
+    started.until(|snapshot| snapshot.stop.is_none());
+
+    home(&started);
+    drop(gate);
+    // The late pair belongs to the ended session; the workflow carries on.
+    ready(&started, 200);
+    started.send(ControllerIntent::Start);
+    started.until(|snapshot| scanning(snapshot).is_some());
 }
 
 #[test]

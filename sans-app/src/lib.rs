@@ -306,8 +306,10 @@ fn show_controller(
         }
         Some(MachineScreen::CapturePreview(preview)) => {
             let mut home = Ok(());
+            // The controller refuses Home until a diagnostic capture finishes.
+            let capturing = preview.status == sans_core::CaptureStatus::Capturing;
             let more = |ui: &mut egui::Ui| {
-                if home_allowed {
+                if home_allowed && !capturing {
                     home = workflow::home_action(ui, handle);
                 }
                 exit(ui);
@@ -328,7 +330,7 @@ fn show_controller(
             }
         }
         Some(MachineScreen::PageWidth(entry)) => {
-            if workflow::show_page_width(ui, handle, stop, entry, page_width_draft).is_err() {
+            if workflow::show_page_width(ui, handle, stop, entry, page_width_draft, exit).is_err() {
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }

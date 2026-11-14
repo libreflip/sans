@@ -2128,7 +2128,7 @@ impl LinkEngine {
                 }
                 if self.config.lift_axis.is_none() {
                     self.fail_gate(Some(
-                        "lift axis is uncommissioned: [odrive.lift_axis] is absent, so no limit was written"
+                        "lift axis is uncommissioned: [odrive.lift_axis] is absent, so positions cannot be converted"
                             .into(),
                     ));
                     if let Some(connection) = self.connection.as_mut() {

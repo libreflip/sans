@@ -100,10 +100,10 @@ impl MachineBoard for MonospaceBoard {
         None
     }
 
-    fn light_on(&mut self) -> Result<(), String> {
+    fn set_light(&mut self, on: bool) -> Result<(), String> {
         lock(&self.0)
             .client
-            .set_light(true)
+            .set_light(on)
             .map_err(|error| error.to_string())
     }
 

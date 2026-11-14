@@ -96,7 +96,8 @@ confirmation_samples = 3
 
 [motion]
 # The percentages below are also immutable maxima; edits may only lower actuation.
-# The Touchdown press current is in amps and at most the ODrive's own current_lim.
+# The Touchdown press current is in amps and at most the ODrive's own current_lim;
+# it is provisional and unvalidated on hardware until #60 measures it.
 touchdown_press_current_a = 2.0
 classification_start_percent = 10.0
 wiggle_start_percent = 65.0
