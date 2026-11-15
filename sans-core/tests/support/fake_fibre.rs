@@ -149,6 +149,8 @@ impl FakeFibre {
         fake.set_i32(CONTROL_MODE, 3);
         fake.set_i32(INPUT_MODE, 5);
         fake.set_f32(CURRENT_LIM, 4.8);
+        // 2 mm/s^2 at the test profiles' 8 mm per turn.
+        fake.set_f32(TRAP_DECEL_LIMIT, 0.25);
         fake
     }
 

@@ -12,8 +12,7 @@ use thiserror::Error;
 pub const MACHINE_PROFILE_TEMPLATE: &str = include_str!("../../sans.example.toml");
 
 /// The only Machine-profile schema version this build reads.
-const SCHEMA_VERSION: i64 = 2;
-const MAX_TOUCHDOWN_PRESS_PERCENT: f32 = 50.0;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_CLASSIFICATION_START_PERCENT: f32 = 10.0;
 const MAX_WIGGLE_START_PERCENT: f32 = 65.0;
 const MAX_WIGGLE_RETREAT_PERCENT: f32 = 5.0;
@@ -30,22 +29,6 @@ const ODRIVE_MAX_TELEMETRY_AGE_CEILING_MS: u64 = 250;
 const ODRIVE_REQUEST_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 250);
 /// Immutable bounds on `odrive.urgent_deadline_ms`. Provisional and unmeasured.
 const ODRIVE_URGENT_DEADLINE_BOUNDS_MS: (u64, u64) = (1, 100);
-/// Software policy cap on the commissioned motor current limit, in amps.
-///
-/// This is an arbitrary conservative starting bound chosen as host policy. It is
-/// not derived from the mechanism and makes no physical safety qualification.
-/// It matches the `current_lim` observed on the board on 2026-11-10, which is
-/// provenance only. #60 reviews it before any change.
-const ODRIVE_CURRENT_LIMIT_CAP_A: f32 = 4.8;
-/// Software policy cap on commissioned velocity, in motor turns per second.
-///
-/// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
-const ODRIVE_VELOCITY_CAP_TURNS_PER_S: f32 = 1.0;
-/// Software policy cap on commissioned acceleration and deceleration, in motor
-/// turns per second squared.
-///
-/// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
-const ODRIVE_ACCELERATION_CAP_TURNS_PER_S2: f32 = 1.0;
 /// Software policy cap on the Touchdown hold depth below contact, in millimetres.
 ///
 /// Arbitrary conservative host policy, not a measured or qualified limit. #60 reviews it.
@@ -57,7 +40,7 @@ const CAMERA_FRAME_HEIGHT: u32 = 2160;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineProfile {
-    /// On-disk schema version. This build accepts only version 2.
+    /// On-disk schema version. This build accepts only version 3.
     pub schema_version: u32,
     /// Absolute or profile-relative root for Scan session directories.
     pub data_root: PathBuf,
@@ -169,10 +152,9 @@ pub enum LiftDirection {
     Reversed,
 }
 
-/// Commissioned lift-axis mechanism values and limits.
-///
-/// Limits are bounded by software policy caps in motor units, so a wrong
-/// `mm_per_turn` cannot raise motor speed or current past the cap.
+/// Commissioned lift-axis mechanism values. Sans writes no velocity or
+/// acceleration limits and sets a current limit only to press during a
+/// Touchdown; otherwise the ODrive's own stored limits apply.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiftAxisProfile {
@@ -184,14 +166,6 @@ pub struct LiftAxisProfile {
     pub travel_minimum_mm: f32,
     /// Highest commissioned soft bound for absolute moves.
     pub travel_maximum_mm: f32,
-    /// Motor current limit written to the board; positive, at most the 4.8 A policy cap.
-    pub current_limit_a: f32,
-    /// Velocity limit; at most 1 motor turn per second after conversion.
-    pub velocity_limit_mm_s: f32,
-    /// Trajectory acceleration limit; at most 1 motor turn per second squared after conversion.
-    pub acceleration_limit_mm_s2: f32,
-    /// Trajectory deceleration limit; at most 1 motor turn per second squared after conversion.
-    pub deceleration_limit_mm_s2: f32,
     /// How close a position must be to a target to count as there.
     pub position_tolerance_mm: f32,
     /// Speed at or under which the axis counts as stationary.
@@ -305,8 +279,10 @@ pub struct PickupProfile {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MotionProfile {
-    /// Normalized Touchdown press command, capped by the immutable 50% ceiling.
-    pub touchdown_press_percent: f32,
+    /// Motor current limit a Touchdown presses at, in amps; at most the
+    /// ODrive's own `current_lim`. The lift-away move keeps the press limit;
+    /// the motion after it restores the board's own.
+    pub touchdown_press_current_a: f32,
     /// Lift percentage at which pressure classification begins.
     pub classification_start_percent: f32,
     /// Lift percentage at which the downward wiggle begins.
@@ -321,31 +297,6 @@ pub struct MotionProfile {
     pub final_lift_percent: f32,
     /// Descending Lift percentage at which the Turn blower is disabled.
     pub blower_off_descent_percent: f32,
-}
-
-/// Commissioned limits converted to the board's motor units.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct MotorLimits {
-    /// `motor.config.current_lim` in amps.
-    pub(crate) current_a: f32,
-    /// `controller.config.vel_limit` and `trap_traj.config.vel_limit` in turns per second.
-    pub(crate) velocity_turns_per_s: f32,
-    /// `trap_traj.config.accel_limit` in turns per second squared.
-    pub(crate) acceleration_turns_per_s2: f32,
-    /// `trap_traj.config.decel_limit` in turns per second squared.
-    pub(crate) deceleration_turns_per_s2: f32,
-}
-
-impl LiftAxisProfile {
-    /// Convert the commissioned limits to motor units, the values written to the board.
-    pub(crate) fn motor_limits(&self) -> MotorLimits {
-        MotorLimits {
-            current_a: self.current_limit_a,
-            velocity_turns_per_s: self.velocity_limit_mm_s / self.mm_per_turn,
-            acceleration_turns_per_s2: self.acceleration_limit_mm_s2 / self.mm_per_turn,
-            deceleration_turns_per_s2: self.deceleration_limit_mm_s2 / self.mm_per_turn,
-        }
-    }
 }
 
 /// A Machine profile that has passed structural and storage validation.
@@ -406,15 +357,27 @@ pub enum StartupError {
     /// The profile uses schema version 1, which named the retired Ligature board.
     #[error(
         "Machine profile at {path} uses retired schema version 1: remove boards.ligature_path, \
-         add the required [odrive] section and set schema_version = 2; compare with the \
-         regenerated template (move this file aside and restart Sans to write a fresh one)"
+         add the required [odrive] section, follow the schema version 2 guidance and set \
+         schema_version = 3; compare with the regenerated template (move this file aside and \
+         restart Sans to write a fresh one)"
     )]
     ProfileVersionRetired {
         /// Selected Machine-profile path.
         path: PathBuf,
     },
+    /// The profile uses schema version 2, which held lift-axis motion limits.
+    #[error(
+        "Machine profile at {path} uses retired schema version 2: remove current_limit_a, \
+         velocity_limit_mm_s, acceleration_limit_mm_s2 and deceleration_limit_mm_s2 from \
+         [odrive.lift_axis] (the ODrive's own limits apply), replace motion.touchdown_press_percent \
+         with motion.touchdown_press_current_a in amps, and set schema_version = 3"
+    )]
+    ProfileVersion2Retired {
+        /// Selected Machine-profile path.
+        path: PathBuf,
+    },
     /// The profile's schema version is missing or not one this build reads.
-    #[error("Machine profile at {path} has unsupported schema_version {found}; this build reads only schema_version = 2")]
+    #[error("Machine profile at {path} has unsupported schema_version {found}; this build reads only schema_version = 3")]
     ProfileVersionUnsupported {
         /// Selected Machine-profile path.
         path: PathBuf,
@@ -525,6 +488,9 @@ fn check_schema_version(path: &Path, source: &str) -> Result<(), StartupError> {
     match table.get("schema_version") {
         Some(toml::Value::Integer(SCHEMA_VERSION)) => Ok(()),
         Some(toml::Value::Integer(1)) => Err(StartupError::ProfileVersionRetired {
+            path: path.to_path_buf(),
+        }),
+        Some(toml::Value::Integer(2)) => Err(StartupError::ProfileVersion2Retired {
             path: path.to_path_buf(),
         }),
         found => Err(StartupError::ProfileVersionUnsupported {
@@ -686,51 +652,6 @@ fn validate_lift_axis(lift_axis: &LiftAxisProfile, problems: &mut Vec<String>) {
         && lift_axis.travel_minimum_mm < lift_axis.travel_maximum_mm)
     {
         problems.push(format!("{name} travel bounds must be finite and ordered"));
-    }
-    validate_positive_finite(
-        &format!("{name}.current_limit_a"),
-        lift_axis.current_limit_a,
-        problems,
-    );
-    if lift_axis.current_limit_a > ODRIVE_CURRENT_LIMIT_CAP_A {
-        problems.push(format!(
-            "{name}.current_limit_a exceeds the {ODRIVE_CURRENT_LIMIT_CAP_A} A software policy cap"
-        ));
-    }
-    let limits = lift_axis.motor_limits();
-    for (field, value, converted, cap, unit) in [
-        (
-            "velocity_limit_mm_s",
-            lift_axis.velocity_limit_mm_s,
-            limits.velocity_turns_per_s,
-            ODRIVE_VELOCITY_CAP_TURNS_PER_S,
-            "motor turn per second",
-        ),
-        (
-            "acceleration_limit_mm_s2",
-            lift_axis.acceleration_limit_mm_s2,
-            limits.acceleration_turns_per_s2,
-            ODRIVE_ACCELERATION_CAP_TURNS_PER_S2,
-            "motor turn per second squared",
-        ),
-        (
-            "deceleration_limit_mm_s2",
-            lift_axis.deceleration_limit_mm_s2,
-            limits.deceleration_turns_per_s2,
-            ODRIVE_ACCELERATION_CAP_TURNS_PER_S2,
-            "motor turn per second squared",
-        ),
-    ] {
-        validate_positive_finite(&format!("{name}.{field}"), value, problems);
-        if !(converted.is_finite() && converted > 0.0) {
-            problems.push(format!(
-                "{name}.{field} must convert to a positive finite motor value; check mm_per_turn"
-            ));
-        } else if converted > cap {
-            problems.push(format!(
-                "{name}.{field} exceeds the {cap} {unit} software policy cap after conversion"
-            ));
-        }
     }
     for (field, value) in [
         ("position_tolerance_mm", lift_axis.position_tolerance_mm),
@@ -908,15 +829,10 @@ fn validate_motion(motion: &MotionProfile, problems: &mut Vec<String>) {
         }
     }
     validate_positive_finite(
-        "motion.touchdown_press_percent",
-        motion.touchdown_press_percent,
+        "motion.touchdown_press_current_a",
+        motion.touchdown_press_current_a,
         problems,
     );
-    if motion.touchdown_press_percent > MAX_TOUCHDOWN_PRESS_PERCENT {
-        problems.push(format!(
-            "motion.touchdown_press_percent exceeds immutable {MAX_TOUCHDOWN_PRESS_PERCENT}% ceiling"
-        ));
-    }
     if !(motion.classification_start_percent
         < motion.wiggle_start_percent - motion.wiggle_retreat_percent
         && motion.wiggle_retreat_percent < motion.wiggle_start_percent

@@ -30,10 +30,6 @@ direction = "normal"
 mm_per_turn = 8.0
 travel_minimum_mm = 0.0
 travel_maximum_mm = 300.0
-current_limit_a = 4.0
-velocity_limit_mm_s = 6.0
-acceleration_limit_mm_s2 = 4.0
-deceleration_limit_mm_s2 = 2.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -495,7 +491,8 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
 
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
-    assert_eq!(rig.write_order_since(6), vec![CURRENT_LIM, REQUESTED_STATE]);
+    // The gate's only write is the idle request; Home writes no current limit.
+    assert_eq!(rig.write_order_since(1), vec![REQUESTED_STATE]);
     assert_eq!(rig.outcome(id), None, "entering homing is not completion");
     finish_home(&mut rig);
     rig.run_for(25);
@@ -506,10 +503,28 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
 }
 
 #[test]
+fn home_waits_for_the_axis_to_settle_wherever_it_comes_to_rest() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    let id = rig.start(Home, Unknown).unwrap();
+    rig.run_for(5);
+    // Idle with clean evidence, still coasting after the firmware's final move.
+    finish_home(&mut rig);
+    rig.axis(0.8, 2.0, 0.0);
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), None, "a moving axis has not settled");
+
+    // At rest off 0: the encoder reference Home set still tracks it.
+    rig.axis(0.9, 0.0, 0.0);
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert!(rig.ops.status().position_trusted);
+}
+
+#[test]
 fn idle_without_clean_evidence_is_home_failed() {
     let spoils: [fn(&mut Rig); 4] = [
         |rig| rig.board.set_i32(AXIS_ERROR, 0x800),
-        |rig| rig.axis(3.0, 0.0, 0.0),
+        |rig| rig.board.set_bool(TRAJECTORY_DONE, false),
         |rig| rig.board.set_bool(IS_HOMED, false),
         |rig| rig.board.set_bool(ENCODER_IS_READY, false),
     ];
@@ -683,7 +698,19 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
 // ----- 4. Moves and cancel ------------------------------------------------------
 
 #[test]
-fn a_move_sets_its_limit_first_and_completes_only_on_later_evidence() {
+fn a_move_writes_no_current_limit_so_the_odrives_own_applies() {
+    let mut rig = armed();
+    let mark = rig.board.writes.len();
+    let id = rig.start(MoveTo { position_mm: 10.0 }, Off).unwrap();
+    rig.run_for(5);
+    assert_eq!(rig.write_order_since(mark), vec![INPUT_POS]);
+    arrive(&mut rig);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+    assert!(rig.board.writes_to(CURRENT_LIM).is_empty());
+}
+
+#[test]
+fn a_move_after_a_touchdown_restores_the_current_limit_and_needs_later_evidence() {
     let mut rig = lifted_away();
     let mark = rig.board.writes.len();
     // The board already reads at the target with its trajectory done, and a
@@ -704,7 +731,7 @@ fn a_move_sets_its_limit_first_and_completes_only_on_later_evidence() {
     }
     rig.settle();
     assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     assert_eq!(
         rig.outcome(id),
         None,
@@ -842,17 +869,7 @@ fn reconnect_mid_operation_gives_one_fault_and_no_writes_beyond_the_gate() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
-    assert_eq!(
-        rig.write_order_since(mark),
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-        ]
-    );
+    assert_eq!(rig.write_order_since(mark), vec![REQUESTED_STATE]);
     let status = rig.ops.status();
     assert_eq!(status.epoch, 2);
     assert!(!status.position_trusted);
@@ -1231,7 +1248,7 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
     rig.settle();
     rig.run_for(50);
     assert_eq!(rig.moves(), moves, "no deferred motion");
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     assert_eq!(rig.finishes(id).len(), 1);
     assert!(matches!(
         rig.outcome(id),
@@ -1299,7 +1316,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     let mark = rig.board.writes.len();
     let park = rig.start(MoveTo { position_mm: 50.0 }, Unknown).unwrap();
     assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
     arrive(&mut rig);
     assert_eq!(rig.outcome(park), Some(LiftOutcome::Completed(None)));
 }
@@ -1332,6 +1349,88 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
     parked.run_for(50);
     assert_eq!(parked.outcome(clear), Some(LiftOutcome::Completed(None)));
     assert_eq!(parked.ops.status().latch, None);
+}
+
+#[test]
+fn an_odrive_error_latches_stop_and_clear_stop_clears_it() {
+    let mut rig = homed();
+    rig.board.set_i32(MOTOR_ERROR, 0x40);
+    rig.run_for(25);
+    let status = rig.ops.status();
+    assert!(
+        matches!(&status.latch, Some(StopCause::AxisError(errors)) if errors.contains("motor BrakeCurrentOutOfRange (0x40)")),
+        "{:?}",
+        status.latch
+    );
+    assert!(!status.position_trusted);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+
+    let clear = rig.clear_stop().unwrap();
+    assert_eq!(rig.board.writes_to(CLEAR_ERRORS).len(), 1);
+    // The fake keeps its error words until a test resets them, as upstream
+    // `clear_errors` does.
+    rig.board.set_i32(MOTOR_ERROR, 0);
+    rig.run_for(50);
+    assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
+    assert_eq!(rig.ops.status().latch, None);
+}
+
+#[test]
+fn resting_on_the_pressed_minimum_endstop_is_not_an_odrive_error() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_i32(AXIS_ERROR, 1 << 12);
+    rig.board.set_bool(MIN_ENDSTOP_STATE, true);
+    rig.run_for(50);
+    assert_eq!(rig.ops.status().latch, None);
+
+    // The bit without the pressed endstop is an error.
+    rig.board.set_bool(MIN_ENDSTOP_STATE, false);
+    rig.run_for(25);
+    assert!(matches!(
+        rig.ops.status().latch,
+        Some(StopCause::AxisError(_))
+    ));
+}
+
+#[test]
+fn a_touchdown_press_above_the_odrives_own_current_limit_is_rejected() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_f32(CURRENT_LIM, 1.5);
+    rig.connect();
+    home(&mut rig);
+    arm(&mut rig);
+
+    let request = Touchdown {
+        post_turn_page_width_mm: None,
+    };
+    assert_eq!(
+        rig.start(request, Off),
+        Err(LiftRejection::PressAboveBoardLimit {
+            press_a: PRESS_A,
+            board_a: Some(1.5),
+        })
+    );
+    assert!(rig.board.writes_to(CURRENT_LIM).is_empty());
+}
+
+#[test]
+fn after_a_reconnect_under_the_press_limit_the_odrives_own_limit_is_restored() {
+    let mut rig = lifted_away();
+    assert_eq!(rig.board.f32_value(CURRENT_LIM), PRESS_A);
+
+    // The new connection reads the press current back as the board's limit.
+    rig.connect();
+    rig.run_for(25);
+    assert!(
+        rig.ops.status().latch.is_some(),
+        "a reconnect while armed stops"
+    );
+    let clear = rig.clear_fault().unwrap();
+    rig.run_for(50);
+    assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
+    home(&mut rig);
+
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
 }
 
 // ----- 10. Cross-board Stop -----------------------------------------------------

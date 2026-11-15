@@ -22,10 +22,6 @@ direction = "normal"
 mm_per_turn = 8.0
 travel_minimum_mm = 0.0
 travel_maximum_mm = 300.0
-current_limit_a = 4.0
-velocity_limit_mm_s = 6.0
-acceleration_limit_mm_s2 = 4.0
-deceleration_limit_mm_s2 = 2.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -385,7 +381,7 @@ fn uncommissioned_profile_writes_no_limit_and_rejects_energizing_commands() {
 }
 
 #[test]
-fn commissioned_limits_are_converted_written_and_read_back_before_energizing() {
+fn the_gate_writes_no_limits_so_the_odrives_own_apply() {
     let mut link = Harness::new(commissioned(), FakeFibre::compatible());
     link.connect();
     link.run_for(5);
@@ -395,85 +391,18 @@ fn commissioned_limits_are_converted_written_and_read_back_before_energizing() {
     link.run_for(5);
     assert_eq!(link.result(1), Some(CommandResult::Completed));
 
-    // 4.0 A unchanged; 6 mm/s and 4, 2 mm/s^2 over 8 mm per turn.
-    let f32s = |endpoint| -> Vec<f32> {
-        link.board
-            .writes_to(endpoint)
-            .into_iter()
-            .map(|payload| f32::from_le_bytes(payload.try_into().unwrap()))
-            .collect()
-    };
-    assert_eq!(f32s(CURRENT_LIM), vec![4.0]);
-    assert_eq!(f32s(CONTROLLER_VEL_LIMIT), vec![0.75]);
-    assert_eq!(f32s(TRAP_VEL_LIMIT), vec![0.75]);
-    assert_eq!(f32s(TRAP_ACCEL_LIMIT), vec![0.5]);
-    assert_eq!(f32s(TRAP_DECEL_LIMIT), vec![0.25]);
     let order: Vec<u16> = link
         .board
         .writes
         .iter()
         .map(|(endpoint, _)| *endpoint)
         .collect();
-    assert_eq!(
-        order,
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-            REQUESTED_STATE,
-        ]
-    );
+    assert_eq!(order, vec![REQUESTED_STATE, REQUESTED_STATE]);
     assert_eq!(link.board.requested_states(), vec![1, 8]);
-    // Each limit write is followed by its readback before the next write.
-    let limit_traffic: Vec<(u16, bool)> = link
-        .board
-        .requests
-        .iter()
-        .filter(|request| [CURRENT_LIM, CONTROLLER_VEL_LIMIT].contains(&request.endpoint))
-        .map(|request| (request.endpoint, request.payload.is_empty()))
-        .collect();
-    assert_eq!(
-        limit_traffic,
-        vec![
-            (CURRENT_LIM, false),
-            (CURRENT_LIM, true),
-            (CONTROLLER_VEL_LIMIT, false),
-            (CONTROLLER_VEL_LIMIT, true),
-        ]
-    );
 }
 
 #[test]
-fn differing_limit_readback_blocks_the_lift_axis() {
-    let mut board = FakeFibre::compatible();
-    board
-        .readback_override
-        .insert(TRAP_ACCEL_LIMIT, 0.6_f32.to_le_bytes().to_vec());
-    let mut link = Harness::new(commissioned(), board);
-
-    link.connect();
-    link.run_for(5);
-    link.submit(1, LinkCommand::Arm, Priority::Urgent);
-
-    let status = link.engine.status();
-    assert_eq!(status.phase, LinkPhase::Blocked);
-    assert!(
-        status.blockers[0].contains("TrapAccelLimit read back"),
-        "{status:?}"
-    );
-    assert!(link.board.writes_to(TRAP_DECEL_LIMIT).is_empty());
-    assert!(matches!(
-        link.result(1),
-        Some(CommandResult::Rejected { .. })
-    ));
-    assert_eq!(link.board.requested_states(), vec![1]);
-}
-
-#[test]
-fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_unsent() {
+fn current_limit_is_written_and_read_back_and_a_non_positive_value_is_rejected_unsent() {
     let mut link = verified(commissioned(), FakeFibre::compatible());
     let gate_writes = link.board.writes_to(CURRENT_LIM).len();
 
@@ -484,7 +413,7 @@ fn current_limit_is_written_and_read_back_and_an_over_limit_value_is_rejected_un
     );
     link.submit(
         2,
-        LinkCommand::SetCurrentLimit { amps: 4.01 },
+        LinkCommand::SetCurrentLimit { amps: 0.0 },
         Priority::Ordinary,
     );
     link.run_for(5);
@@ -1076,17 +1005,7 @@ fn transport_loss_retires_pending_work_with_transmitted_flags_and_reconnect_only
         .iter()
         .map(|(endpoint, _)| *endpoint)
         .collect();
-    assert_eq!(
-        writes,
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-        ]
-    );
+    assert_eq!(writes, vec![REQUESTED_STATE]);
     assert_eq!(link.board.requested_states().last(), Some(&1));
     assert_eq!(link.requests_to(0).len(), 2 * 1273);
     assert!(link.wire[wire_before..].iter().all(|(urgent, _)| !urgent));

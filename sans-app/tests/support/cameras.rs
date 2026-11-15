@@ -4,11 +4,15 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
+use std::time::Duration;
+
 use sans_core::{
     CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, FibreConnection,
-    FibreOpener, MachineFactory, OpenRequest, PreparedMachineProfile, RoleCamera, SetupBlocker,
-    SetupDiagnostic,
+    FibreOpener, MachineBoard, MachineEvent, MachineFactory, OpenRequest, OpenedBoard,
+    PreparedMachineProfile, RoleCamera, SetupBlocker, SetupDiagnostic,
 };
+
+use super::core_support::fake_fibre::{FakeFibre, FakeOpener, IS_HOMED, TRAJECTORY_DONE};
 
 /// What one camera does on one capture call. The last step repeats.
 #[derive(Clone, Debug)]
@@ -125,6 +129,14 @@ pub enum FixtureFactory {
         calls: CaptureCalls,
     },
     Blocked(Vec<String>),
+    /// Scripted cameras, a Monospace that answers every command and a fake
+    /// ODrive whose native Home ends cleanly, so the whole scan workflow runs.
+    Scanner {
+        left: Vec<Step>,
+        right: Vec<Step>,
+        calls: CaptureCalls,
+        opener: FakeOpener,
+    },
 }
 
 impl FixtureFactory {
@@ -139,6 +151,41 @@ impl FixtureFactory {
             },
             calls,
         )
+    }
+
+    /// Like [`FixtureFactory::cameras`], with a Monospace and a lift axis that homes.
+    pub fn scanner(left: Vec<Step>, right: Vec<Step>) -> (Self, CaptureCalls) {
+        let mut board = FakeFibre::compatible();
+        board.settle_after_one_read.insert(11, 1);
+        board.set_bool(IS_HOMED, true);
+        board.set_bool(TRAJECTORY_DONE, true);
+        let calls = CaptureCalls::default();
+        (
+            Self::Scanner {
+                left,
+                right,
+                calls: calls.clone(),
+                opener: FakeOpener::new(board),
+            },
+            calls,
+        )
+    }
+}
+
+/// A Monospace that answers every command and never reports an event.
+struct QuietBoard;
+
+impl MachineBoard for QuietBoard {
+    fn all_off(&mut self, _within: Duration) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Option<MachineEvent> {
+        None
+    }
+
+    fn set_light(&mut self, _on: bool) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -155,7 +202,18 @@ impl MachineFactory for FixtureFactory {
     type Machine = CapturePairMachine;
 
     fn odrive_opener(&mut self) -> Box<dyn FibreOpener> {
-        Box::new(NoOdrive)
+        match self {
+            Self::Scanner { opener, .. } => Box::new(opener.clone()),
+            _ => Box::new(NoOdrive),
+        }
+    }
+
+    fn open_board(&mut self, _profile: &PreparedMachineProfile) -> Option<OpenedBoard> {
+        let Self::Scanner { .. } = self else {
+            return None;
+        };
+        let board: Box<dyn MachineBoard> = Box::new(QuietBoard);
+        Some(Ok((board, SetupDiagnostic::ready("Monospace", "fixture"))))
     }
 
     fn open(
@@ -163,7 +221,10 @@ impl MachineFactory for FixtureFactory {
         _profile: &PreparedMachineProfile,
     ) -> Result<(Self::Machine, Vec<SetupDiagnostic>), Vec<SetupBlocker>> {
         match self {
-            Self::Cameras { left, right, calls } => CapturePairMachine::new(
+            Self::Cameras { left, right, calls }
+            | Self::Scanner {
+                left, right, calls, ..
+            } => CapturePairMachine::new(
                 Box::new(ScriptedCamera {
                     role: CameraRole::Left,
                     steps: left.into(),

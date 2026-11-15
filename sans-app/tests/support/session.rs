@@ -18,6 +18,7 @@ use sans_core::bootstrap;
 use tempfile::TempDir;
 
 use super::cameras::{CaptureCalls, FixtureFactory, Gate, GateRelease, Step};
+use super::core_support::{with_relaxed_timing, LIFT_AXIS};
 use super::fixtures::{portrait_full_frame, Fixture};
 
 const VALID_PROFILE: &str = include_str!("../../../sans-core/tests/fixtures/valid-sans.toml");
@@ -132,6 +133,27 @@ impl Session {
         session
     }
 
+    /// Start a whole scanner, with a lift axis that homes, and wait until Home may be given.
+    pub fn scanner(pair: (Fixture, Fixture), viewport: Viewport) -> Self {
+        Self::scanner_rendered(pair, viewport, None)
+    }
+
+    /// Like [`Session::scanner`], rendering through `renderer`.
+    pub fn scanner_rendered(
+        (left, right): (Fixture, Fixture),
+        viewport: Viewport,
+        renderer: Option<WgpuTestRenderer>,
+    ) -> Self {
+        let (factory, calls) = FixtureFactory::scanner(
+            vec![Step::Frame(left.frame)],
+            vec![Step::Frame(right.frame)],
+        );
+        let profile = with_relaxed_timing(&format!("{VALID_PROFILE}{LIFT_AXIS}"));
+        let mut session = Self::controller_with(&profile, factory, calls, viewport, renderer);
+        session.wait_for_label("Home required");
+        session
+    }
+
     /// Start with cameras returning `pair`, capture it, and wait for the four views.
     pub fn with_pair(pair: (Fixture, Fixture), viewport: Viewport) -> Self {
         Self::with_pair_rendered(pair, viewport, None)
@@ -179,12 +201,22 @@ impl Session {
         viewport: Viewport,
         renderer: Option<WgpuTestRenderer>,
     ) -> Self {
+        Self::controller_with(VALID_PROFILE, factory, calls, viewport, renderer)
+    }
+
+    fn controller_with(
+        profile_text: &str,
+        factory: FixtureFactory,
+        calls: CaptureCalls,
+        viewport: Viewport,
+        renderer: Option<WgpuTestRenderer>,
+    ) -> Self {
         let profile = TempDir::new().unwrap();
         let profile_path = profile.path().join("sans.toml");
         let data_root = profile.path().join("scan-data");
         fs::write(
             &profile_path,
-            VALID_PROFILE.replace(
+            profile_text.replace(
                 "data_root = \"scan-data\"",
                 &format!("data_root = {data_root:?}"),
             ),

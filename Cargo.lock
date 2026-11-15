@@ -2857,6 +2857,7 @@ dependencies = [
  "log",
  "pollster",
  "sans-core",
+ "serde_json",
  "tempfile",
 ]
 

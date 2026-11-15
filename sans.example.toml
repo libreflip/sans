@@ -2,7 +2,7 @@
 # Copy this file to the normal config path or let Sans generate it there.
 # Every <...> value and zero page-width bound must be commissioned before use.
 
-schema_version = 2
+schema_version = 3
 data_root = "scans"
 
 [boards]
@@ -23,10 +23,10 @@ request_deadline_ms = 100
 urgent_deadline_ms = 50
 
 # The lift axis stays blocked until this table is commissioned. Sans never
-# substitutes a default mechanism value. Limits are bounded by software policy
-# caps of 4.8 A, 1 motor turn per second and 1 motor turn per second squared.
-# Those caps are arbitrary conservative host policy, not measured or physically
-# qualified limits; #60 reviews them. Commissioning does not enable scanning.
+# substitutes a default mechanism value. Sans writes no velocity, acceleration
+# or current limits: the limits stored on the ODrive apply, and Sans reads its
+# current limit and deceleration at connection. Commissioning does not enable
+# scanning.
 # Lift millimetres are 0 at Home and increase downward; set direction so this holds.
 # The tuning values below are provisional until #60 measures them. Each must be
 # positive and finite; the saturation percent is at most 100 and the hold depth
@@ -37,10 +37,6 @@ urgent_deadline_ms = 50
 # mm_per_turn = <positive>
 # travel_minimum_mm = <lower-soft-bound>
 # travel_maximum_mm = <upper-soft-bound>
-# current_limit_a = <at-most-4.8>
-# velocity_limit_mm_s = <at-most-1-turn-per-second>
-# acceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
-# deceleration_limit_mm_s2 = <at-most-1-turn-per-second-squared>
 # position_tolerance_mm = <positive>
 # stationary_velocity_mm_s = <positive>
 # move_timeout_ms = <positive>
@@ -99,8 +95,10 @@ pickup_drop_mbar = 1.2
 confirmation_samples = 3
 
 [motion]
-# These resolved starting values are also immutable maxima; edits may only lower actuation.
-touchdown_press_percent = 50.0
+# The percentages below are also immutable maxima; edits may only lower actuation.
+# The Touchdown press current is in amps and at most the ODrive's own current_lim;
+# it is provisional and unvalidated on hardware until #60 measures it.
+touchdown_press_current_a = 2.0
 classification_start_percent = 10.0
 wiggle_start_percent = 65.0
 wiggle_retreat_percent = 5.0

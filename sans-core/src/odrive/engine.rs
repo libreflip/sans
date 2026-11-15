@@ -9,8 +9,10 @@
 //!
 //! There is no public raw read or write: every write Sans can make is a named
 //! typed command, and Sans never writes control mode, input mode or any stored
-//! configuration other than the gate's limits, and never calls save, erase,
-//! reboot or DFU functions.
+//! configuration, and never calls save, erase, reboot or DFU functions. The
+//! gate writes no limits, so the ODrive's own velocity, acceleration and
+//! current limits apply; the only limit Sans writes is a Touchdown's reduced
+//! press current and its restore.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,12 +21,12 @@ use std::time::{Duration, Instant};
 
 use super::descriptor::{check_capabilities, flatten, value_type, Endpoint, ResolvedEndpoints};
 use super::protocol::{
-    decode_reply, descriptor_crc16, encode_descriptor_read, encode_request, WireValue,
-    AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
+    decode_reply, describe_error_words, descriptor_crc16, encode_descriptor_read, encode_request,
+    WireValue, AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
     AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, DESCRIPTOR_CHUNK_REQUEST_LEN,
     INPUT_MODE_TRAP_TRAJ, SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
 };
-use crate::config::{odrive_profile_problems, LiftAxisProfile, LiftDirection, MotorLimits};
+use crate::config::{odrive_profile_problems, LiftAxisProfile, LiftDirection};
 use crate::MachineProfile;
 
 /// Largest descriptor the engine accepts before blocking the link.
@@ -38,7 +40,7 @@ const COUNT_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CONFIRM_REREAD_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Identity and status reads made once per connection, in order.
-const IDENTITY_READS: [Endpoint; 10] = [
+const IDENTITY_READS: [Endpoint; 12] = [
     Endpoint::SerialNumber,
     Endpoint::HwVersionMajor,
     Endpoint::HwVersionMinor,
@@ -49,6 +51,8 @@ const IDENTITY_READS: [Endpoint; 10] = [
     Endpoint::FwVersionUnreleased,
     Endpoint::VbusVoltage,
     Endpoint::MotorArmedState,
+    Endpoint::CurrentLimit,
+    Endpoint::TrapDecelLimit,
 ];
 
 /// One telemetry cycle reads every telemetry row of the capability table.
@@ -113,9 +117,9 @@ pub enum LinkCommand {
     },
     /// Write `motor.config.current_lim`; confirmed when it reads back the
     /// written value. Accepted only on a verified, unfaulted, commissioned
-    /// link, for a finite positive value at most the commissioned current
-    /// limit; any other value is rejected, never clamped. Not an energizing
-    /// write.
+    /// link, for a finite positive value; any other value is rejected, never
+    /// clamped. The lift module keeps it at most the ODrive's own limit read
+    /// at connection. Not an energizing write.
     SetCurrentLimit {
         /// Motor current limit in amps.
         amps: f32,
@@ -192,6 +196,10 @@ pub struct DiscoveryRecord {
     pub vbus_voltage: Option<f32>,
     /// `motor.armed_state`, raw and uninterpreted.
     pub armed_state: Option<i32>,
+    /// `motor.config.current_lim` in amps, the ODrive's own limit Sans leaves in place.
+    pub current_limit_a: Option<f32>,
+    /// `trap_traj.config.decel_limit` in motor turns per second squared.
+    pub deceleration_turns_per_s2: Option<f32>,
 }
 
 /// A snapshot of link state.
@@ -282,12 +290,71 @@ pub struct TelemetryValues {
 }
 
 impl TelemetryValues {
+    /// Everything but position, velocity and current, which change in motion.
+    fn condition(&self) -> impl PartialEq + '_ {
+        (
+            self.axis_state,
+            [
+                self.axis_error,
+                self.motor_error,
+                self.encoder_error,
+                self.controller_error,
+            ],
+            [
+                self.is_homed,
+                self.min_endstop_pressed,
+                self.motor_calibrated,
+                self.encoder_ready,
+                self.trajectory_done,
+            ],
+            (self.control_mode, self.input_mode),
+        )
+    }
+
+    /// The error words with their upstream flag names.
+    pub fn describe_errors(&self) -> String {
+        describe_error_words(
+            self.axis_error,
+            self.motor_error,
+            self.encoder_error,
+            self.controller_error,
+        )
+    }
+
     fn error_words_zero(&self) -> bool {
         self.axis_error == 0
             && self.motor_error == 0
             && self.encoder_error == 0
             && self.controller_error == 0
     }
+}
+
+/// Log the axis condition on a connection's first sample and whenever it
+/// changes; a warning while any error word is set.
+fn log_condition_change(previous: Option<&TelemetryValues>, values: &TelemetryValues) {
+    if previous.is_some_and(|previous| previous.condition() == values.condition()) {
+        return;
+    }
+    let level = if values.error_words_zero() {
+        log::Level::Info
+    } else {
+        log::Level::Warn
+    };
+    log::log!(
+        level,
+        "ODrive axis {:?}: errors {}; \
+         homed {}, min endstop {}, motor calibrated {}, encoder ready {}, trajectory done {}; \
+         control mode {}, input mode {}",
+        values.axis_state,
+        values.describe_errors(),
+        values.is_homed,
+        values.min_endstop_pressed,
+        values.motor_calibrated,
+        values.encoder_ready,
+        values.trajectory_done,
+        values.control_mode,
+        values.input_mode,
+    );
 }
 
 /// A telemetry sample, readable only while fresh.
@@ -599,7 +666,6 @@ enum GateStep {
     Identity { next: usize, reads: IdentityReads },
     IdleWrite,
     IdleRead { not_before: Instant },
-    Limit { index: usize, readback: bool },
     FirstCycle,
 }
 
@@ -612,7 +678,6 @@ impl GateStep {
             Self::Identity { .. } => "Identity",
             Self::IdleWrite => "IdleWrite",
             Self::IdleRead { .. } => "IdleRead",
-            Self::Limit { .. } => "Limit",
             Self::FirstCycle => "FirstCycle",
         }
     }
@@ -674,6 +739,8 @@ struct IdentityReads {
     firmware: [Option<u8>; 4],
     vbus_voltage: Option<f32>,
     armed_state: Option<i32>,
+    current_limit_a: Option<f32>,
+    deceleration_turns_per_s2: Option<f32>,
 }
 
 impl IdentityReads {
@@ -689,6 +756,10 @@ impl IdentityReads {
             (Endpoint::FwVersionUnreleased, WireValue::U8(v)) => self.firmware[3] = Some(v),
             (Endpoint::VbusVoltage, WireValue::F32(v)) => self.vbus_voltage = Some(v),
             (Endpoint::MotorArmedState, WireValue::I32(v)) => self.armed_state = Some(v),
+            (Endpoint::CurrentLimit, WireValue::F32(v)) => self.current_limit_a = Some(v),
+            (Endpoint::TrapDecelLimit, WireValue::F32(v)) => {
+                self.deceleration_turns_per_s2 = Some(v)
+            }
             (endpoint, value) => {
                 return Err(format!("identity read {endpoint:?} returned {value:?}"));
             }
@@ -1505,31 +1576,7 @@ impl LinkEngine {
                 RequestSpec::Write(Endpoint::RequestedState, WireValue::I32(AXIS_STATE_IDLE))
             }
             GateStep::IdleRead { .. } => RequestSpec::Read(Endpoint::CurrentState),
-            GateStep::Limit { index, readback } => {
-                let (endpoint, value) = self.limit_writes()?[*index];
-                if *readback {
-                    RequestSpec::Read(endpoint)
-                } else {
-                    RequestSpec::Write(endpoint, WireValue::F32(value))
-                }
-            }
         })
-    }
-
-    fn limit_writes(&self) -> Option<[(Endpoint, f32); 5]> {
-        let MotorLimits {
-            current_a,
-            velocity_turns_per_s,
-            acceleration_turns_per_s2,
-            deceleration_turns_per_s2,
-        } = self.config.lift_axis.as_ref()?.motor_limits();
-        Some([
-            (Endpoint::CurrentLimit, current_a),
-            (Endpoint::ControllerVelLimit, velocity_turns_per_s),
-            (Endpoint::TrapVelLimit, velocity_turns_per_s),
-            (Endpoint::TrapAccelLimit, acceleration_turns_per_s2),
-            (Endpoint::TrapDecelLimit, deceleration_turns_per_s2),
-        ])
     }
 
     fn op_request(&self, op: &Operation) -> Option<RequestSpec> {
@@ -1655,14 +1702,11 @@ impl LinkEngine {
                 ))
             }
             LinkCommand::SetCurrentLimit { amps } => {
-                let Some(lift_axis) = self.config.lift_axis.as_ref() else {
+                if self.config.lift_axis.is_none() {
                     return Err("the lift axis is uncommissioned".into());
-                };
-                if !(amps.is_finite() && amps > 0.0 && amps <= lift_axis.current_limit_a) {
-                    return Err(format!(
-                        "current limit {amps} A is not positive, finite and at most the commissioned {} A",
-                        lift_axis.current_limit_a
-                    ));
+                }
+                if !(amps.is_finite() && amps > 0.0) {
+                    return Err(format!("current limit {amps} A is not positive and finite"));
                 }
                 let connection = self.connection.as_ref().expect("checked by caller");
                 if let Some(fault) = &connection.fault {
@@ -2084,56 +2128,15 @@ impl LinkEngine {
                 }
                 if self.config.lift_axis.is_none() {
                     self.fail_gate(Some(
-                        "lift axis is uncommissioned: [odrive.lift_axis] is absent, so no limit was written"
+                        "lift axis is uncommissioned: [odrive.lift_axis] is absent, so positions cannot be converted"
                             .into(),
                     ));
                     if let Some(connection) = self.connection.as_mut() {
                         connection.freshness_reference = Some(now);
                     }
                 } else {
-                    self.set_gate(GateStep::Limit {
-                        index: 0,
-                        readback: false,
-                    });
-                }
-            }
-            (
-                GateStep::Limit {
-                    index,
-                    readback: false,
-                },
-                Reply::Ack,
-            ) => {
-                self.set_gate(GateStep::Limit {
-                    index,
-                    readback: true,
-                });
-            }
-            (
-                GateStep::Limit {
-                    index,
-                    readback: true,
-                },
-                Reply::Value(value),
-            ) => {
-                let limits = self.limit_writes().expect("commissioned");
-                let (endpoint, written) = limits[index];
-                if !same_bits(value, WireValue::F32(written)) {
-                    self.fail_gate(Some(format!(
-                        "{endpoint:?} read back {value:?} after Sans wrote {written}"
-                    )));
-                    return;
-                }
-                if index + 1 < limits.len() {
-                    self.set_gate(GateStep::Limit {
-                        index: index + 1,
-                        readback: false,
-                    });
-                } else {
+                    // The ODrive's own limits apply: the gate writes none.
                     self.set_gate(GateStep::FirstCycle);
-                    if let Some(connection) = self.connection.as_mut() {
-                        connection.next_cycle_at = now;
-                    }
                 }
             }
             (step, reply) => self.fail_gate(Some(format!(
@@ -2200,6 +2203,8 @@ impl LinkEngine {
         };
         record.vbus_voltage = reads.vbus_voltage;
         record.armed_state = reads.armed_state;
+        record.current_limit_a = reads.current_limit_a;
+        record.deceleration_turns_per_s2 = reads.deceleration_turns_per_s2;
         match reads.serial_number {
             Some(board_serial) if board_serial == expected => self.set_gate(GateStep::IdleWrite),
             board_serial => self.fail_gate(Some(format!(
@@ -2247,7 +2252,8 @@ impl LinkEngine {
             values,
         };
         let connection = self.connection.as_mut().expect("connection");
-        connection.latest = Some(sample.clone());
+        let previous = connection.latest.replace(sample.clone());
+        log_condition_change(previous.as_ref().map(|p| &p.values), &sample.values);
         if matches!(connection.gate, Some(GateStep::FirstCycle)) {
             connection.gate = None;
             connection.verified = true;

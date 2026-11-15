@@ -51,9 +51,11 @@
 //!   entry by observing the homing state.
 //! - Home completion (reference): the first fresh sample after that
 //!   confirmation that reads idle. Success needs all four error words zero,
-//!   `is_homed` true, encoder ready, trajectory done, stationary velocity and position within
-//!   the position tolerance of 0. An idle sample without that evidence is a
-//!   clean `HomeFailed`; any other state or the Home timeout is Stop. Upstream
+//!   `is_homed` true, encoder ready and trajectory done; with that evidence
+//!   Home then waits for a stationary sample, wherever the idle axis comes to
+//!   rest, since the encoder tracks it from the reference Home set. An idle
+//!   sample without that evidence is a clean `HomeFailed`; any other state or
+//!   the Home timeout is Stop. Upstream
 //!   clears `is_homed` on entry and sets it true on every exit, including
 //!   after a fault or an interrupting state request, and an interrupted run
 //!   rewrites the encoder count. So `is_homed` alone is never evidence, and an
@@ -97,7 +99,7 @@
 //!   settled position by more than the position tolerance, or Stop or a new
 //!   epoch ends it, no current limit is written and Home and every descent
 //!   are rejected. The first upward move therefore runs at the press limit,
-//!   and the next motion restores the commissioned limit first. A routine
+//!   and the next motion restores the ODrive's own limit first. A routine
 //!   cancel keeps the press limit and the hold. The hold is independent of
 //!   Position trust; without trust the only way out is Stop. Unverified:
 //!   #60 must check that the press current can lift the loaded suction box
@@ -105,6 +107,12 @@
 //!   and becomes Stop, which fails closed.
 //! - Stop (reference): a Disarm, which floats the motor phases upstream. What
 //!   the vertical axis does unpowered is a physical question for #60 and #25.
+//! - ODrive errors (host policy): a fresh sample with any error word set,
+//!   the axis minimum-endstop bit alone on a pressed endstop excepted,
+//!   latches Stop unless a Home is running; a Home that ends with errors is
+//!   `HomeFailed` and the next sample latches Stop. Upstream error words are
+//!   sticky until `clear_errors`, and a set word makes every non-idle state
+//!   exit at once, so Clear Stop is the recovery.
 //! - Stale telemetry: only fresh current-epoch samples count as evidence.
 
 use std::collections::VecDeque;
@@ -203,6 +211,14 @@ pub enum LiftRejection {
     InHold,
     /// Clearing the fault needs a fresh sample reading idle.
     NotIdle,
+    /// The profile's Touchdown press current exceeds the ODrive's own current
+    /// limit, or that limit was not read at connection.
+    PressAboveBoardLimit {
+        /// `motion.touchdown_press_current_a`.
+        press_a: f32,
+        /// The ODrive's `current_lim`, if read.
+        board_a: Option<f32>,
+    },
 }
 
 /// Why Stop latched.
@@ -214,6 +230,9 @@ pub enum StopCause {
     LinkLost(String),
     /// A command or the axis gave no certain outcome.
     Uncertain(String),
+    /// The ODrive reported an error word, the axis minimum-endstop bit alone
+    /// on a pressed endstop excepted. Clear Stop clears it.
+    AxisError(String),
 }
 
 /// A typed operation fault.
@@ -330,6 +349,14 @@ pub struct LiftOperations {
     /// A live hold's own reference, kept apart from trust and `touchdown_mm`.
     live_hold_mm: Option<f32>,
     applied_limit_a: Option<f32>,
+    /// A Touchdown's press limit may still be in force on the board, across
+    /// reconnects too, so the next Home or move restores `board_current_a`.
+    press_limit: bool,
+    /// The ODrive's own `current_lim`, read at connection. It is not re-read
+    /// while a press limit may be in force, so it stays the value to restore.
+    board_current_a: Option<f32>,
+    /// The ODrive's own trajectory deceleration in mm/s², read at connection.
+    board_deceleration_mm_s2: Option<f32>,
     latch: Option<StopCause>,
     stop_disarm: Option<Ticket>,
     stop_confirmed_at: Option<Instant>,
@@ -422,6 +449,9 @@ impl LiftOperations {
             touchdown_mm: None,
             live_hold_mm: None,
             applied_limit_a: None,
+            press_limit: false,
+            board_current_a: None,
+            board_deceleration_mm_s2: None,
             latch: None,
             stop_disarm: None,
             stop_confirmed_at: None,
@@ -733,6 +763,16 @@ impl LiftOperations {
                 Some(previous - self.motion.blower_off_descent_percent / 100.0 * width)
             }
         };
+        let press_a = self.motion.touchdown_press_current_a;
+        if !self
+            .board_current_a
+            .is_some_and(|board_a| press_a <= board_a)
+        {
+            return Err(LiftRejection::PressAboveBoardLimit {
+                press_a,
+                board_a: self.board_current_a,
+            });
+        }
         let axis = self.axis();
         let limit_mm = axis.travel_maximum_mm - axis.touchdown_hold_depth_mm;
         if !(limit_mm >= axis.travel_minimum_mm
@@ -744,7 +784,7 @@ impl LiftOperations {
         Ok(Touchdown {
             start_mm,
             limit_mm,
-            press_a: self.motion.touchdown_press_percent / 100.0 * axis.current_limit_a,
+            press_a,
             cutoff_mm,
         })
     }
@@ -775,12 +815,14 @@ impl LiftOperations {
             let cause = StopCause::Uncertain("Position trust lost before motion".into());
             return self.stop(cause, link);
         }
-        let commissioned_a = self.axis.as_ref().expect("commissioned").current_limit_a;
+        // Otherwise the ODrive's own current limit applies; Sans writes one
+        // only to press during a Touchdown and to undo that press.
+        let restore_a = self.board_current_a.filter(|_| self.press_limit);
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
-            Phase::Home => (Some(commissioned_a), LinkCommand::Home),
+            Phase::Home => (restore_a, LinkCommand::Home),
             Phase::Move { target_mm } => (
-                Some(commissioned_a),
+                restore_a,
                 LinkCommand::MoveAbsolute {
                     position_mm: target_mm,
                 },
@@ -798,6 +840,9 @@ impl LiftOperations {
             Some(amps) if self.applied_limit_a != Some(amps) && self.live_hold_mm.is_none() => {
                 active.limit_a = Some(amps);
                 self.applied_limit_a = None;
+                if matches!(active.phase, Phase::Descend { .. }) {
+                    self.press_limit = true;
+                }
                 self.submit(
                     LinkCommand::SetCurrentLimit { amps },
                     Priority::Ordinary,
@@ -832,11 +877,20 @@ impl LiftOperations {
             return self.stop(cause, link);
         };
         let speed = velocity.abs();
+        let deceleration = self
+            .board_deceleration_mm_s2
+            .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
         let reach = if speed <= axis.stationary_velocity_mm_s {
             0.0
-        } else {
+        } else if let Some(deceleration) = deceleration {
             speed * (self.max_age + self.urgent_deadline).as_secs_f32()
-                + speed * speed / (2.0 * axis.deceleration_limit_mm_s2)
+                + speed * speed / (2.0 * deceleration)
+        } else {
+            let cause = StopCause::Uncertain(
+                "cancel braking reach is unknown: the ODrive deceleration limit was not read"
+                    .into(),
+            );
+            return self.stop(cause, link);
         };
         let end = position + velocity.signum() * reach;
         let inside = |mm: f32| mm >= axis.travel_minimum_mm && mm <= axis.travel_maximum_mm;
@@ -888,6 +942,15 @@ impl LiftOperations {
             self.latest = None;
             self.applied_limit_a = None;
         }
+        if let Some(discovery) = &status.discovery {
+            // Under a press limit the board reads the press current, not its own.
+            if let Some(amps) = discovery.current_limit_a.filter(|_| !self.press_limit) {
+                self.board_current_a = Some(amps);
+            }
+            if let (Some(turns), Some(axis)) = (discovery.deceleration_turns_per_s2, &self.axis) {
+                self.board_deceleration_mm_s2 = Some(turns * axis.mm_per_turn);
+            }
+        }
         self.epoch = status.epoch;
         self.verified = verified;
     }
@@ -933,6 +996,9 @@ impl LiftOperations {
         }
         if let Some(amps) = active.limit_a.take() {
             self.applied_limit_a = Some(amps);
+            if !matches!(active.phase, Phase::Descend { .. }) {
+                self.press_limit = false;
+            }
             return self.submit_phase(link);
         }
         if matches!(active.phase, Phase::Arm) {
@@ -961,6 +1027,16 @@ impl LiftOperations {
         if !self.trusted && self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)) {
             let cause = StopCause::Uncertain("Position trust lost during motion".into());
             return self.stop(cause, link);
+        }
+        // A Home's own errors finish it as `HomeFailed`; the next sample stops.
+        let homing = self
+            .active
+            .as_ref()
+            .is_some_and(|a| matches!(a.phase, Phase::Home | Phase::HomeCancel));
+        if self.latch.is_none() && !homing {
+            if let Some(errors) = odrive_errors(&values) {
+                return self.stop(StopCause::AxisError(errors), link);
+            }
         }
         let (Some(position), Some(velocity)) = (values.position_mm, values.velocity_mm_s) else {
             return;
@@ -1087,6 +1163,19 @@ fn phase_name(phase: &Phase) -> &'static str {
     }
 }
 
+/// The ODrive's error words, or `None` when they are clear. Upstream re-sets
+/// the axis minimum-endstop bit whenever the endstop is pressed outside
+/// homing, so that bit alone on a pressed endstop counts as clear.
+fn odrive_errors(values: &TelemetryValues) -> Option<String> {
+    let only_endstop =
+        values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
+    let clear = (values.axis_error == 0 || only_endstop)
+        && values.motor_error == 0
+        && values.encoder_error == 0
+        && values.controller_error == 0;
+    (!clear).then(|| format!("ODrive errors {}", values.describe_errors()))
+}
+
 /// Judge one fresh sample taken after the active command's confirmation.
 fn sample_step(
     axis: &LiftAxisProfile,
@@ -1142,17 +1231,8 @@ fn sample_step(
     match &mut active.phase {
         Phase::Arm => Step::Wait,
         Phase::Clear => {
-            // Upstream re-sets the endstop bit whenever the endstop is pressed
-            // outside homing, so that bit alone is accepted, as Home accepts it.
-            let only_endstop =
-                values.axis_error == AXIS_ERROR_MIN_ENDSTOP_PRESSED && values.min_endstop_pressed;
             // A moving axis never clears: Stop evidence would be withdrawn.
-            if values.axis_state == AxisState::Idle
-                && stationary
-                && values.motor_error == 0
-                && values.encoder_error == 0
-                && values.controller_error == 0
-                && (values.axis_error == 0 || only_endstop)
+            if values.axis_state == AxisState::Idle && stationary && odrive_errors(values).is_none()
             {
                 Step::Finish(LiftOutcome::Completed(None))
             } else {
@@ -1169,13 +1249,15 @@ fn sample_step(
         Phase::Home => match values.axis_state {
             AxisState::Homing => Step::Wait,
             AxisState::Idle => {
-                if errors_zero
+                let clean = errors_zero
                     && values.is_homed
                     && values.encoder_ready
-                    && values.trajectory_done
-                    && stationary
-                    && position.abs() <= tolerance
-                {
+                    && values.trajectory_done;
+                // The idle axis may still coast; the Home timeout bounds the wait.
+                // Wherever it rests, the encoder tracks it from Home's reference.
+                if clean && !stationary {
+                    Step::Wait
+                } else if clean {
                     Step::Finish(LiftOutcome::Completed(None))
                 } else {
                     Step::Finish(LiftOutcome::Fault(LiftFault::HomeFailed(format!(

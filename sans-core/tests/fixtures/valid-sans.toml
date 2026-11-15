@@ -1,4 +1,4 @@
-schema_version = 2
+schema_version = 3
 data_root = "scan-data"
 
 [boards]
@@ -49,7 +49,7 @@ pickup_drop_mbar = 1.2
 confirmation_samples = 3
 
 [motion]
-touchdown_press_percent = 50.0
+touchdown_press_current_a = 2.0
 classification_start_percent = 10.0
 wiggle_start_percent = 65.0
 wiggle_retreat_percent = 5.0

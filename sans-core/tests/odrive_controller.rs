@@ -16,30 +16,9 @@ use sans_core::{
     SetupDiagnostic, SetupState, StopCause, StopVerdict,
 };
 use support::fake_fibre::*;
-use support::{recv_within, GATE_WAIT};
+use support::{recv_within, with_relaxed_timing, GATE_WAIT, LIFT_AXIS};
 
 const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
-const LIFT_AXIS: &str = r#"
-[odrive.lift_axis]
-direction = "normal"
-mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
-current_limit_a = 4.0
-velocity_limit_mm_s = 6.0
-acceleration_limit_mm_s2 = 4.0
-deceleration_limit_mm_s2 = 2.0
-position_tolerance_mm = 0.5
-stationary_velocity_mm_s = 0.2
-move_timeout_ms = 2000
-home_timeout_ms = 3000
-cancel_timeout_ms = 1000
-touchdown_grace_ms = 100
-touchdown_dwell_ms = 100
-touchdown_no_progress_mm = 1.0
-touchdown_saturation_percent = 90.0
-touchdown_hold_depth_mm = 2.0
-"#;
 
 /// A camera that fails every capture, after waiting for its gate.
 struct FailingCamera(CameraRole, Arc<Mutex<()>>);
@@ -118,25 +97,6 @@ struct Started {
     _temp: tempfile::TempDir,
 }
 
-/// Widest timing the profile bounds allow. These tests check behaviour through
-/// real threads, including under the emulated aarch64 cross job, not timing.
-fn with_relaxed_timing(profile: &str) -> String {
-    let relaxed = [
-        ("poll_interval_ms = 20", "poll_interval_ms = 100"),
-        ("telemetry_max_age_ms = 100", "telemetry_max_age_ms = 250"),
-        ("request_deadline_ms = 100", "request_deadline_ms = 250"),
-        ("urgent_deadline_ms = 50", "urgent_deadline_ms = 100"),
-        ("device_open_ms = 5000", "device_open_ms = 60000"),
-    ];
-    relaxed
-        .iter()
-        .fold(profile.to_string(), |profile, (from, to)| {
-            let replaced = profile.replacen(from, to, 1);
-            assert_ne!(replaced, profile, "{from}");
-            replaced
-        })
-}
-
 fn start(profile: &str, opener: FakeOpener, cameras_ready: bool) -> Started {
     let temp = tempfile::tempdir().unwrap();
     let path: PathBuf = temp.path().join("sans.toml");
@@ -180,7 +140,7 @@ fn camera_preview_ready(screen: &MachineScreen) -> bool {
 #[test]
 fn invalid_or_version_1_profile_never_asks_the_factory_for_the_odrive_opener() {
     for profile in [
-        VALID_PROFILE.replace("schema_version = 2", "schema_version = 1"),
+        VALID_PROFILE.replace("schema_version = 3", "schema_version = 1"),
         VALID_PROFILE.replace("poll_interval_ms = 20", "poll_interval_ms = 1"),
     ] {
         let temp = tempfile::tempdir().unwrap();
@@ -220,10 +180,8 @@ fn compatible_device_and_commissioned_profile_reach_verified_with_the_preview_re
 
     assert_eq!(snapshot.lift_axis.epoch, 1);
     assert!(camera_preview_ready(&snapshot.screen));
-    assert!(matches!(
-        snapshot.scan_readiness,
-        ScanReadiness::Disabled { .. }
-    ));
+    // Live gates pass; Home still needs the operator's consent.
+    assert_eq!(snapshot.scan_readiness, ScanReadiness::Enabled);
     let discovery = snapshot.lift_axis.discovery.as_ref().unwrap();
     assert_eq!(discovery.descriptor_crc, Some(39744));
     assert_eq!(discovery.endpoint_count, Some(535));
@@ -236,17 +194,8 @@ fn compatible_device_and_commissioned_profile_reach_verified_with_the_preview_re
     assert_eq!(telemetry.values.position_mm, Some(0.0));
     let board = started.opener.board.lock().unwrap();
     let writes: Vec<u16> = board.writes.iter().map(|(endpoint, _)| *endpoint).collect();
-    assert_eq!(
-        writes,
-        vec![
-            REQUESTED_STATE,
-            CURRENT_LIM,
-            CONTROLLER_VEL_LIMIT,
-            TRAP_VEL_LIMIT,
-            TRAP_ACCEL_LIMIT,
-            TRAP_DECEL_LIMIT,
-        ]
-    );
+    // The ODrive's own limits apply: the gate writes only the idle request.
+    assert_eq!(writes, vec![REQUESTED_STATE]);
     assert_eq!(board.requested_states(), vec![1]);
 }
 
@@ -344,10 +293,7 @@ fn cutting_the_connection_then_reconnecting_reaches_verified_in_epoch_2_without_
         snapshot.lift_axis.phase == LinkPhase::Verified && snapshot.lift_axis.epoch == 2
     });
 
-    assert!(matches!(
-        reconnected.scan_readiness,
-        ScanReadiness::Disabled { .. }
-    ));
+    assert_eq!(reconnected.scan_readiness, ScanReadiness::Enabled);
     let board = started.opener.board.lock().unwrap();
     assert_eq!(board.requested_states(), vec![1, 1]);
     assert!(board.writes_to(INPUT_POS).is_empty());
@@ -446,20 +392,8 @@ fn stop_intent_confirms_on_both_boards_then_clear_stop_unlatches_without_arming(
 }
 
 #[test]
-fn physical_button_and_a_lost_machine_each_stop_the_machine() {
-    let started = verified();
-    started
-        .machine_events
-        .send(MachineEvent::StopButton)
-        .unwrap();
-    let pressed = recv_within(&started.controller, GATE_WAIT, |snapshot| {
-        snapshot.stop.is_some()
-    });
-    assert_eq!(
-        pressed.stop.unwrap().cause,
-        StopCause::Requested("physical button".into())
-    );
-
+fn a_lost_machine_stops_the_machine() {
+    // The physical button's state-dependent meaning is covered in scan_workflow.rs.
     let started = verified();
     started
         .machine_events

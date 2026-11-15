@@ -31,7 +31,10 @@ pub(super) fn setup_state(
 }
 
 pub(super) enum MachineRequest {
+    /// A diagnostic capture that lights itself.
     CapturePair,
+    /// A Scan session capture under the light the controller switched on.
+    SessionCapture,
 }
 
 /// Run the factory on its own thread: open the board, then the Cameras,
@@ -78,6 +81,9 @@ pub(super) fn spawn_machine<Factory: MachineFactory>(
                 let sent = match received.recv_timeout(SETUP_POLL_INTERVAL) {
                     Ok(MachineRequest::CapturePair) => {
                         inbox.send(Inbox::Captured(machine.capture_pair()))
+                    }
+                    Ok(MachineRequest::SessionCapture) => {
+                        inbox.send(Inbox::Captured(machine.capture_session_pair()))
                     }
                     Err(RecvTimeoutError::Timeout) => match Factory::poll_machine(&mut machine) {
                         None => Ok(()),
