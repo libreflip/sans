@@ -2044,10 +2044,10 @@ fn stop_during_torque_entry_discards_stages_even_after_the_late_reply() {
 }
 
 #[test]
-fn torque_touchdown_rejects_invalid_speed_or_unachievable_current_without_writes() {
+fn torque_touchdown_rejects_speed_outside_native_limits_without_writes() {
     let mut rig = armed();
     let mark = rig.board.writes.len();
-    for speed in [0.0, -1.0, f32::NAN, f32::INFINITY, 8.1, 0.1] {
+    for speed in [0.0, -1.0, f32::NAN, f32::INFINITY, 8.1] {
         assert!(matches!(
             rig.start(
                 Touchdown {
@@ -2271,4 +2271,43 @@ fn malformed_telemetry_between_torque_stages_sends_no_further_setup_writes() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
+}
+
+#[test]
+fn torque_touchdown_allows_the_firmware_limiter_to_reduce_press_current() {
+    let profile = LIFT_AXIS.replace("mm_per_turn = 8.0", "mm_per_turn = 5.0");
+    let mut rig = Rig::new(&profile);
+    rig.board.set_f32(VEL_GAIN, 0.01);
+    rig.connect();
+    home(&mut rig);
+    arm(&mut rig);
+    // Both combinations will clip current in firmware. They remain explicit
+    // operator choices within the board's current and velocity ceilings.
+    for speed in [5.0, 0.1] {
+        let id = rig
+            .start(
+                Touchdown {
+                    press_current_a: 1.0,
+                    velocity_limit_mm_s: Some(speed),
+                    post_turn_page_width_mm: None,
+                },
+                Off,
+            )
+            .unwrap();
+        assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&1.0));
+        assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&-0.1));
+        assert_eq!(
+            rig.f32_writes(CONTROLLER_VEL_LIMIT).last(),
+            Some(&(speed / 5.0))
+        );
+        assert_eq!(rig.outcome(id), None);
+        assert!(rig.ops.status().latch.is_none());
+        rig.cancel(id);
+        rig.trajectory_done();
+        rig.run_for(25);
+        assert!(matches!(
+            rig.outcome(id),
+            Some(LiftOutcome::Cancelled { .. })
+        ));
+    }
 }

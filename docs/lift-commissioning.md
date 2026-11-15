@@ -27,8 +27,8 @@ fields removed and `motion.touchdown_press_percent` replaced by
 Set current, speed and acceleration limits on the ODrive. The tool uses those
 board limits. Touchdown uses current/torque mode with the firmware velocity
 limiter; its current and optional speed cannot exceed the board's limits. Omitted
-speed uses the lower controller/trajectory limit. The current must also fit the
-board's velocity gain at that speed; a rejected combination prints the reason.
+speed uses the lower controller/trajectory limit. The firmware may reduce actual
+current to enforce that speed, including while stationary.
 Contact hold keeps the torque and monitors downward drift against
 `touchdown_hold_depth_mm`. Cancel and lift-away restore position control.
 

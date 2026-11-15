@@ -265,9 +265,8 @@ impl TorqueSettings {
             );
         }
         let torque = amps * self.torque_constant;
-        let available = self.velocity_gain * speed;
-        if !torque.is_finite() || !available.is_finite() || torque > available {
-            return Err("Touchdown current exceeds the torque available at this velocity limit and velocity gain".into());
+        if !torque.is_finite() {
+            return Err("Touchdown current converts to non-finite torque".into());
         }
         Ok(())
     }
