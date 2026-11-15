@@ -18,15 +18,19 @@ The bought 20-tooth T2.5 pulley gives 20 × 2.5 = 50 mm per pulley revolution.
 With the 10:1 reduction, use `mm_per_turn = 5.0` for that pulley.
 Keep this value positive; `direction` handles the sign.
 
-Profiles now use schema version 3. To convert a version 2 lift profile, flip
-`direction` and set `new_min = -old_max`, `new_max = -old_min`. Leave positive
-speed, current and distance magnitudes unchanged. With no lift section, only
-the schema number needs changing.
+Profiles now use schema version 4. For positive-down bounds, flip `direction`
+and set `new_min = -old_max`, `new_max = -old_min`. Keep already negative-down
+bounds unchanged. Version 2 profiles also need the old current/speed limit
+fields removed and `motion.touchdown_press_percent` replaced by
+`motion.touchdown_press_current_a` in amps; compare with the current template.
 
-The code currently caps current at 4.8 A, speed at 1 motor turn/s, and
-acceleration/deceleration at 1 motor turn/s². These are provisional software
-choices, not measured machine limits. Start with settings suitable for your
-mechanism; the profile can lower these caps.
+Set current, speed and acceleration limits on the ODrive. The tool uses those
+board limits. Touchdown uses current/torque mode with the firmware velocity
+limiter; its current and optional speed cannot exceed the board's limits. Omitted
+speed uses the lower controller/trajectory limit. The current must also fit the
+board's velocity gain at that speed; a rejected combination prints the reason.
+Contact hold keeps the torque and monitors downward drift against
+`touchdown_hold_depth_mm`. Cancel and lift-away restore position control.
 
 ```sh
 mkdir -p sans-core/test-results/commissioning
@@ -55,7 +59,7 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | `arm` | Enable the motor, as a separate action. |
 | `disarm` | Idle the motor when no operation is active; loses Position trust. |
 | `move -10` | Move down to absolute position -10 mm. |
-| `touchdown 1.0` | Lower to contact and hold with a 1 A current limit, up to the profile's press limit. |
+| `touchdown 1.0 5` | Press at 1 A in torque mode with a 5 mm/s firmware velocity limit. Speed is optional. |
 | `lift -5` | Lift to absolute position -5 mm, which must be above the current position. |
 | `cancel` | Cancel the current operation; a press hold may remain active. |
 | `stop` or blank Enter | Stop the lift and switch the air actuators off. |
@@ -63,17 +67,19 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | `status` or `help` | Show state, position, current, sample age and commands. |
 | `quit`, EOF or Ctrl-C | Request Stop and wait for its verdict before exiting. |
 
-Touchdown's current ceiling is `current_limit_a × touchdown_press_percent / 100`.
-
 ## Try it
 
 1. Run `home`, then `arm`, waiting for each to finish. Try a short move and
    check direction and distance before moving farther.
-2. Try `touchdown <amps>` on scrap material, then `lift` away. Check that contact
+2. Try `touchdown <amps> [mm/s]` on scrap material, then `lift` away. Check that contact
    detection and press hold work, and that the press current can lift the load.
 3. Try `cancel`, `stop` and the physical button during motion. After a Confirmed
    Stop, recover with separate `clear-fault`, `home` and `arm` commands. If Stop
    is Unconfirmed, switch off power and check the machine before continuing.
+
+A crash can leave temporary limits in board RAM. Check the board limits before
+restarting a run. Torque mode has no trajectory acceleration ramp; check its
+entry, stop distance and overspeed behavior on the machine.
 
 Keep the CSV and a short note of what worked or failed. It already records the
 profile, telemetry, commands and Stop results. The 100 ms dispatch and 500 ms

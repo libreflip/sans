@@ -41,7 +41,7 @@ touchdown_no_progress_mm = 1.0
 touchdown_saturation_percent = 90.0
 touchdown_hold_depth_mm = 2.0
 "#;
-/// 50% of the 4 A commissioned limit.
+/// Test press current, below the fake board's 4.8 A limit.
 const PRESS_A: f32 = 2.0;
 
 struct Rig {
@@ -285,6 +285,15 @@ impl Rig {
             .collect()
     }
 
+    fn i32_writes(&self, endpoint: u16) -> Vec<i32> {
+        self.board
+            .writes
+            .iter()
+            .filter(|(id, _)| *id == endpoint)
+            .map(|(_, bytes)| i32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
+            .collect()
+    }
+
     fn f32_writes(&self, endpoint: u16) -> Vec<f32> {
         self.board
             .writes_to(endpoint)
@@ -373,14 +382,13 @@ fn armed_with(lift_axis: &str) -> Rig {
 }
 
 /// Start a Touchdown, descend past the grace and stall at `contact_mm`
-/// until the hold move is written.
+/// through the contact dwell, before the second hold dwell finishes.
 fn descend_to_contact(rig: &mut Rig, request: LiftRequest, contact_mm: f32) -> OperationId {
     let id = rig.start(request, Off).unwrap();
-    let moves = rig.moves().len();
     rig.axis(contact_mm + 50.0, -5.0, -PRESS_A);
     rig.run_for(150);
     rig.axis(contact_mm, 0.0, -PRESS_A);
-    rig.run_until(300, |rig| rig.moves().len() == moves + 1);
+    rig.run_for(120);
     id
 }
 
@@ -390,6 +398,7 @@ fn touched_down() -> Rig {
         &mut rig,
         Touchdown {
             press_current_a: PRESS_A,
+            velocity_limit_mm_s: None,
             post_turn_page_width_mm: None,
         },
         -200.0,
@@ -499,17 +508,18 @@ fn touchdown_descends_negative_and_lift_away_returns_toward_zero() {
         .start(
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: None,
             },
             Off,
         )
         .unwrap();
-    assert_eq!(rig.moves(), vec![-298.0]);
+    assert_eq!(rig.moves(), vec![0.0]);
     rig.axis(-150.0, -5.0, -PRESS_A);
     rig.run_for(150);
     rig.axis(-200.0, 0.0, -PRESS_A);
     rig.run_for(150);
-    assert_eq!(rig.moves(), vec![-298.0, -202.0]);
+    assert_eq!(rig.moves(), vec![0.0]);
     rig.axis(-200.4, 0.0, -1.9);
     rig.run_for(150);
     assert!(matches!(
@@ -741,6 +751,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         (
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: None,
             },
             Unknown,
@@ -749,6 +760,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         (
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: Some(351.0),
             },
             Off,
@@ -791,6 +803,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         untrusted.start(
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: None
             },
             Off
@@ -810,7 +823,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
 fn a_move_writes_no_current_limit_so_the_odrives_own_applies() {
     let mut rig = armed();
     let mark = rig.board.writes.len();
-    let id = rig.start(MoveTo { position_mm: 10.0 }, Off).unwrap();
+    let id = rig.start(MoveTo { position_mm: -10.0 }, Off).unwrap();
     rig.run_for(5);
     assert_eq!(rig.write_order_since(mark), vec![INPUT_POS]);
     arrive(&mut rig);
@@ -1059,6 +1072,7 @@ fn touchdown_uses_requested_current_for_contact_hold_and_lift_away() {
         .start(
             Touchdown {
                 press_current_a: 1.0,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: None,
             },
             Off,
@@ -1068,8 +1082,8 @@ fn touchdown_uses_requested_current_for_contact_hold_and_lift_away() {
     rig.axis(-150.0, -5.0, -0.95);
     rig.run_for(150);
     rig.axis(-200.0, 0.0, -0.95);
-    rig.run_until(300, |rig| rig.moves().len() == 2);
-    assert_eq!(rig.moves(), vec![-298.0, -202.0]);
+    rig.run_for(120);
+    assert_eq!(rig.moves(), vec![0.0]);
     rig.axis(-200.4, 0.0, -0.95);
     rig.run_for(150);
     assert_eq!(
@@ -1077,7 +1091,7 @@ fn touchdown_uses_requested_current_for_contact_hold_and_lift_away() {
         Some(LiftOutcome::Completed(Some(TouchdownHold {
             position_mm: -200.4,
             press_current_a: 1.0,
-            hold_target_mm: -202.0,
+            hold_limit_mm: -202.0,
         })))
     );
     let mark = rig.board.writes.len();
@@ -1088,27 +1102,41 @@ fn touchdown_uses_requested_current_for_contact_hold_and_lift_away() {
         Unknown,
     )
     .unwrap();
-    assert_eq!(rig.write_order_since(mark), vec![INPUT_POS]);
+    assert_eq!(
+        rig.write_order_since(mark),
+        vec![
+            INPUT_VEL,
+            INPUT_POS,
+            CONTROL_MODE,
+            INPUT_TORQUE,
+            INPUT_MODE,
+            CONTROLLER_VEL_LIMIT,
+            CURRENT_MODE_VEL_LIMIT,
+            INPUT_POS
+        ]
+    );
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&1.0));
     arrive(&mut rig);
     rig.start(MoveTo { position_mm: -50.0 }, Unknown).unwrap();
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
 }
 
 #[test]
 fn touchdown_rejects_invalid_or_excessive_requested_current_without_writes() {
     let mut rig = armed();
     let writes = rig.board.writes.len();
-    for current_a in [0.0, -1.0, f32::NAN, f32::INFINITY, 2.01, 4.0] {
+    for current_a in [0.0, -1.0, f32::NAN, f32::INFINITY, 4.81, 5.0] {
         assert!(matches!(
             rig.start(
                 Touchdown {
                     press_current_a: current_a,
+                    velocity_limit_mm_s: None,
                     post_turn_page_width_mm: None,
                 },
                 Off
             ),
-            Err(LiftRejection::InvalidPressCurrent { maximum_a: 2.0, .. })
+            Err(LiftRejection::InvalidPressCurrent { maximum_a: 4.8, .. }
+                | LiftRejection::PressAboveBoardLimit { .. })
         ));
         assert_eq!(rig.board.writes.len(), writes);
         assert!(rig.ops.status().active.is_none());
@@ -1123,18 +1151,28 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
         .start(
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: None,
             },
             Off,
         )
         .unwrap();
-    assert_eq!(rig.write_order_since(mark), vec![CURRENT_LIM, INPUT_POS]);
-    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     assert_eq!(
-        rig.moves(),
-        vec![-298.0],
-        "travel minimum plus the hold depth"
+        rig.write_order_since(mark),
+        vec![
+            CURRENT_LIM,
+            INPUT_POS,
+            INPUT_VEL,
+            INPUT_TORQUE,
+            CONTROLLER_VEL_LIMIT,
+            CURRENT_MODE_VEL_LIMIT,
+            INPUT_MODE,
+            CONTROL_MODE,
+            INPUT_TORQUE
+        ]
     );
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
+    assert_eq!(rig.moves(), vec![0.0], "travel minimum plus the hold depth");
 
     // Saturated and stationary during the 100 ms grace is not contact: a
     // window may open only when it ends, so 140 ms is short of its dwell.
@@ -1147,7 +1185,7 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
 
     rig.axis(-200.0, 0.0, -PRESS_A);
     let set_at = rig.now;
-    rig.run_until(300, |rig| rig.moves().len() == 2);
+    rig.run_for(120);
     let first_stalled = rig
         .link_events
         .iter()
@@ -1156,10 +1194,14 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(rig.now - first_stalled, Duration::from_millis(100));
-    assert_eq!(rig.moves()[1], -202.0, "contact minus the hold depth");
+    assert!(rig.now - first_stalled >= Duration::from_millis(100));
+    assert_eq!(
+        rig.moves(),
+        vec![0.0],
+        "contact keeps torque without a deeper position target"
+    );
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
-    assert_eq!(rig.write_order_since(mark).last(), Some(&INPUT_POS));
+    assert_eq!(rig.write_order_since(mark).last(), Some(&INPUT_TORQUE));
 
     rig.axis(-200.4, 0.0, -1.9);
     rig.run_for(90);
@@ -1171,7 +1213,7 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
         Some(LiftOutcome::Completed(Some(TouchdownHold {
             position_mm: -200.4,
             press_current_a: PRESS_A,
-            hold_target_mm: -202.0,
+            hold_limit_mm: -202.0,
         })))
     );
     assert_eq!(rig.ops.status().touchdown_mm, Some(-200.4));
@@ -1184,6 +1226,7 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
         &mut rig,
         Touchdown {
             press_current_a: PRESS_A,
+            velocity_limit_mm_s: None,
             post_turn_page_width_mm: None,
         },
         -200.0,
@@ -1193,7 +1236,7 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
     rig.trajectory_done();
     rig.run_for(25);
     // The routine cancel moves to the sampled position and settles.
-    assert_eq!(rig.moves(), vec![-298.0, -202.0, -202.0]);
+    assert_eq!(rig.moves(), vec![0.0, -202.0, -202.0]);
     rig.trajectory_done();
     rig.run_for(25);
 
@@ -1220,11 +1263,12 @@ fn touchdown_ending(
 ) -> OperationId {
     let request = Touchdown {
         press_current_a: PRESS_A,
+        velocity_limit_mm_s: None,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
     rig.axis(position_mm, velocity_mm_s, iq_a);
-    rig.run_until(ms, |rig| rig.moves().len() == 2);
+    rig.run_until(ms, |rig| rig.moves().len() >= 3);
     rig.axis(position_mm, 0.0, iq_a);
     rig.trajectory_done();
     rig.run_for(25);
@@ -1237,7 +1281,7 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
     // Arrival at the descent limit, even saturated.
     let mut rig = armed();
     let exhausted = touchdown_ending(&mut rig, -297.6, 0.0, -PRESS_A, 100);
-    assert_eq!(rig.moves(), vec![-298.0, -297.6]);
+    assert_eq!(rig.moves(), vec![0.0, -297.6, -297.6]);
     // Permanent stiction at the start.
     let mut stuck = armed();
     let no_progress = touchdown_ending(&mut stuck, -0.3, 0.0, -PRESS_A, 400);
@@ -1263,6 +1307,7 @@ fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
 
     let request = Touchdown {
         press_current_a: PRESS_A,
+        velocity_limit_mm_s: None,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
@@ -1271,7 +1316,7 @@ fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
 
     // -12 mm is above the -20 mm travel maximum: no hold write, and with the
     // axis outside travel the cancel cannot run either.
-    assert_eq!(rig.moves(), vec![-298.0]);
+    assert_eq!(rig.moves(), vec![0.0]);
     assert!(
         matches!(rig.outcome(id), Some(LiftOutcome::Fault(_))),
         "{:?}",
@@ -1284,6 +1329,7 @@ fn dropped_telemetry_during_touchdown_ends_in_stop_never_contact() {
     let mut rig = armed();
     let request = Touchdown {
         press_current_a: PRESS_A,
+        velocity_limit_mm_s: None,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
@@ -1292,7 +1338,7 @@ fn dropped_telemetry_during_touchdown_ends_in_stop_never_contact() {
     rig.axis(-200.0, 0.0, -PRESS_A);
     rig.run_for(300);
 
-    assert_eq!(rig.moves(), vec![-298.0]);
+    assert_eq!(rig.moves(), vec![0.0]);
     assert!(
         matches!(
             rig.outcome(id),
@@ -1346,6 +1392,7 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
         .start(
             Touchdown {
                 press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
                 post_turn_page_width_mm: Some(150.0),
             },
             Off,
@@ -1383,12 +1430,13 @@ fn reversed() -> String {
 
 #[test]
 fn touchdown_detects_contact_from_descent_current_only_in_both_directions() {
-    for (profile, native_hold_turns) in [(LIFT_AXIS.to_owned(), -25.25), (reversed(), 25.25)] {
+    for (profile, torque) in [(LIFT_AXIS.to_owned(), -0.2), (reversed(), 0.2)] {
         let mut rig = armed_with(&profile);
         let id = rig
             .start(
                 Touchdown {
                     press_current_a: PRESS_A,
+                    velocity_limit_mm_s: None,
                     post_turn_page_width_mm: None,
                 },
                 Off,
@@ -1398,13 +1446,13 @@ fn touchdown_detects_contact_from_descent_current_only_in_both_directions() {
         // Saturated torque opposing the descent is never contact.
         rig.axis(-100.0, 0.0, PRESS_A);
         rig.run_for(200);
-        assert_eq!(rig.moves(), vec![-298.0]);
+        assert_eq!(rig.moves(), vec![0.0]);
         assert_eq!(rig.outcome(id), None);
 
         rig.axis(-200.0, 0.0, -PRESS_A);
-        rig.run_until(300, |rig| rig.moves().len() == 2);
-        assert_eq!(rig.moves()[1], -202.0);
-        assert_eq!(rig.f32_writes(INPUT_POS)[1], native_hold_turns);
+        rig.run_for(120);
+        assert_eq!(rig.moves(), vec![0.0]);
+        assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&torque));
         rig.axis(-200.4, 0.0, -1.9);
         rig.run_for(150);
         assert_eq!(
@@ -1412,7 +1460,7 @@ fn touchdown_detects_contact_from_descent_current_only_in_both_directions() {
             Some(LiftOutcome::Completed(Some(TouchdownHold {
                 position_mm: -200.4,
                 press_current_a: PRESS_A,
-                hold_target_mm: -202.0,
+                hold_limit_mm: -202.0,
             })))
         );
     }
@@ -1522,6 +1570,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     );
     let touchdown = Touchdown {
         press_current_a: PRESS_A,
+        velocity_limit_mm_s: None,
         post_turn_page_width_mm: None,
     };
     assert_eq!(rig.start(touchdown, Off), Err(LiftRejection::InHold));
@@ -1543,7 +1592,19 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
             Unknown,
         )
         .unwrap();
-    assert_eq!(rig.write_order_since(writes), vec![INPUT_POS]);
+    assert_eq!(
+        rig.write_order_since(writes),
+        vec![
+            INPUT_VEL,
+            INPUT_POS,
+            CONTROL_MODE,
+            INPUT_TORQUE,
+            INPUT_MODE,
+            CONTROLLER_VEL_LIMIT,
+            CURRENT_MODE_VEL_LIMIT,
+            INPUT_POS
+        ]
+    );
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     arrive(&mut rig);
     assert_eq!(rig.outcome(leg), Some(LiftOutcome::Completed(None)));
@@ -1637,6 +1698,8 @@ fn a_touchdown_press_above_the_odrives_own_current_limit_is_rejected() {
     arm(&mut rig);
 
     let request = Touchdown {
+        press_current_a: PRESS_A,
+        velocity_limit_mm_s: None,
         post_turn_page_width_mm: None,
     };
     assert_eq!(
@@ -1881,4 +1944,331 @@ fn a_stop_the_lift_module_repeats_on_its_own_is_a_new_attempt() {
 
     assert_eq!(rig.relay_calls.len(), 2);
     assert!(rig.ops.status().latch.is_some());
+}
+
+#[test]
+fn torque_touchdown_limits_speed_and_restores_position_control_on_cancel() {
+    let mut rig = armed();
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: 1.0,
+                velocity_limit_mm_s: Some(4.0),
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.run_for(25);
+    assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&-0.1));
+    assert_eq!(rig.f32_writes(CONTROLLER_VEL_LIMIT).last(), Some(&0.5));
+    assert_eq!(rig.i32_writes(CONTROL_MODE).last(), Some(&1));
+    rig.axis(-20.0, 0.0, -1.0);
+    rig.run_for(25);
+    rig.cancel(id);
+    rig.trajectory_done();
+    rig.run_for(25);
+    assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&0.0));
+    assert_eq!(rig.i32_writes(CONTROL_MODE).last(), Some(&3));
+    assert_eq!(rig.f32_writes(CONTROLLER_VEL_LIMIT).last(), Some(&1.0));
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Cancelled { .. })
+    ));
+}
+
+#[test]
+fn cancel_during_torque_entry_retires_the_remaining_press_writes() {
+    let mut rig = armed();
+    rig.board.fault_next(INPUT_TORQUE, ReplyFault::Hold);
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: Some(4.0),
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    assert_eq!(rig.f32_writes(INPUT_TORQUE), vec![0.0]);
+    rig.cancel(id);
+    for reply in rig.board.take_held() {
+        rig.engine.receive(rig.now, &reply);
+    }
+    rig.settle();
+    rig.trajectory_done();
+    rig.run_for(25);
+    assert!(rig
+        .f32_writes(INPUT_TORQUE)
+        .iter()
+        .all(|torque| *torque == 0.0));
+    assert_eq!(rig.i32_writes(CONTROL_MODE).last(), Some(&3));
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Cancelled { .. })
+    ));
+    assert!(rig.ops.status().latch.is_none());
+}
+
+#[test]
+fn stop_during_torque_entry_discards_stages_even_after_the_late_reply() {
+    let mut rig = armed();
+    rig.board.fault_next(CONTROLLER_VEL_LIMIT, ReplyFault::Hold);
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: Some(4.0),
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.machine_stop();
+    let mark = rig.board.writes.len();
+    for reply in rig.board.take_held() {
+        rig.engine.receive(rig.now, &reply);
+    }
+    rig.settle();
+    rig.run_for(25);
+    assert_eq!(rig.board.writes.len(), mark);
+    assert_eq!(rig.board.writes.last().unwrap().0, REQUESTED_STATE);
+    assert_eq!(rig.board.requested_states().last(), Some(&1));
+    assert!(rig
+        .f32_writes(INPUT_TORQUE)
+        .iter()
+        .all(|torque| *torque == 0.0));
+    assert_eq!(rig.finishes(id).len(), 1);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+}
+
+#[test]
+fn torque_touchdown_rejects_invalid_speed_or_unachievable_current_without_writes() {
+    let mut rig = armed();
+    let mark = rig.board.writes.len();
+    for speed in [0.0, -1.0, f32::NAN, f32::INFINITY, 8.1, 0.1] {
+        assert!(matches!(
+            rig.start(
+                Touchdown {
+                    press_current_a: PRESS_A,
+                    velocity_limit_mm_s: Some(speed),
+                    post_turn_page_width_mm: None,
+                },
+                Off
+            ),
+            Err(LiftRejection::TorqueSettings(_))
+        ));
+        assert_eq!(rig.board.writes.len(), mark);
+    }
+}
+
+#[test]
+fn torque_touchdown_defaults_to_the_lower_native_speed_limit() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_f32(TRAP_VEL_LIMIT, 0.5);
+    rig.connect();
+    home(&mut rig);
+    arm(&mut rig);
+    rig.start(
+        Touchdown {
+            press_current_a: PRESS_A,
+            velocity_limit_mm_s: None,
+            post_turn_page_width_mm: None,
+        },
+        Off,
+    )
+    .unwrap();
+    assert_eq!(rig.f32_writes(CONTROLLER_VEL_LIMIT).last(), Some(&0.5));
+    assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&-0.2));
+}
+
+#[test]
+fn torque_speed_readback_failure_stops_before_pressing() {
+    let mut rig = armed();
+    rig.board
+        .readback_override
+        .insert(CONTROLLER_VEL_LIMIT, 1.0_f32.to_le_bytes().to_vec());
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: Some(4.0),
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.run_for(25);
+    assert!(rig
+        .f32_writes(INPUT_TORQUE)
+        .iter()
+        .all(|torque| *torque == 0.0));
+    assert!(rig.i32_writes(CONTROL_MODE).is_empty());
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+}
+
+#[test]
+fn a_completed_torque_hold_still_stops_if_contact_gives_way() {
+    let mut rig = touched_down();
+    rig.axis(-203.0, -1.0, -PRESS_A);
+    rig.run_for(25);
+    assert!(rig.ops.status().latch.is_some());
+    assert_eq!(rig.board.requested_states().last(), Some(&1));
+    assert_eq!(rig.relay_calls.len(), 1);
+}
+
+#[test]
+fn home_after_a_torque_stop_recovers_even_outside_normal_travel() {
+    let mut rig = touched_down();
+    rig.axis(-301.0, 0.0, 0.0);
+    rig.run_for(50);
+    assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
+    rig.clear_stop().unwrap();
+    rig.run_until(100, |rig| rig.ops.status().latch.is_none());
+    let mark = rig.board.writes.len();
+    let id = rig.start(Home, Unknown).unwrap();
+    assert!(!rig.write_order_since(mark).contains(&INPUT_POS));
+    assert_eq!(rig.board.requested_states().last(), Some(&11));
+    assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&0.0));
+    finish_home(&mut rig);
+    rig.run_for(25);
+    assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
+}
+
+#[test]
+fn reversed_motor_current_direction_does_not_reverse_the_torque_command() {
+    for (profile, torque) in [(LIFT_AXIS.to_owned(), -0.2), (reversed(), 0.2)] {
+        let mut rig = Rig::new(&profile);
+        rig.board.set_i32(MOTOR_DIRECTION, -1);
+        rig.connect();
+        home(&mut rig);
+        arm(&mut rig);
+        let id = rig
+            .start(
+                Touchdown {
+                    press_current_a: PRESS_A,
+                    velocity_limit_mm_s: None,
+                    post_turn_page_width_mm: None,
+                },
+                Off,
+            )
+            .unwrap();
+        assert_eq!(rig.f32_writes(INPUT_TORQUE).last(), Some(&torque));
+        rig.axis(-200.0, 0.0, PRESS_A); // motor direction -1 reverses native Iq
+        rig.run_until(500, |rig| rig.outcome(id).is_some());
+        assert!(matches!(
+            rig.outcome(id),
+            Some(LiftOutcome::Completed(Some(_)))
+        ));
+        assert!(rig.ops.status().latch.is_none());
+    }
+}
+
+#[test]
+fn cancelling_lift_away_ends_torque_hold_without_latching_stop() {
+    let mut rig = touched_down();
+    let id = rig
+        .start(
+            MoveTo {
+                position_mm: -100.0,
+            },
+            Unknown,
+        )
+        .unwrap();
+    rig.cancel(id);
+    rig.trajectory_done();
+    rig.run_for(50);
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Cancelled { .. })
+    ));
+    assert_eq!(rig.ops.status().live_hold_mm, None);
+    assert!(rig.ops.status().latch.is_none());
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
+    rig.start(
+        MoveTo {
+            position_mm: -150.0,
+        },
+        Off,
+    )
+    .unwrap();
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.8));
+}
+
+#[test]
+fn torque_hold_depth_smaller_than_position_tolerance_still_holds_contact() {
+    let profile = LIFT_AXIS.replace(
+        "touchdown_hold_depth_mm = 2.0",
+        "touchdown_hold_depth_mm = 0.1",
+    );
+    for complete_first in [false, true] {
+        let mut rig = armed_with(&profile);
+        let id = rig
+            .start(
+                Touchdown {
+                    press_current_a: PRESS_A,
+                    velocity_limit_mm_s: None,
+                    post_turn_page_width_mm: None,
+                },
+                Off,
+            )
+            .unwrap();
+        rig.axis(-200.0, 0.0, -PRESS_A);
+        rig.run_for(if complete_first { 500 } else { 220 });
+        if complete_first {
+            assert!(matches!(
+                rig.outcome(id),
+                Some(LiftOutcome::Completed(Some(_)))
+            ));
+            assert!(rig.ops.status().latch.is_none());
+        }
+        rig.axis(-200.2, 0.0, -PRESS_A);
+        rig.run_for(50);
+        if complete_first {
+            assert!(rig.ops.status().latch.is_some());
+        } else {
+            rig.trajectory_done();
+            rig.run_for(25);
+            assert_eq!(
+                rig.outcome(id),
+                Some(LiftOutcome::Fault(LiftFault::ContactNotHeld))
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_telemetry_between_torque_stages_sends_no_further_setup_writes() {
+    let mut rig = armed();
+    rig.board.fault_next(INPUT_VEL, ReplyFault::Hold);
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: Some(4.0),
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    assert_eq!(rig.f32_writes(INPUT_VEL), vec![0.0]);
+    rig.run_for(20); // telemetry is due when this stage finishes
+    rig.board.fault_next(POS_ESTIMATE, ReplyFault::Truncate);
+    for reply in rig.board.take_held() {
+        rig.engine.receive(rig.now, &reply);
+    }
+    rig.settle();
+    rig.run_for(25);
+    assert!(rig.f32_writes(INPUT_TORQUE).is_empty());
+    assert!(rig.i32_writes(CONTROL_MODE).is_empty());
+    assert_eq!(rig.board.requested_states().last(), Some(&1));
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
 }

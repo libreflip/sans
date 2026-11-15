@@ -22,6 +22,10 @@ pub(crate) const AXIS_STATE_IDLE: i32 = 1;
 pub(crate) const AXIS_STATE_CLOSED_LOOP_CONTROL: i32 = 8;
 /// `ODrive.Axis.AxisState` value `Homing`, twelfth entry (`odrive-interface.yaml`).
 pub(crate) const AXIS_STATE_HOMING: i32 = 11;
+/// `ODrive.Controller.ControlMode` value `TorqueControl`, second entry (`odrive-interface.yaml`).
+pub(crate) const CONTROL_MODE_TORQUE_CONTROL: i32 = 1;
+/// `ODrive.Controller.InputMode` value `Passthrough`, second entry (`odrive-interface.yaml`).
+pub(crate) const INPUT_MODE_PASSTHROUGH: i32 = 1;
 /// `ODrive.Controller.ControlMode` value `PositionControl`, fourth entry (`odrive-interface.yaml`).
 pub(crate) const CONTROL_MODE_POSITION_CONTROL: i32 = 3;
 /// `ODrive.Controller.InputMode` value `TrapTraj`, sixth entry (`odrive-interface.yaml`).

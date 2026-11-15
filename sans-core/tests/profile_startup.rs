@@ -17,7 +17,7 @@ fn missing_profile_creates_parseable_template_and_stops_startup() {
     ));
     let template = fs::read_to_string(&profile_path).unwrap();
     let parsed = toml::from_str::<toml::Value>(&template).unwrap();
-    assert_eq!(parsed["schema_version"].as_integer(), Some(3));
+    assert_eq!(parsed["schema_version"].as_integer(), Some(4));
     assert!(parsed["odrive"].get("lift_axis").is_none());
     assert!(parsed["boards"].get("ligature_path").is_none());
     let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
@@ -69,18 +69,19 @@ fn valid_profile_resolves_and_creates_relative_data_root() {
 #[test]
 fn structural_mistakes_are_reported_with_the_selected_profile_path() {
     let cases = [
+        ("schema_version = 4", "schema_version = 3", "negative-down travel"),
         (
-            "schema_version = 3",
+            "schema_version = 4",
             "schema_version = 2",
             "negate and swap travel bounds",
         ),
         (
-            "schema_version = 3",
             "schema_version = 4",
-            "unsupported schema_version 4",
+            "schema_version = 5",
+            "unsupported schema_version 5",
         ),
         (
-            "schema_version = 3",
+            "schema_version = 4",
             "schema_version = \"3\"",
             "unsupported schema_version",
         ),
@@ -365,7 +366,7 @@ fn version_2_profile_is_rejected_with_limit_removal_guidance() {
     let profile_path = temp.path().join("sans.toml");
     fs::write(
         &profile_path,
-        VALID_PROFILE.replace("schema_version = 3", "schema_version = 2"),
+        VALID_PROFILE.replace("schema_version = 4", "schema_version = 2"),
     )
     .unwrap();
 
@@ -375,7 +376,7 @@ fn version_2_profile_is_rejected_with_limit_removal_guidance() {
     let message = error.to_string();
     assert!(message.contains("current_limit_a"), "{message}");
     assert!(message.contains("touchdown_press_current_a"), "{message}");
-    assert!(message.contains("schema_version = 3"), "{message}");
+    assert!(message.contains("schema_version = 4"), "{message}");
 }
 
 #[test]

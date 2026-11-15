@@ -12,7 +12,7 @@ use thiserror::Error;
 pub const MACHINE_PROFILE_TEMPLATE: &str = include_str!("../../sans.example.toml");
 
 /// The only Machine-profile schema version this build reads.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_CLASSIFICATION_START_PERCENT: f32 = 10.0;
 const MAX_WIGGLE_START_PERCENT: f32 = 65.0;
 const MAX_WIGGLE_RETREAT_PERCENT: f32 = 5.0;
@@ -40,7 +40,7 @@ const CAMERA_FRAME_HEIGHT: u32 = 2160;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineProfile {
-    /// On-disk schema version. This build accepts only version 3.
+    /// On-disk schema version. This build accepts only version 4.
     pub schema_version: u32,
     /// Absolute or profile-relative root for Scan session directories.
     pub data_root: PathBuf,
@@ -152,9 +152,8 @@ pub enum LiftDirection {
     Reversed,
 }
 
-/// Commissioned lift-axis mechanism values. Sans writes no velocity or
-/// acceleration limits and sets a current limit only to press during a
-/// Touchdown; otherwise the ODrive's own stored limits apply.
+/// Commissioned lift-axis mechanism values. The ODrive's stored limits apply;
+/// Touchdown temporarily lowers current and controller velocity for torque mode.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiftAxisProfile {
@@ -185,7 +184,7 @@ pub struct LiftAxisProfile {
     pub touchdown_no_progress_mm: f32,
     /// Measured current, as a percentage of the press current, that counts as saturated; at most 100.
     pub touchdown_saturation_percent: f32,
-    /// Hold target depth below contact; at most the 5 mm software policy cap.
+    /// Maximum downward drift below contact during a torque hold; at most 5 mm.
     pub touchdown_hold_depth_mm: f32,
 }
 
@@ -359,7 +358,7 @@ pub enum StartupError {
     #[error(
         "Machine profile at {path} uses retired schema version 1: remove boards.ligature_path, \
          add the required [odrive] section, follow the schema version 2 guidance and set \
-         schema_version = 3; compare with the regenerated template (move this file aside and \
+         schema_version = 4; compare with the regenerated template (move this file aside and \
          restart Sans to write a fresh one)"
     )]
     ProfileVersionRetired {
@@ -372,14 +371,23 @@ pub enum StartupError {
          velocity_limit_mm_s, acceleration_limit_mm_s2 and deceleration_limit_mm_s2 from \
          [odrive.lift_axis] (the ODrive's own limits apply), replace motion.touchdown_press_percent \
          with motion.touchdown_press_current_a in amps, negate and swap travel bounds, \
-         flip direction normal/reversed, and set schema_version = 3"
+         flip direction normal/reversed, and set schema_version = 4"
     )]
     ProfileVersion2Retired {
         /// Selected Machine-profile path.
         path: PathBuf,
     },
+    /// Upstream version 3 still used positive-down lift coordinates.
+    #[error("Machine profile at {path} uses schema version 3: Home is now 0 with negative-down travel. \
+        If the lift bounds are positive-down, flip direction normal/reversed and set \
+        new_min = -old_max, new_max = -old_min. Keep already negative-down bounds unchanged. \
+        Then set schema_version = 4")]
+    ProfileVersion3Retired {
+        /// Selected Machine-profile path.
+        path: PathBuf,
+    },
     /// The profile's schema version is missing or not one this build reads.
-    #[error("Machine profile at {path} has unsupported schema_version {found}; this build reads only schema_version = 3")]
+    #[error("Machine profile at {path} has unsupported schema_version {found}; this build reads only schema_version = 4")]
     ProfileVersionUnsupported {
         /// Selected Machine-profile path.
         path: PathBuf,
@@ -493,6 +501,9 @@ fn check_schema_version(path: &Path, source: &str) -> Result<(), StartupError> {
             path: path.to_path_buf(),
         }),
         Some(toml::Value::Integer(2)) => Err(StartupError::ProfileVersion2Retired {
+            path: path.to_path_buf(),
+        }),
+        Some(toml::Value::Integer(3)) => Err(StartupError::ProfileVersion3Retired {
             path: path.to_path_buf(),
         }),
         found => Err(StartupError::ProfileVersionUnsupported {

@@ -2,7 +2,7 @@
 # Copy this file to the normal config path or let Sans generate it there.
 # Every <...> value and zero page-width bound must be commissioned before use.
 
-schema_version = 3
+schema_version = 4
 data_root = "scans"
 
 [boards]

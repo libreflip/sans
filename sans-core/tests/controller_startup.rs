@@ -266,7 +266,7 @@ fn invalid_profile_never_invokes_the_machine_factory() {
     let profile_path = temp.path().join("sans.toml");
     fs::write(
         &profile_path,
-        VALID_PROFILE.replace("schema_version = 3", "schema_version = 4"),
+        VALID_PROFILE.replace("schema_version = 4", "schema_version = 5"),
     )
     .unwrap();
     let open_threads = Arc::new(Mutex::new(Vec::new()));

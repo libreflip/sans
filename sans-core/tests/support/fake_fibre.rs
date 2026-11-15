@@ -30,9 +30,17 @@ pub const MOTOR_ERROR: u16 = 132;
 pub const MOTOR_IS_CALIBRATED: u16 = 134;
 pub const IQ_SETPOINT: u16 = 149;
 pub const IQ_MEASURED: u16 = 150;
+pub const TORQUE_CONSTANT: u16 = 177;
+pub const MOTOR_DIRECTION: u16 = 178;
+pub const MOTOR_TYPE: u16 = 179;
 pub const CURRENT_LIM: u16 = 180;
 pub const CONTROLLER_ERROR: u16 = 193;
 pub const INPUT_POS: u16 = 194;
+pub const INPUT_VEL: u16 = 195;
+pub const INPUT_TORQUE: u16 = 196;
+pub const CURRENT_MODE_VEL_LIMIT: u16 = 205;
+pub const VEL_GAIN: u16 = 211;
+pub const LOAD_ENCODER_AXIS: u16 = 223;
 pub const TRAJECTORY_DONE: u16 = 200;
 pub const CONTROL_MODE: u16 = 208;
 pub const INPUT_MODE: u16 = 209;
@@ -149,6 +157,14 @@ impl FakeFibre {
         fake.set_i32(CONTROL_MODE, 3);
         fake.set_i32(INPUT_MODE, 5);
         fake.set_f32(CURRENT_LIM, 4.8);
+        fake.set_f32(TORQUE_CONSTANT, 0.1); // torque constant, Nm/A
+        fake.set_i32(MOTOR_DIRECTION, 1); // motor direction
+        fake.set_i32(MOTOR_TYPE, 0); // high-current PM motor
+        fake.set_f32(VEL_GAIN, 1.0); // velocity gain, Nm/(turn/s)
+        fake.set_f32(CONTROLLER_VEL_LIMIT, 1.0);
+        fake.set_f32(TRAP_VEL_LIMIT, 1.0);
+        fake.set_raw(LOAD_ENCODER_AXIS, vec![0]); // load encoder axis
+
         // 2 mm/s^2 at the test profiles' 8 mm per turn.
         fake.set_f32(TRAP_DECEL_LIMIT, 0.25);
         fake

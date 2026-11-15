@@ -49,8 +49,8 @@ pub const LIFT_AXIS: &str = r#"
 [odrive.lift_axis]
 direction = "normal"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000

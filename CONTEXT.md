@@ -41,7 +41,7 @@ One attempt to pick up and turn the page within a capture cycle. Retries remain 
 _Avoid_: Cycle, page slot
 
 **Touchdown**:
-The controlled operation that lowers the suction box until it detects page contact and holds the selected press level, with its target a short commissioned hold depth below contact.
+The controlled operation that lowers the suction box until it detects page contact and holds the selected press level. A short commissioned hold depth limits further downward drift after contact.
 _Avoid_: Move down, descend
 
 **Flutter fan**:
