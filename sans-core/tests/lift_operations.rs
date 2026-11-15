@@ -1280,8 +1280,8 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
     use LiftFault::*;
     // Arrival at the descent limit, even saturated.
     let mut rig = armed();
-    let exhausted = touchdown_ending(&mut rig, -297.6, 0.0, -PRESS_A, 100);
-    assert_eq!(rig.moves(), vec![0.0, -297.6, -297.6]);
+    let exhausted = touchdown_ending(&mut rig, -300.0, 0.0, -PRESS_A, 100);
+    assert_eq!(rig.moves(), vec![0.0, -300.0, -300.0]);
     // Permanent stiction at the start.
     let mut stuck = armed();
     let no_progress = touchdown_ending(&mut stuck, -0.3, 0.0, -PRESS_A, 400);
@@ -2327,11 +2327,11 @@ fn touchdown_at_travel_limit_cancels_without_a_projected_stop() {
         .unwrap();
     // Position is inside travel. A trajectory braking projection from this
     // sample would extend past -300 mm, but Touchdown is stopped by the book.
-    rig.axis(-298.0, -3.0, -PRESS_A);
+    rig.axis(-300.0, -3.0, -PRESS_A);
     rig.run_for(25);
     assert!(rig.ops.status().latch.is_none());
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
-    rig.axis(-298.0, 0.0, -PRESS_A);
+    rig.axis(-300.0, 0.0, -PRESS_A);
     rig.trajectory_done();
     rig.run_for(25);
     assert_eq!(
@@ -2354,7 +2354,7 @@ fn touchdown_cancel_still_stops_on_measured_overtravel() {
             Off,
         )
         .unwrap();
-    rig.axis(-298.0, -3.0, -PRESS_A);
+    rig.axis(-300.0, -3.0, -PRESS_A);
     rig.run_for(25);
     assert!(rig.ops.status().latch.is_none());
     rig.axis(-300.25, 0.0, -PRESS_A);
@@ -2365,4 +2365,39 @@ fn touchdown_cancel_still_stops_on_measured_overtravel() {
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
     assert_eq!(rig.board.requested_states().last(), Some(&1));
+}
+
+#[test]
+fn touchdown_can_record_contact_inside_the_old_hold_depth_margin() {
+    for contact_mm in [-298.5, -299.75] {
+        let mut rig = armed();
+        let id = rig
+            .start(
+                Touchdown {
+                    press_current_a: PRESS_A,
+                    velocity_limit_mm_s: None,
+                    post_turn_page_width_mm: None,
+                },
+                Off,
+            )
+            .unwrap();
+        // Both contacts are inside the old hold-depth margin. The second is
+        // also within position tolerance of the actual travel minimum.
+        rig.axis(contact_mm, 0.0, -PRESS_A);
+        rig.run_until(500, |rig| rig.outcome(id).is_some());
+        assert_eq!(
+            rig.outcome(id),
+            Some(LiftOutcome::Completed(Some(TouchdownHold {
+                position_mm: contact_mm,
+                press_current_a: PRESS_A,
+                hold_limit_mm: -300.0,
+            })))
+        );
+        assert!(rig.ops.status().latch.is_none());
+        assert_eq!(rig.moves(), vec![0.0]);
+        rig.axis(-300.0, 0.0, -PRESS_A);
+        rig.run_for(25);
+        assert!(rig.ops.status().latch.is_some());
+        assert_eq!(rig.board.requested_states().last(), Some(&1));
+    }
 }

@@ -261,7 +261,7 @@ pub enum LiftFault {
     ClearFailed(String),
     /// Home ended idle without clean evidence; the axis is idle and unlatched.
     HomeFailed(String),
-    /// Touchdown reached the descent limit or a hold limit outside travel.
+    /// Touchdown reached the commissioned travel minimum.
     TravelExhausted,
     /// Touchdown stalled where it started.
     NoProgress,
@@ -280,7 +280,8 @@ pub struct TouchdownHold {
     pub position_mm: f32,
     /// The press current limit in force.
     pub press_current_a: f32,
-    /// The lowest allowed position, the hold depth below contact; never a motion target.
+    /// The lowest allowed position: the hold depth below contact, bounded by
+    /// the travel minimum. Never a motion target.
     pub hold_limit_mm: f32,
 }
 
@@ -416,7 +417,7 @@ enum Phase {
     },
     Hold {
         touchdown: Touchdown,
-        target_mm: f32,
+        limit_mm: f32,
         window: Option<Window>,
     },
     Cancel {
@@ -446,7 +447,7 @@ enum Step {
     Finish(LiftOutcome),
     Stop(String),
     Cancel(LiftFault),
-    Hold { target_mm: f32 },
+    Hold { limit_mm: f32 },
 }
 
 /// Submits one lift-axis link command and returns its ticket, or `None` when
@@ -843,7 +844,7 @@ impl LiftOperations {
                 "Touchdown entry needs a stationary axis".into(),
             ));
         }
-        let limit_mm = axis.travel_minimum_mm + axis.touchdown_hold_depth_mm;
+        let limit_mm = axis.travel_minimum_mm;
         if !(limit_mm >= axis.travel_minimum_mm
             && limit_mm <= axis.travel_maximum_mm
             && limit_mm < start_mm - axis.touchdown_no_progress_mm)
@@ -1227,12 +1228,12 @@ impl LiftOperations {
             }
             Step::Stop(reason) => self.stop(StopCause::Uncertain(reason), link),
             Step::Cancel(fault) => self.begin_cancel(now, Some(fault), link),
-            Step::Hold { target_mm } => {
+            Step::Hold { limit_mm } => {
                 let active = self.active.as_mut().expect("active");
                 if let Phase::Descend { touchdown, .. } = active.phase {
                     active.phase = Phase::Hold {
                         touchdown,
-                        target_mm,
+                        limit_mm,
                         window: None,
                     };
                 }
@@ -1446,7 +1447,7 @@ fn sample_step(
             }
         }
         Phase::Descend { touchdown, window } => {
-            if position <= touchdown.limit_mm + tolerance {
+            if position <= touchdown.limit_mm {
                 return Step::Cancel(LiftFault::TravelExhausted);
             }
             let grace = Duration::from_millis(axis.touchdown_grace_ms);
@@ -1457,21 +1458,16 @@ fn sample_step(
             if (contact.position_mm - touchdown.start_mm).abs() <= axis.touchdown_no_progress_mm {
                 return Step::Cancel(LiftFault::NoProgress);
             }
-            let target_mm = contact.position_mm - axis.touchdown_hold_depth_mm;
-            if !(target_mm.is_finite()
-                && target_mm >= axis.travel_minimum_mm
-                && target_mm <= axis.travel_maximum_mm)
-            {
-                return Step::Cancel(LiftFault::TravelExhausted);
-            }
-            Step::Hold { target_mm }
+            let limit_mm =
+                (contact.position_mm - axis.touchdown_hold_depth_mm).max(axis.travel_minimum_mm);
+            Step::Hold { limit_mm }
         }
         Phase::Hold {
             touchdown,
-            target_mm,
+            limit_mm,
             window,
         } => {
-            if position <= *target_mm {
+            if position <= *limit_mm {
                 return Step::Cancel(LiftFault::ContactNotHeld);
             }
             let stalled = stalled(touchdown.press_a);
@@ -1479,7 +1475,7 @@ fn sample_step(
                 return Step::Finish(LiftOutcome::Completed(Some(TouchdownHold {
                     position_mm: settled.position_mm,
                     press_current_a: touchdown.press_a,
-                    hold_limit_mm: *target_mm,
+                    hold_limit_mm: *limit_mm,
                 })));
             }
             Step::Wait

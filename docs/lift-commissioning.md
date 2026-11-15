@@ -33,6 +33,8 @@ Contact hold keeps the torque and monitors downward drift against
 `touchdown_hold_depth_mm`. Cancel and lift-away restore position control.
 Touchdown checks measured travel rather than predicting a stopping point;
 the book is intended to stop the descent.
+Its descent boundary is `travel_minimum_mm` directly. Hold depth limits drift
+after contact and never extends beyond that boundary.
 
 ```sh
 mkdir -p sans-core/test-results/commissioning
