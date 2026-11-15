@@ -31,6 +31,8 @@ speed uses the lower controller/trajectory limit. The firmware may reduce actual
 current to enforce that speed, including while stationary.
 Contact hold keeps the torque and monitors downward drift against
 `touchdown_hold_depth_mm`. Cancel and lift-away restore position control.
+Touchdown checks measured travel rather than predicting a stopping point;
+the book is intended to stop the descent.
 
 ```sh
 mkdir -p sans-core/test-results/commissioning

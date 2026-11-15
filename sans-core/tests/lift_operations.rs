@@ -2311,3 +2311,58 @@ fn torque_touchdown_allows_the_firmware_limiter_to_reduce_press_current() {
         ));
     }
 }
+
+#[test]
+fn touchdown_at_travel_limit_cancels_without_a_projected_stop() {
+    let mut rig = armed();
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    // Position is inside travel. A trajectory braking projection from this
+    // sample would extend past -300 mm, but Touchdown is stopped by the book.
+    rig.axis(-298.0, -3.0, -PRESS_A);
+    rig.run_for(25);
+    assert!(rig.ops.status().latch.is_none());
+    assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
+    rig.axis(-298.0, 0.0, -PRESS_A);
+    rig.trajectory_done();
+    rig.run_for(25);
+    assert_eq!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::TravelExhausted))
+    );
+    assert!(rig.ops.status().position_trusted);
+}
+
+#[test]
+fn touchdown_cancel_still_stops_on_measured_overtravel() {
+    let mut rig = armed();
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: PRESS_A,
+                velocity_limit_mm_s: None,
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    rig.axis(-298.0, -3.0, -PRESS_A);
+    rig.run_for(25);
+    assert!(rig.ops.status().latch.is_none());
+    rig.axis(-300.25, 0.0, -PRESS_A);
+    rig.trajectory_done();
+    rig.run_for(25);
+    assert!(matches!(
+        rig.outcome(id),
+        Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+    ));
+    assert_eq!(rig.board.requested_states().last(), Some(&1));
+}

@@ -79,9 +79,10 @@
 //!   urgent idle request followed by a fresh stationary idle sample. Use
 //!   routine cancel or cross-board Stop to interrupt an operation.
 //! - Routine cancel: an urgent move to the sampled position, restoring position
-//!   and trapezoidal control if a torque press was active. The braking envelope
-//!   uses the board's trajectory deceleration as an estimate; torque-mode handover
-//!   and actual stopping distance still need physical measurement in #60.
+//!   and trapezoidal control if a torque press was active. Position moves use
+//!   the board's trajectory deceleration to estimate braking reach. Touchdown
+//!   relies on book contact and checks the sampled position against travel,
+//!   without projecting a free-motion stopping point.
 //! - Current limit (reference): upstream reads the configured limit every
 //!   control cycle, so a runtime write takes effect at once. Units are amps.
 //! - Touchdown contact (host policy): saturated current in the descent
@@ -944,7 +945,8 @@ impl LiftOperations {
     }
 
     /// Start the routine cancel sequence: an urgent move to the sampled
-    /// position, or an urgent Stop when the braking envelope leaves travel.
+    /// position. Position moves also check projected braking reach; Touchdown
+    /// checks only the sampled position while seeking book contact.
     fn begin_cancel(&mut self, now: Instant, fault: Option<LiftFault>, link: &mut Port<'_>) {
         let axis = self.axis().clone();
         let sampled = self
@@ -954,29 +956,40 @@ impl LiftOperations {
             let cause = StopCause::Uncertain("cancel without a fresh sample".into());
             return self.stop(cause, link);
         };
-        let speed = velocity.abs();
-        let deceleration = self
-            .board_deceleration_mm_s2
-            .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
-        let reach = if speed <= axis.stationary_velocity_mm_s {
-            0.0
-        } else if let Some(deceleration) = deceleration {
-            speed * (self.max_age + self.urgent_deadline).as_secs_f32()
-                + speed * speed / (2.0 * deceleration)
-        } else {
-            let cause = StopCause::Uncertain(
-                "cancel braking reach is unknown: the ODrive deceleration limit was not read"
-                    .into(),
-            );
-            return self.stop(cause, link);
-        };
-        let end = position + velocity.signum() * reach;
         let inside = |mm: f32| mm >= axis.travel_minimum_mm && mm <= axis.travel_maximum_mm;
-        if !(inside(position) && inside(end)) {
-            let cause = StopCause::Uncertain(format!(
-                "cancel braking envelope {position} to {end} mm leaves travel"
-            ));
-            return self.stop(cause, link);
+        if !inside(position) {
+            return self.stop(
+                StopCause::Uncertain(format!("cancel position {position} mm is outside travel")),
+                link,
+            );
+        }
+        let touchdown = self.active.as_ref().is_some_and(|active| {
+            matches!(active.phase, Phase::Descend { .. } | Phase::Hold { .. })
+        });
+        if !touchdown {
+            let speed = velocity.abs();
+            let deceleration = self
+                .board_deceleration_mm_s2
+                .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
+            let reach = if speed <= axis.stationary_velocity_mm_s {
+                0.0
+            } else if let Some(deceleration) = deceleration {
+                speed * (self.max_age + self.urgent_deadline).as_secs_f32()
+                    + speed * speed / (2.0 * deceleration)
+            } else {
+                let cause = StopCause::Uncertain(
+                    "cancel braking reach is unknown: the ODrive deceleration limit was not read"
+                        .into(),
+                );
+                return self.stop(cause, link);
+            };
+            let end = position + velocity.signum() * reach;
+            if !inside(end) {
+                let cause = StopCause::Uncertain(format!(
+                    "cancel braking envelope {position} to {end} mm leaves travel"
+                ));
+                return self.stop(cause, link);
+            }
         }
         if let Some(active) = self.active.as_mut() {
             active.phase = Phase::Cancel { fault };
@@ -1142,20 +1155,23 @@ impl LiftOperations {
         {
             self.stop_evidence = Some(StopEvidence::Unconfirmed);
         }
-        let pressing = self.live_hold_mm.is_some()
+        let check_travel = self.live_hold_mm.is_some()
             || self.active.as_ref().is_some_and(|active| {
-                matches!(active.phase, Phase::Descend { .. } | Phase::Hold { .. })
+                matches!(
+                    active.phase,
+                    Phase::Descend { .. } | Phase::Hold { .. } | Phase::Cancel { .. }
+                )
             });
         if self.latch.is_none()
             && ((self.live_hold_mm.is_some()
                 && self
                     .live_hold_limit_mm
                     .is_some_and(|limit| position <= limit))
-                || (pressing
+                || (check_travel
                     && (position < axis.travel_minimum_mm || position > axis.travel_maximum_mm)))
         {
             return self.stop(
-                StopCause::Uncertain("torque press left its travel or contact hold limit".into()),
+                StopCause::Uncertain("lift motion left its travel or contact hold limit".into()),
                 link,
             );
         }
