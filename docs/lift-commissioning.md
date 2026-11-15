@@ -87,10 +87,11 @@ A crash can leave temporary limits in board RAM. Check the board limits before
 restarting a run. Torque mode has no trajectory acceleration ramp; check its
 entry, stop distance and overspeed behavior on the machine.
 
-Keep the CSV and a short note of what worked or failed. It already records the
-profile, telemetry, commands and Stop results. The 100 ms dispatch and 500 ms
-stopped/off targets still need checking on the machine. Physical testing for
-#60 remains pending, and production scanning stays disabled.
+Keep a short note of what worked or failed, including the profile and measured
+Stop timings. CSVs can be analysed locally and discarded instead of committed.
+The supervised [run 16 summary](../sans-core/test-results/lift-16.md) records
+successful Touchdown, hold, lift-away and physical-button Stop for #60.
+The assembled-book workflow remains #31.
 
 While armed, the terminal shows measured and setpoint current, position and
 sample age about five times a second. The CSV keeps every telemetry sample.

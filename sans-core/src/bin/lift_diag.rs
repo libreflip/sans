@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Both production gates are nonmoving: Monospace confirms ALL OFF and
-    // PRESS STOP; ODrive idles, checks compatibility and writes bounded limits.
+    // PRESS STOP; ODrive idles and checks compatibility and the board's limits.
     let connection = MonospaceClient::connect(
         &profile.boards.monospace_path,
         Duration::from_millis(2500),
