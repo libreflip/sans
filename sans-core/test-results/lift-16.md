@@ -24,13 +24,12 @@ the assembled-book workflow remains #31.
 - Source reviewed at `cb73eaec9f2d791efc8598935416c29ed6fc5722`.
   The CSV did not contain the runner build's commit ID.
 
-The operator reports enabling `axis0.encoder.config.ignore_illegal_hall_state = True`
-after the earlier `Position trust lost during motion` Stop. Its enable time
-relative to the 23:02 UTC run is not recorded, and the CSV does not read this
-setting. This is an operator-reported board change, not a measured configuration
-or a recommendation. The Position trust and zero-error observations below
-describe the board as run; they do not establish that illegal-Hall-state fault
-reporting was enabled during the run.
+The operator confirms enabling `axis0.encoder.config.ignore_illegal_hall_state = True`
+after the earlier `Position trust lost during motion` Stop and before run 16
+started at 23:02 UTC. The Position trust and zero-error observations below were
+collected with this setting enabled. Its state and timing are operator-confirmed;
+the CSV did not read the setting. This records the configuration used for this
+run, rather than recommending the setting. Sans does not write it.
 
 ## Observed results
 
