@@ -1041,7 +1041,10 @@ impl Projection {
         let trusted = lift.ops.status(Instant::now()).position_trusted;
         let keep = match self.workflow {
             Workflow::Setup { .. } => {
-                if enabled && trusted {
+                if enabled
+                    && trusted
+                    && matches!(self.workflow, Workflow::Setup { home_failure: None })
+                {
                     self.workflow = Workflow::Idle;
                 }
                 true

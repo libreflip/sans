@@ -380,7 +380,8 @@ pub enum StartupError {
     /// Upstream version 3 still used positive-down lift coordinates.
     #[error("Machine profile at {path} uses schema version 3: Home is now 0 with negative-down travel. \
         If the lift bounds are positive-down, flip direction normal/reversed and set \
-        new_min = -old_max, new_max = -old_min. Keep already negative-down bounds unchanged. \
+        odrive.lift_axis.travel_minimum_mm = -old travel_maximum_mm and \
+        travel_maximum_mm = -old travel_minimum_mm. Keep already negative-down bounds unchanged. \
         Then set schema_version = 4")]
     ProfileVersion3Retired {
         /// Selected Machine-profile path.

@@ -36,7 +36,7 @@ urgent_deadline_ms = 50
 #
 # [odrive.lift_axis]
 # direction = "<normal-or-reversed>"
-# mm_per_turn = 5.0
+# mm_per_turn = <positive-travel-per-motor-turn>
 # travel_minimum_mm = <negative-lower-soft-bound>
 # travel_maximum_mm = <upper-soft-bound-at-most-zero>
 # position_tolerance_mm = <positive>

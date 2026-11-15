@@ -19,7 +19,8 @@ With the 10:1 reduction, use `mm_per_turn = 5.0` for that pulley.
 Keep this value positive; `direction` handles the sign.
 
 Profiles now use schema version 4. For positive-down bounds, flip `direction`
-and set `new_min = -old_max`, `new_max = -old_min`. Keep already negative-down
+and set `travel_minimum_mm = -old travel_maximum_mm`,
+`travel_maximum_mm = -old travel_minimum_mm`. Keep already negative-down
 bounds unchanged. Version 2 profiles also need the old current/speed limit
 fields removed and `motion.touchdown_press_percent` replaced by
 `motion.touchdown_press_current_a` in amps; compare with the current template.
@@ -29,8 +30,16 @@ board limits. Touchdown uses current/torque mode with the firmware velocity
 limiter; its current and optional speed cannot exceed the board's limits. Omitted
 speed uses the lower controller/trajectory limit. The firmware may reduce actual
 current to enforce that speed, including while stationary.
+
+The commissioned board uses `axis0.encoder.config.ignore_illegal_hall_state = True`.
+The operator enabled it after an earlier "Position trust lost during motion"
+Stop. This is a board setting; Sans does not write it.
+
 Contact hold keeps the torque and monitors downward drift against
-`touchdown_hold_depth_mm`. Cancel and lift-away restore position control.
+`touchdown_hold_depth_mm`. Cancelling an active Touchdown or lifting away
+restores position control.
+Once Touchdown has completed its torque hold, `cancel` has no active operation
+to cancel; use lift-away or `stop` to leave that hold.
 Touchdown checks measured travel rather than predicting a stopping point;
 the book is intended to stop the descent.
 Its descent boundary is `travel_minimum_mm` directly. Hold depth limits drift
@@ -50,7 +59,8 @@ scripts/pi-run --bin lift_diag pi@sans-pi.local -- \
   --config /home/pi/sans.toml --log /home/pi/lift-01.csv
 ```
 
-Those profile and CSV paths are on the Pi; the CSV stays there.
+Those profile and CSV paths are on the Pi. Copy the CSV off the Pi for local
+analysis.
 
 Use a new CSV filename each time. Startup leaves the axis idle and the air
 actuators off. Wait for `Verified`, then use `status` to check fresh telemetry. A fresh native

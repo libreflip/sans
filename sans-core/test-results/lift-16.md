@@ -24,6 +24,10 @@ the assembled-book workflow remains #31.
 - Source reviewed at `cb73eaec9f2d791efc8598935416c29ed6fc5722`.
   The CSV did not contain the runner build's commit ID.
 
+The operator reports enabling `axis0.encoder.config.ignore_illegal_hall_state = True`
+after the earlier `Position trust lost during motion` Stop. The CSV does not
+read this setting, so it is an operator observation rather than a CSV measurement.
+
 ## Observed results
 
 Home, Arm, absolute moves to −200 mm and return to 0 completed. Three
@@ -39,8 +43,9 @@ All three holds reported zero velocity and no position change at the encoder's
 resolution. Setpoint current stayed at 1.1 A. No ODrive error bits, overspeed,
 travel exhaustion or unexpected Stop appeared in these three attempts.
 
-Physical-button Stop interrupted two moves and the first completed torque
-hold. Position trust remained valid. Each Clear Stop completed without motion;
+The button events at 14.231 s and 33.006 s interrupted moves to −100 mm and
+−200 mm respectively. The event at 73.082 s ended the first torque hold after
+Touchdown had already reported completion at 65.752 s. Position trust remained valid. Each Clear Stop completed without motion;
 a subsequent move while idle was refused until an explicit Arm. The final
 Quit also produced a Confirmed Stop. The capture contains no standalone
 `cancel`, terminal `stop`, or explicit `disarm` command; those are not claimed

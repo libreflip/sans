@@ -297,27 +297,29 @@ fn consented_home_enters_idle_and_new_book_does_not_home_again() {
 
 #[test]
 fn clean_home_failure_returns_to_setup_blocked_without_stop_and_home_can_be_retried() {
-    let mut board = homing_board();
-    board.readback_override.insert(IS_HOMED, vec![0]);
-    let started = start(board, vec![]);
+    for endpoint in [IS_HOMED, TRAJECTORY_DONE] {
+        let mut board = homing_board();
+        board.readback_override.insert(endpoint, vec![0]);
+        let started = start(board, vec![]);
 
-    started.send(ControllerIntent::Home);
-    let failed = started.until(|snapshot| {
-        matches!(&snapshot.screen, MachineScreen::Setup(SetupState::Blocked { reasons })
+        started.send(ControllerIntent::Home);
+        let failed = started.until(|snapshot| {
+            matches!(&snapshot.screen, MachineScreen::Setup(SetupState::Blocked { reasons })
             if reasons.iter().any(|reason| reason.summary.starts_with("Home failed")))
-    });
+        });
 
-    assert_eq!(failed.stop, None);
-    assert_eq!(failed.scan_readiness, ScanReadiness::Enabled);
-    started
-        .opener
-        .board
-        .lock()
-        .unwrap()
-        .readback_override
-        .remove(&IS_HOMED);
-    home(&started);
-    assert_eq!(started.requested_states(), vec![1, 11, 11]);
+        assert_eq!(failed.stop, None);
+        assert_eq!(failed.scan_readiness, ScanReadiness::Enabled);
+        started
+            .opener
+            .board
+            .lock()
+            .unwrap()
+            .readback_override
+            .remove(&endpoint);
+        home(&started);
+        assert_eq!(started.requested_states(), vec![1, 11, 11]);
+    }
 }
 
 #[test]

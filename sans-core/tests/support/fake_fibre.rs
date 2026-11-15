@@ -1,4 +1,5 @@
-//! A fake legacy-Fibre ODrive built from the #57 capture.
+//! A fake legacy-Fibre ODrive using the #57 captured endpoint schema.
+//! Runtime values and dynamics are synthetic test inputs, not a board capture.
 //!
 //! It serves the reconstructed descriptor, keeps a raw value per endpoint ID,
 //! drops requests whose trailer is wrong as the pinned dispatcher does, and
@@ -104,7 +105,7 @@ pub struct FakeFibre {
 }
 
 impl FakeFibre {
-    /// A compatible board matching the #57 capture: idle, calibrated,
+    /// A compatible board with the #57 schema and synthetic state: idle, calibrated,
     /// encoder ready, in position control with trapezoidal input, no errors.
     pub fn compatible() -> Self {
         let flat: serde_json::Value = serde_json::from_str(ENDPOINTS).unwrap();

@@ -111,7 +111,7 @@ impl Diagnostic {
             Command::Disarm => LiftRequest::Disarm,
             Command::Move(position_mm) => LiftRequest::MoveTo { position_mm },
             Command::Touchdown(press_current_a, velocity_limit_mm_s) => LiftRequest::Touchdown {
-                press_current_a,
+                press_current_a: Some(press_current_a),
                 velocity_limit_mm_s,
                 post_turn_page_width_mm: None,
             },

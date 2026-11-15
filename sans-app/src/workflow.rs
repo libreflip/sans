@@ -104,6 +104,7 @@ pub(crate) fn show_idle(
         |ui, _| {
             show_stop(ui, stop);
             ui.label("Position trust is held. Press New Book or the green button to scan a book.");
+            show_home_consent(ui);
         },
     );
     result

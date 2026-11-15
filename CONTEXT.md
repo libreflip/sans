@@ -93,7 +93,7 @@ A non-Stop pause after three confirmed pickup failures in which automatic scanni
 _Avoid_: Stopped state, Stop job
 
 **Position trust**:
-Whether the suction box's position can be used for absolute motion, based on ODrive's reported Home reference and valid current encoder feedback. Stop and Disarm do not erase that reference. Home is needed when the board cannot provide a valid homed reference.
+Whether the suction box's position can be used for absolute motion, based on fresh telemetry from the verified current connection reporting ODrive's Home reference and ready, error-free encoder feedback. Stop and Disarm do not erase that reference. Home is needed when the board cannot provide a valid homed reference.
 _Avoid_: Homed flag, homed boolean
 
 **Stop**:

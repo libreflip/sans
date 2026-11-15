@@ -794,6 +794,13 @@ struct Operation {
     completed_stages: usize,
 }
 
+impl Operation {
+    /// Only a revoked first packet means no part of the command left the host.
+    fn was_transmitted(&self, unsent_first: bool) -> bool {
+        self.completed_stages > 0 || (self.transmitted && !unsent_first)
+    }
+}
+
 struct UrgentLane {
     op: Operation,
     in_flight: Option<InFlight>,
@@ -1380,11 +1387,7 @@ impl LinkEngine {
             self.settle_unanswered(&in_flight) && in_flight.is_first_packet()
         });
         if let Some(op) = active {
-            results.push((
-                op.ticket,
-                op.command,
-                op.completed_stages > 0 || (op.transmitted && !unsent_first),
-            ));
+            results.push((op.ticket, op.command, op.was_transmitted(unsent_first)));
         }
         results.extend(
             queued
@@ -1398,7 +1401,7 @@ impl LinkEngine {
             results.push((
                 lane.op.ticket,
                 lane.op.command,
-                lane.op.completed_stages > 0 || (lane.op.transmitted && !unsent_first),
+                lane.op.was_transmitted(unsent_first),
             ));
         }
         results.extend(
@@ -1432,6 +1435,7 @@ impl LinkEngine {
         }
         self.retire_queue();
         self.revoke_unsent_energizing();
+        self.retire_staged_commands();
     }
 
     fn retire_queue(&mut self) {
@@ -1953,14 +1957,28 @@ impl LinkEngine {
                 ))
             }
         }?;
-        let normalize = matches!(
+        let mut stages = if matches!(
             command,
             LinkCommand::Arm | LinkCommand::Home | LinkCommand::MoveAbsolute { .. }
-        ) && (self.torque_restore.is_some()
+        ) {
+            self.position_mode_stages(now)?
+        } else {
+            VecDeque::new()
+        };
+        stages.push_back(single);
+        Ok(stages)
+    }
+
+    /// Recover position mode from either our press or externally selected modes.
+    fn position_mode_stages(
+        &mut self,
+        now: Instant,
+    ) -> Result<VecDeque<(RequestSpec, Confirm)>, String> {
+        let normalize = self.torque_restore.is_some()
             || self.fresh_sample_inner(now).is_some_and(|s| {
                 s.values.control_mode != CONTROL_MODE_POSITION_CONTROL
                     || s.values.input_mode != INPUT_MODE_TRAP_TRAJ
-            }));
+            });
         let mut stages = VecDeque::new();
         if normalize {
             let values = self.ready_to_energize(now)?;
@@ -2005,7 +2023,6 @@ impl LinkEngine {
                 ));
             }
         }
-        stages.push_back(single);
         Ok(stages)
     }
 
@@ -2129,7 +2146,7 @@ impl LinkEngine {
         self.publish_status();
     }
 
-    /// Urgent commands cancel the remainder even when a stage read is in flight.
+    /// Urgent commands and link faults retire the remainder of staged plans.
     fn retire_staged_commands(&mut self) {
         let Some(connection) = self.connection.as_mut() else {
             return;
@@ -2169,7 +2186,7 @@ impl LinkEngine {
                 op.ticket,
                 op.command,
                 CommandResult::Retired {
-                    transmitted: op.completed_stages > 0 || (op.transmitted && !unsent),
+                    transmitted: op.was_transmitted(unsent),
                 },
             );
         }
@@ -2204,7 +2221,7 @@ impl LinkEngine {
                 lane.op.ticket,
                 lane.op.command,
                 CommandResult::Retired {
-                    transmitted: lane.op.completed_stages > 0,
+                    transmitted: lane.op.was_transmitted(true),
                 },
             );
         }
@@ -2235,7 +2252,7 @@ impl LinkEngine {
                 op.ticket,
                 op.command,
                 CommandResult::Retired {
-                    transmitted: op.completed_stages > 0 || !in_flight.is_first_packet(),
+                    transmitted: op.was_transmitted(in_flight.is_first_packet()),
                 },
             );
         }
@@ -2668,7 +2685,7 @@ impl LinkEngine {
                         op.ticket,
                         op.command,
                         CommandResult::Retired {
-                            transmitted: op.completed_stages > 0 || !in_flight.is_first_packet(),
+                            transmitted: op.was_transmitted(in_flight.is_first_packet()),
                         },
                     );
                 }
@@ -2701,7 +2718,7 @@ impl LinkEngine {
             self.latch_fault(reason.clone());
             let result = if unsent {
                 CommandResult::Retired {
-                    transmitted: lane.op.completed_stages > 0 || !in_flight.is_first_packet(),
+                    transmitted: lane.op.was_transmitted(in_flight.is_first_packet()),
                 }
             } else {
                 CommandResult::OutcomeUnknown { reason }

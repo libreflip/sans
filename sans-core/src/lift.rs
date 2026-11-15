@@ -150,9 +150,9 @@ pub enum LiftRequest {
     /// Lower until contact and hold the press. With a post-turn page width,
     /// emits [`LiftEvent::TurnBlowerCutoff`] on the way down.
     Touchdown {
-        /// Requested press current in amps, positive and at most the board's
-        /// own current limit read on this connection.
-        press_current_a: f32,
+        /// Optional press current in amps; otherwise use the Machine profile.
+        /// Must be positive and at most the board's current limit.
+        press_current_a: Option<f32>,
         /// Optional firmware velocity limit in mm/s; otherwise use the lower of
         /// the board's controller and trajectory velocity limits.
         velocity_limit_mm_s: Option<f32>,
@@ -230,6 +230,8 @@ pub enum LiftRejection {
     TorqueSettings(String),
     /// A Touchdown hold is live: Home and descents wait for a lift-away or Stop.
     InHold,
+    /// Touchdown entry needs a stationary axis.
+    NotStationary,
     /// Clearing the fault needs a fresh sample reading idle.
     NotIdle,
     /// The requested Touchdown press current exceeds the ODrive's own current
@@ -536,7 +538,7 @@ impl LiftOperations {
                 touchdown: self.check_touchdown(
                     now,
                     post_turn_page_width_mm,
-                    press_current_a,
+                    press_current_a.unwrap_or(self.motion.touchdown_press_current_a),
                     velocity_limit_mm_s,
                     vacuum,
                 )?,
@@ -835,9 +837,7 @@ impl LiftOperations {
             .velocity_mm_s
             .is_none_or(|v| v.abs() > axis.stationary_velocity_mm_s)
         {
-            return Err(LiftRejection::TorqueSettings(
-                "Touchdown entry needs a stationary axis".into(),
-            ));
+            return Err(LiftRejection::NotStationary);
         }
         let limit_mm = axis.travel_minimum_mm;
         if !(limit_mm >= axis.travel_minimum_mm
