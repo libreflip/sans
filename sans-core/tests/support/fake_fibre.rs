@@ -285,7 +285,11 @@ impl FakeFibre {
             };
             if endpoint == CURRENT_STATE && payload_was_empty(packet) {
                 if let Some(settled) = self.settling.take() {
+                    let home_finished = settled == 1 && current == 11_i32.to_le_bytes();
                     self.set_i32(CURRENT_STATE, settled);
+                    if home_finished {
+                        self.set_bool(IS_HOMED, true);
+                    }
                 }
             }
             current[..limit.min(current.len())].to_vec()

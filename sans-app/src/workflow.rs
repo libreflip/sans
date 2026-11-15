@@ -53,7 +53,7 @@ pub(crate) fn home_action(
 /// What Home consent means, for the Setup screen bodies.
 pub(crate) fn show_home_consent(ui: &mut egui::Ui) {
     ui.label(
-        "Home is required. The suction box moves up to its Home reference. \
+        "Home moves the suction box up to establish its position reference. \
          Keep hands clear of the machine, then press Home lift axis.",
     );
     ui.add_space(12.0);
@@ -93,11 +93,12 @@ pub(crate) fn show_idle(
         ui,
         stop_header(stop).unwrap_or_else(|| Header::new("Idle", egui::Color32::LIGHT_BLUE)),
         |ui| {
-            let mut new_book = Ok(());
+            let mut actions = Ok(());
             result = stop_actions(ui, handle, stop, |ui| {
-                new_book = intent_action(ui, handle, "New Book", ControllerIntent::NewBook);
+                actions = intent_action(ui, handle, "New Book", ControllerIntent::NewBook)
+                    .and(home_action(ui, handle));
             })
-            .and(new_book);
+            .and(actions);
             exit(ui);
         },
         |ui, _| {

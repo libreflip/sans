@@ -143,7 +143,7 @@ fn failed() -> Result<CapturePair, CapturePairError> {
 fn homing_board() -> FakeFibre {
     let mut board = FakeFibre::compatible();
     board.settle_after_one_read.insert(11, 1);
-    board.set_bool(IS_HOMED, true);
+    board.set_bool(IS_HOMED, false);
     board.set_bool(TRAJECTORY_DONE, true);
     board
 }
@@ -298,7 +298,7 @@ fn consented_home_enters_idle_and_new_book_does_not_home_again() {
 #[test]
 fn clean_home_failure_returns_to_setup_blocked_without_stop_and_home_can_be_retried() {
     let mut board = homing_board();
-    board.set_bool(IS_HOMED, false);
+    board.readback_override.insert(IS_HOMED, vec![0]);
     let started = start(board, vec![]);
 
     started.send(ControllerIntent::Home);
@@ -314,7 +314,8 @@ fn clean_home_failure_returns_to_setup_blocked_without_stop_and_home_can_be_retr
         .board
         .lock()
         .unwrap()
-        .set_bool(IS_HOMED, true);
+        .readback_override
+        .remove(&IS_HOMED);
     home(&started);
     assert_eq!(started.requested_states(), vec![1, 11, 11]);
 }
@@ -558,7 +559,7 @@ fn stop_during_the_first_capture_switches_the_light_off_and_does_not_block_home(
 }
 
 #[test]
-fn stop_then_clear_stop_needs_home_consent_again() {
+fn stop_then_clear_stop_returns_to_idle_without_another_home() {
     let started = start(homing_board(), vec![pair(1)]);
     home(&started);
     ready(&started, 200);
@@ -573,16 +574,21 @@ fn stop_then_clear_stop_needs_home_consent_again() {
     started.send(ControllerIntent::ClearStop);
     let cleared = started.until(|snapshot| snapshot.stop.is_none());
 
-    assert!(matches!(cleared.screen, MachineScreen::Setup(_)));
-    // Neither Clear Stop nor New Book homes or arms.
-    started.send(ControllerIntent::NewBook);
-    started.send(ControllerIntent::Start);
-    home(&started);
-    assert_eq!(started.requested_states(), vec![1, 11, 1, 11]);
+    assert_eq!(cleared.screen, MachineScreen::Idle);
+    assert_eq!(
+        started.sessions().len(),
+        1,
+        "the stopped session is not resumed"
+    );
+    assert_eq!(
+        started.requested_states(),
+        vec![1, 11, 1],
+        "clear neither homes nor arms"
+    );
 }
 
 #[test]
-fn a_lift_axis_reconnect_loses_position_trust_and_needs_home_again() {
+fn a_lift_axis_reconnect_accepts_the_new_epochs_native_homed_report() {
     let started = start(homing_board(), vec![]);
     home(&started);
     ready(&started, 200);
@@ -594,7 +600,12 @@ fn a_lift_axis_reconnect_loses_position_trust_and_needs_home_again() {
     started.until(|snapshot| {
         snapshot.lift_axis.epoch == 2 && snapshot.scan_readiness == ScanReadiness::Enabled
     });
-    home(&started);
+    started.until(|snapshot| snapshot.screen == MachineScreen::Idle);
+    assert_eq!(
+        started.requested_states(),
+        vec![1, 11, 1],
+        "reconnect only idles the axis"
+    );
 }
 
 #[test]
@@ -607,4 +618,24 @@ fn pressure_readings_reach_the_snapshot() {
         .unwrap();
 
     started.until(|snapshot| snapshot.pressure_mbar == Some(1_013.5));
+}
+
+#[test]
+fn already_homed_startup_skips_home_but_manual_home_is_still_available() {
+    let mut board = homing_board();
+    board.set_bool(IS_HOMED, true);
+    let started = start(board, vec![]);
+    started.until(|snapshot| snapshot.screen == MachineScreen::Idle);
+    assert_eq!(
+        started.requested_states(),
+        vec![1],
+        "only the connection gate idles"
+    );
+    assert_eq!(started.log(), vec!["LED Blue"]);
+    home(&started);
+    assert_eq!(
+        started.requested_states(),
+        vec![1, 11],
+        "Home from Idle is explicit"
+    );
 }

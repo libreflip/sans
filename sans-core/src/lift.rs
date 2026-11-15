@@ -6,7 +6,7 @@
 //! link commands through a port the caller supplies, and hands back typed
 //! [`LiftEvent`]s. It runs one operation at a time, with no queue, and reports
 //! exactly one [`LiftEvent::Finished`] for each accepted operation. It derives
-//! Position trust from a Home it watched end to end, detects Touchdown contact
+//! Position trust from fresh native homed/encoder evidence, detects Touchdown contact
 //! from polled position and current, and separates routine cancel, which
 //! leaves the axis armed, from Stop, which latches a host fault.
 //!
@@ -58,8 +58,12 @@
 //!   the Home timeout is Stop. Upstream
 //!   clears `is_homed` on entry and sets it true on every exit, including
 //!   after a fault or an interrupting state request, and an interrupted run
-//!   rewrites the encoder count. So `is_homed` alone is never evidence, and an
-//!   interrupted Home grants no trust.
+//!   rewrites the encoder count. Home completion remains an operation result;
+//!   Position trust independently follows the board's fresh homed/encoder report.
+//! - Position trust (host policy): the native homed flag is authoritative, with
+//!   ready, error-free encoder feedback on a verified link in a fresh current-epoch
+//!   sample. Startup and reconnect can therefore recover trust without a Home
+//!   witnessed by Sans. Stop and Disarm clear press state, not the reference.
 //! - Home leaves the axis idle (reference). Motion needs a separate Arm.
 //!   Home is accepted from idle because the adapter's Arm rejects any error
 //!   word, and the #57 capture showed the axis idle on a pressed endstop with
@@ -75,7 +79,7 @@
 //! - Arming (reference) sets the input position to the current estimate, so
 //!   arming commands no motion.
 //! - Explicit Disarm (host policy) is accepted only without an active
-//!   operation, revokes Position trust and the live hold, and waits for an
+//!   operation, clears the live hold and waits for an
 //!   urgent idle request followed by a fresh stationary idle sample. Use
 //!   routine cancel or cross-board Stop to interrupt an operation.
 //! - Routine cancel: an urgent move to the sampled position, restoring position
@@ -133,10 +137,10 @@ pub struct OperationId(pub u64);
 pub enum LiftRequest {
     /// Enter closed-loop control; completes when the adapter confirms it.
     Arm,
-    /// Urgently idle an otherwise inactive axis and revoke Position trust.
+    /// Urgently idle an inactive axis while retaining a valid native position reference.
     /// During an operation use routine cancel or cross-board Stop instead.
     Disarm,
-    /// Run native homing from idle. Grants Position trust on clean evidence.
+    /// Run native homing. Position trust follows the board's fresh homed report.
     Home,
     /// Absolute move, also used to park.
     MoveTo {
@@ -362,7 +366,6 @@ pub struct LiftOperations {
     epoch: u64,
     verified: bool,
     latest: Option<TelemetrySample>,
-    trusted: bool,
     touchdown_mm: Option<f32>,
     /// A live hold's own reference, kept apart from trust and `touchdown_mm`.
     live_hold_mm: Option<f32>,
@@ -468,7 +471,6 @@ impl LiftOperations {
             epoch: 0,
             verified: false,
             latest: None,
-            trusted: false,
             touchdown_mm: None,
             live_hold_mm: None,
             applied_limit_a: None,
@@ -565,14 +567,10 @@ impl LiftOperations {
             _ => axis.move_timeout_ms,
         };
         if matches!(phase, Phase::Home | Phase::Disarm) {
-            self.lose_trust();
-        }
-        if matches!(phase, Phase::Disarm) {
-            self.live_hold_mm = None;
-            self.live_hold_limit_mm = None;
+            self.clear_press_state();
         }
         let id = self.begin(now, Duration::from_millis(timeout), phase);
-        self.submit_phase(link);
+        self.submit_phase(now, link);
         Ok(id)
     }
 
@@ -607,10 +605,7 @@ impl LiftOperations {
     /// Latch Stop, finish the active operation and submit an urgent Disarm.
     /// Always accepted.
     pub fn stop(&mut self, cause: StopCause, link: &mut Port<'_>) {
-        self.lose_trust();
-        // The latch and the Arm needed after it reset the pressing setpoint.
-        self.live_hold_mm = None;
-        self.live_hold_limit_mm = None;
+        self.clear_press_state();
         self.finish(LiftOutcome::Fault(LiftFault::Stopped(cause.clone())));
         self.latch.get_or_insert(cause);
         self.stop_disarm = link(LinkCommand::Disarm, Priority::Urgent);
@@ -695,11 +690,11 @@ impl LiftOperations {
         self.events.pop_front()
     }
 
-    /// Current policy state.
-    pub fn status(&self) -> LiftStatus {
+    /// Policy state at `now`; position trust requires fresh native encoder evidence.
+    pub fn status(&self, now: Instant) -> LiftStatus {
         LiftStatus {
             epoch: self.epoch,
-            position_trusted: self.trusted,
+            position_trusted: self.position_trusted(now),
             latch: self.latch.clone(),
             active: self.active.as_ref().map(|active| active.id),
             touchdown_mm: self.touchdown_mm,
@@ -722,7 +717,7 @@ impl LiftOperations {
     fn fresh_position(&self, now: Instant) -> Result<f32, LiftRejection> {
         let position = self.fresh(now).and_then(|values| values.position_mm);
         let position = position.ok_or(LiftRejection::NoFreshSample)?;
-        if !self.trusted {
+        if !self.position_trusted(now) {
             return Err(LiftRejection::PositionUntrusted);
         }
         Ok(position)
@@ -878,11 +873,12 @@ impl LiftOperations {
     }
 
     /// Submit the active phase's command, first setting its current limit if needed.
-    fn submit_phase(&mut self, link: &mut Port<'_>) {
+    fn submit_phase(&mut self, now: Instant, link: &mut Port<'_>) {
+        let trusted = self.position_trusted(now);
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if needs_trust(&active.phase) && !self.trusted {
+        if needs_trust(&active.phase) && !trusted {
             let cause = StopCause::Uncertain("Position trust lost before motion".into());
             return self.stop(cause, link);
         }
@@ -1023,7 +1019,8 @@ impl LiftOperations {
             if self.stop_evidence.is_some() {
                 self.stop_evidence = Some(StopEvidence::Unconfirmed);
             }
-            self.lose_trust();
+            self.clear_press_state();
+            self.latest = None;
         }
         if epoch_changed {
             // A new epoch never reuses the previous one's Disarm confirmation.
@@ -1093,7 +1090,7 @@ impl LiftOperations {
             if !matches!(active.phase, Phase::Descend { .. }) {
                 self.press_limit = false;
             }
-            return self.submit_phase(link);
+            return self.submit_phase(now, link);
         }
         if matches!(active.phase, Phase::Arm) {
             return self.finish(LiftOutcome::Completed(None));
@@ -1120,11 +1117,14 @@ impl LiftOperations {
         let Some(values) = sample.fresh_values(now).cloned() else {
             return;
         };
+        let holding = self.live_hold_mm.is_some();
         if values.encoder_error != 0 || !values.encoder_ready || !values.is_homed {
-            self.lose_trust();
+            self.clear_press_state();
         }
-        if !self.trusted && self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)) {
-            let cause = StopCause::Uncertain("Position trust lost during motion".into());
+        if !self.position_trusted(now)
+            && (holding || self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)))
+        {
+            let cause = StopCause::Uncertain(format!("ODrive position reference unavailable: homed {}, encoder ready {}, encoder error 0x{:x}", values.is_homed, values.encoder_ready, values.encoder_error));
             return self.stop(cause, link);
         }
         // A Home's own errors finish it as `HomeFailed`; the next sample stops.
@@ -1244,9 +1244,20 @@ impl LiftOperations {
 
     // ----- outcomes ------------------------------------------------------------
 
-    fn lose_trust(&mut self) {
-        self.trusted = false;
+    fn position_trusted(&self, now: Instant) -> bool {
+        self.verified
+            && self.latest.as_ref().is_some_and(|sample| {
+                sample.epoch() == self.epoch
+                    && sample.fresh_values(now).is_some_and(|values| {
+                        values.is_homed && values.encoder_ready && values.encoder_error == 0
+                    })
+            })
+    }
+
+    fn clear_press_state(&mut self) {
         self.touchdown_mm = None;
+        self.live_hold_mm = None;
+        self.live_hold_limit_mm = None;
     }
 
     fn finish(&mut self, outcome: LiftOutcome) {
@@ -1254,14 +1265,10 @@ impl LiftOperations {
             return;
         };
         if let LiftOutcome::Completed(hold) = &outcome {
-            match active.phase {
-                Phase::Home => self.trusted = true,
-                Phase::Clear => {
-                    self.latch = None;
-                    self.stop_evidence = None;
-                    self.stop_disarm = None;
-                }
-                _ => {}
+            if matches!(active.phase, Phase::Clear) {
+                self.latch = None;
+                self.stop_evidence = None;
+                self.stop_disarm = None;
             }
             if let Some(hold) = hold {
                 self.touchdown_mm = Some(hold.position_mm);

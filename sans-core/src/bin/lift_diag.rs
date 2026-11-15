@@ -127,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut closing = None;
     let mut failed = false;
     let mut board_lost = false;
-    let mut shown = diagnostic.status();
+    let mut shown = diagnostic.status(Instant::now());
     let mut last_current_print = None;
     loop {
         let mut link = link_port(&handle, &log);
@@ -188,7 +188,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "status",
                         format!(
                             "{:?}; {}; {HELP}",
-                            diagnostic.status(),
+                            diagnostic.status(Instant::now()),
                             diagnostic.sample_summary(Instant::now())
                         ),
                     );
@@ -241,7 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 diagnostic.link_event(at, &event, &mut link);
                 if let LinkEvent::Telemetry(sample) = &event {
-                    let armed = sample.epoch() == diagnostic.status().0.epoch
+                    let armed = sample.epoch() == diagnostic.status(Instant::now()).0.epoch
                         && sample
                             .fresh_values(at)
                             .is_some_and(|values| values.axis_state.is_armed());
@@ -271,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         diagnostic.poll(Instant::now(), &mut link);
         settle(&mut diagnostic, &log, &mut relays);
-        let status = diagnostic.status();
+        let status = diagnostic.status(Instant::now());
         if status != shown {
             log.record(Instant::now(), "status", format!("{status:?}"));
             shown = status;
@@ -300,7 +300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!(
             "incomplete={} {:?}",
             failed || log.failed(),
-            diagnostic.status()
+            diagnostic.status(Instant::now())
         ),
     );
     drop(runner);

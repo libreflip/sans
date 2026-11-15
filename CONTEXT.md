@@ -93,7 +93,7 @@ A non-Stop pause after three confirmed pickup failures in which automatic scanni
 _Avoid_: Stopped state, Stop job
 
 **Position trust**:
-Sans's judgement of whether the suction box's current position can be used for absolute motion. Only a Home that Sans watched from start to end on the current connection grants it; the board's homed flag alone never does. It is lost on every Stop, reconnect and uncertain motion, and regaining it requires Home.
+Whether the suction box's position can be used for absolute motion, based on ODrive's reported Home reference and valid current encoder feedback. Stop and Disarm do not erase that reference. Home is needed when the board cannot provide a valid homed reference.
 _Avoid_: Homed flag, homed boolean
 
 **Stop**:
@@ -105,7 +105,7 @@ A Stop for which current-connection evidence shows that motion is stopped and va
 _Avoid_: Safe stop
 
 **Clear Stop**:
-The deliberate recovery from a Confirmed Stop that clears the lift axis's errors and the Stop latch without arming; Position trust stays lost until Home.
+The deliberate recovery from a Confirmed Stop that clears the lift axis's errors and the Stop latch without arming or resuming interrupted work. A valid position reference is retained.
 _Avoid_: Reset, resume
 
 **Unconfirmed Stop**:

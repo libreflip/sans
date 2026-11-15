@@ -15,6 +15,7 @@ fn home_new_book_page_width_and_start_reach_the_first_pair() {
 
     session.tap_label("Home lift axis");
     session.wait_for_label("Idle");
+    assert!(session.has("Home lift axis"), "manual Home stays available");
     session.tap_label("New Book");
     session.wait_for_label("Enter page width");
     for key in ["2", "1", "0"] {

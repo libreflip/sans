@@ -719,7 +719,7 @@ fn spawn_controller<Factory: MachineFactory>(
                         }
                     }
                     Inbox::Intent(ControllerIntent::Home) => {
-                        let setup = matches!(state.workflow, Workflow::Setup { .. });
+                        let setup = matches!(state.workflow, Workflow::Setup { .. } | Workflow::Idle);
                         let ready = state.readiness(&lift, board.is_some()).is_enabled();
                         // A Scan session's capture never blocks Home: Stop
                         // ended its session, so its late result is dropped.
@@ -1033,15 +1033,23 @@ impl Projection {
     }
 
     /// Return to Setup, dropping any in-memory Scan session, when a live
-    /// gate fails or Position trust is lost. Home consent is then needed
-    /// again. #30 will keep the interrupted Capture cycle instead.
+    /// gate fails or native Position trust is lost. Fresh homed evidence may
+    /// return Setup to Idle; interrupted work never resumes automatically.
+    /// #30 will keep the interrupted Capture cycle instead.
     fn reconcile(&mut self, lift: &LiftAxis, board_live: bool) {
         let enabled = self.readiness(lift, board_live).is_enabled();
+        let trusted = lift.ops.status(Instant::now()).position_trusted;
         let keep = match self.workflow {
+            Workflow::Setup { .. } => {
+                if enabled && trusted {
+                    self.workflow = Workflow::Idle;
+                }
+                true
+            }
             // A running Home always ends in exactly one finish, Stop included,
             // so Homing waits for it and the button keeps meaning Stop.
-            Workflow::Setup { .. } | Workflow::Homing(_) => true,
-            _ => enabled && lift.ops.status().position_trusted,
+            Workflow::Homing(_) => true,
+            _ => enabled && trusted,
         };
         if !keep {
             self.workflow = Workflow::setup();

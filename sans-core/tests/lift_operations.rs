@@ -427,7 +427,7 @@ fn lifted_away() -> Rig {
         .unwrap();
     arrive(&mut rig);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
-    assert_eq!(rig.ops.status().live_hold_mm, None);
+    assert_eq!(rig.ops.status(rig.now).live_hold_mm, None);
     rig
 }
 
@@ -465,7 +465,7 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
     rig.board.fault_next(INPUT_POS, ReplyFault::Hold);
     let id = rig.start(MoveTo { position_mm: -50.0 }, Off).unwrap();
     let move_ticket = Ticket(rig.tickets);
-    let epoch = rig.ops.status().epoch;
+    let epoch = rig.ops.status(rig.now).epoch;
     let refused = |ticket, epoch| LinkEvent::CommandResult {
         ticket,
         epoch,
@@ -487,7 +487,7 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
     arrive(&mut rig);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
 
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     let replay: Vec<_> = rig.link_events[mark..]
         .iter()
         .map(|(_, event)| event.clone())
@@ -496,7 +496,7 @@ fn stale_and_redelivered_results_and_samples_change_nothing() {
         rig.feed(event);
     }
     assert_eq!(rig.finishes(id).len(), 1);
-    assert_eq!(rig.ops.status(), status);
+    assert_eq!(rig.ops.status(rig.now), status);
 }
 
 // ----- 2. Home ------------------------------------------------------------------
@@ -538,16 +538,16 @@ fn touchdown_descends_negative_and_lift_away_returns_toward_zero() {
     rig.trajectory_done();
     rig.run_for(25);
     assert_eq!(rig.outcome(lift), Some(LiftOutcome::Completed(None)));
-    assert_eq!(rig.ops.status().live_hold_mm, None);
+    assert_eq!(rig.ops.status(rig.now).live_hold_mm, None);
 }
 
 #[test]
-fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
+fn explicit_disarm_keeps_native_position_trust_and_waits_for_stationary_evidence() {
     let mut rig = armed();
     rig.board.fault_next(CURRENT_STATE, ReplyFault::Hold);
     let id = rig.start(LiftRequest::Disarm, Unknown).unwrap();
-    assert!(!rig.ops.status().position_trusted);
-    assert_eq!(rig.ops.status().latch, None);
+    assert!(rig.ops.status(rig.now).position_trusted);
+    assert_eq!(rig.ops.status(rig.now).latch, None);
     rig.run_for(25);
     assert_eq!(
         rig.outcome(id),
@@ -566,11 +566,14 @@ fn explicit_disarm_revokes_trust_and_waits_for_ack_then_new_sample() {
     rig.run_for(25);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8, 1]);
-    assert_eq!(rig.ops.status().latch, None, "Disarm does not latch Stop");
     assert_eq!(
-        rig.start(MoveTo { position_mm: -10.0 }, Off),
-        Err(LiftRejection::PositionUntrusted)
+        rig.ops.status(rig.now).latch,
+        None,
+        "Disarm does not latch Stop"
     );
+    arm(&mut rig);
+    rig.start(MoveTo { position_mm: -10.0 }, Off).unwrap();
+    assert_eq!(rig.board.requested_states(), vec![1, 11, 8, 1, 8]);
 }
 
 #[test]
@@ -595,7 +598,7 @@ fn explicit_disarm_during_motion_is_busy_and_stop_still_preempts() {
 #[test]
 fn home_success_grants_trust_and_leaves_the_axis_idle() {
     let mut rig = Rig::new(LIFT_AXIS);
-    assert!(!rig.ops.status().position_trusted);
+    assert!(!rig.ops.status(rig.now).position_trusted);
 
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
@@ -606,7 +609,7 @@ fn home_success_grants_trust_and_leaves_the_axis_idle() {
     rig.run_for(25);
 
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
-    assert!(rig.ops.status().position_trusted);
+    assert!(rig.ops.status(rig.now).position_trusted);
     assert_eq!(rig.board.requested_states(), vec![1, 11], "Home never arms");
 }
 
@@ -625,7 +628,7 @@ fn home_waits_for_the_axis_to_settle_wherever_it_comes_to_rest() {
     rig.axis(0.9, 0.0, 0.0);
     rig.run_for(25);
     assert_eq!(rig.outcome(id), Some(LiftOutcome::Completed(None)));
-    assert!(rig.ops.status().position_trusted);
+    assert!(rig.ops.status(rig.now).position_trusted);
 }
 
 #[test]
@@ -636,7 +639,7 @@ fn idle_without_clean_evidence_is_home_failed() {
         |rig| rig.board.set_bool(IS_HOMED, false),
         |rig| rig.board.set_bool(ENCODER_IS_READY, false),
     ];
-    for spoil in spoils {
+    for (index, spoil) in spoils.into_iter().enumerate() {
         let mut rig = Rig::new(LIFT_AXIS);
         let id = rig.start(Home, Unknown).unwrap();
         rig.run_for(5);
@@ -652,14 +655,18 @@ fn idle_without_clean_evidence_is_home_failed() {
             "{:?}",
             rig.outcome(id)
         );
-        let status = rig.ops.status();
+        let status = rig.ops.status(rig.now);
         assert_eq!(status.latch, None);
-        assert!(!status.position_trusted);
+        assert_eq!(
+            status.position_trusted,
+            index < 2,
+            "only invalid native reference flags revoke trust"
+        );
     }
 }
 
 #[test]
-fn cancelled_home_disarms_waits_for_stationary_idle_and_grants_no_trust() {
+fn cancelled_home_uses_the_boards_fresh_homed_report_after_stationary_idle() {
     let mut rig = Rig::new(LIFT_AXIS);
     let id = rig.start(Home, Unknown).unwrap();
     rig.run_for(5);
@@ -680,8 +687,8 @@ fn cancelled_home_disarms_waits_for_stationary_idle_and_grants_no_trust() {
         rig.outcome(id),
         Some(LiftOutcome::Cancelled { position_mm: -4.0 })
     );
-    let status = rig.ops.status();
-    assert!(!status.position_trusted);
+    let status = rig.ops.status(rig.now);
+    assert!(status.position_trusted);
     assert_eq!(status.latch, None);
 
     let retry = rig.start(Home, Unknown).unwrap();
@@ -704,7 +711,7 @@ fn home_timeout_becomes_stop() {
         "{:?}",
         rig.outcome(id)
     );
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
     assert_eq!(rig.board.requested_states().last(), Some(&1));
 }
 
@@ -892,7 +899,7 @@ fn routine_cancel_stops_armed_with_no_idle_write_and_accepts_a_retry() {
         Some(LiftOutcome::Cancelled { position_mm: -41.5 })
     );
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert_eq!(status.latch, None);
     assert!(status.position_trusted);
     assert!(rig
@@ -961,21 +968,21 @@ fn cancel_without_stationary_evidence_by_its_timeout_becomes_stop() {
 // ----- 5. Stop and recovery -----------------------------------------------------
 
 #[test]
-fn stop_latches_and_recovery_is_clear_then_home_then_arm() {
+fn stop_latches_but_native_homed_recovery_is_clear_then_arm() {
     let mut rig = touched_down();
 
     rig.stop();
     let (urgent, request) = rig.last_write();
     assert!(*urgent);
     assert_eq!(request.endpoint, REQUESTED_STATE);
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert!(status.latch.is_some());
-    assert!(!status.position_trusted);
+    assert!(status.position_trusted);
     assert_eq!(status.touchdown_mm, None);
     assert_eq!(status.stop_evidence, Some(StopEvidence::Pending));
     rig.run_for(25);
     assert_eq!(
-        rig.ops.status().stop_evidence,
+        rig.ops.status(rig.now).stop_evidence,
         Some(StopEvidence::Stationary)
     );
     assert_eq!(rig.start(Arm, Off), Err(LiftRejection::Latched));
@@ -991,16 +998,17 @@ fn stop_latches_and_recovery_is_clear_then_home_then_arm() {
         states,
         "clear never arms"
     );
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert_eq!(status.latch, None);
-    assert!(!status.position_trusted);
-    assert_eq!(
-        rig.start(MoveTo { position_mm: -10.0 }, Off),
-        Err(LiftRejection::PositionUntrusted)
-    );
-
-    home(&mut rig);
+    assert!(status.position_trusted);
+    let idle_move = rig.start(MoveTo { position_mm: -10.0 }, Off).unwrap();
+    assert!(matches!(
+        rig.outcome(idle_move),
+        Some(LiftOutcome::Fault(LiftFault::CommandRejected(_)))
+    ));
     arm(&mut rig);
+    rig.start(MoveTo { position_mm: -10.0 }, Off).unwrap();
+    assert_eq!(rig.board.requested_states(), vec![1, 11, 8, 1, 8]);
 }
 
 #[test]
@@ -1027,9 +1035,9 @@ fn reconnect_mid_operation_gives_one_fault_and_no_writes_beyond_the_gate() {
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
     assert_eq!(rig.write_order_since(mark), vec![REQUESTED_STATE]);
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert_eq!(status.epoch, 2);
-    assert!(!status.position_trusted);
+    assert!(status.position_trusted);
     assert_eq!(status.stop_evidence, Some(StopEvidence::Unconfirmed));
 }
 
@@ -1139,7 +1147,7 @@ fn touchdown_rejects_invalid_or_excessive_requested_current_without_writes() {
                 | LiftRejection::PressAboveBoardLimit { .. })
         ));
         assert_eq!(rig.board.writes.len(), writes);
-        assert!(rig.ops.status().active.is_none());
+        assert!(rig.ops.status(rig.now).active.is_none());
     }
 }
 
@@ -1206,7 +1214,7 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
     rig.axis(-200.4, 0.0, -1.9);
     rig.run_for(90);
     assert_eq!(rig.outcome(id), None);
-    assert_eq!(rig.ops.status().touchdown_mm, None);
+    assert_eq!(rig.ops.status(rig.now).touchdown_mm, None);
     rig.run_for(30);
     assert_eq!(
         rig.outcome(id),
@@ -1216,7 +1224,7 @@ fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
             hold_limit_mm: -202.0,
         })))
     );
-    assert_eq!(rig.ops.status().touchdown_mm, Some(-200.4));
+    assert_eq!(rig.ops.status(rig.now).touchdown_mm, Some(-200.4));
 }
 
 #[test]
@@ -1244,7 +1252,7 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::ContactNotHeld))
     );
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert_eq!(status.touchdown_mm, None);
     assert_eq!(status.latch, None);
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8], "still armed");
@@ -1295,7 +1303,7 @@ fn touchdown_ends_in_typed_faults_at_its_bounds() {
         (slow, timed_out, TimedOut),
     ] {
         assert_eq!(rig.outcome(id), Some(LiftOutcome::Fault(fault)));
-        assert_eq!(rig.ops.status().latch, None);
+        assert_eq!(rig.ops.status(rig.now).latch, None);
         assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
     }
 }
@@ -1349,7 +1357,7 @@ fn dropped_telemetry_during_touchdown_ends_in_stop_never_contact() {
         "{:?}",
         rig.outcome(id)
     );
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
 }
 
 // ----- 8. Page-turn legs --------------------------------------------------------
@@ -1409,7 +1417,7 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
         .collect();
     assert_eq!(cutoffs, vec![&LiftEvent::TurnBlowerCutoff { id }]);
     assert_eq!(
-        rig.ops.status().touchdown_mm,
+        rig.ops.status(rig.now).touchdown_mm,
         Some(-200.4),
         "replaced only on completion"
     );
@@ -1472,13 +1480,13 @@ fn stationary_stop_evidence_is_withdrawn_by_contradiction_or_link_loss() {
     contradicted.stop();
     contradicted.run_for(25);
     assert_eq!(
-        contradicted.ops.status().stop_evidence,
+        contradicted.ops.status(contradicted.now).stop_evidence,
         Some(StopEvidence::Stationary)
     );
     contradicted.axis(0.0, -1.0, 0.0);
     contradicted.run_for(25);
     assert_eq!(
-        contradicted.ops.status().stop_evidence,
+        contradicted.ops.status(contradicted.now).stop_evidence,
         Some(StopEvidence::Unconfirmed)
     );
 
@@ -1486,14 +1494,14 @@ fn stationary_stop_evidence_is_withdrawn_by_contradiction_or_link_loss() {
     reconnected.stop();
     reconnected.run_for(25);
     assert_eq!(
-        reconnected.ops.status().stop_evidence,
+        reconnected.ops.status(reconnected.now).stop_evidence,
         Some(StopEvidence::Stationary)
     );
     reconnected.connect();
     // Idle stationary samples in the new epoch reuse no earlier confirmation.
     reconnected.run_for(100);
     assert_eq!(
-        reconnected.ops.status().stop_evidence,
+        reconnected.ops.status(reconnected.now).stop_evidence,
         Some(StopEvidence::Unconfirmed)
     );
 }
@@ -1546,7 +1554,7 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
     ));
-    assert!(!rig.ops.status().position_trusted);
+    assert!(!rig.ops.status(rig.now).position_trusted);
 }
 
 // ----- 9. Leaving the hold ------------------------------------------------------
@@ -1554,7 +1562,7 @@ fn losing_position_trust_stops_pending_and_active_motion_once() {
 #[test]
 fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     let mut rig = touched_down();
-    assert_eq!(rig.ops.status().live_hold_mm, Some(-200.4));
+    assert_eq!(rig.ops.status(rig.now).live_hold_mm, Some(-200.4));
     let writes = rig.board.writes.len();
     let wire = rig.wire.len();
 
@@ -1608,7 +1616,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     arrive(&mut rig);
     assert_eq!(rig.outcome(leg), Some(LiftOutcome::Completed(None)));
-    assert_eq!(rig.ops.status().live_hold_mm, None);
+    assert_eq!(rig.ops.status(rig.now).live_hold_mm, None);
 
     let mark = rig.board.writes.len();
     let park = rig.start(MoveTo { position_mm: -50.0 }, Unknown).unwrap();
@@ -1634,7 +1642,7 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
         "{:?}",
         stuck.outcome(clear)
     );
-    assert!(stuck.ops.status().latch.is_some());
+    assert!(stuck.ops.status(stuck.now).latch.is_some());
 
     // Parked on a pressed endstop, upstream re-sets only the endstop bit.
     let mut parked = armed();
@@ -1645,7 +1653,7 @@ fn clear_fault_keeps_the_latch_while_errors_other_than_a_pressed_endstop_remain(
     let clear = parked.clear_fault().unwrap();
     parked.run_for(50);
     assert_eq!(parked.outcome(clear), Some(LiftOutcome::Completed(None)));
-    assert_eq!(parked.ops.status().latch, None);
+    assert_eq!(parked.ops.status(parked.now).latch, None);
 }
 
 #[test]
@@ -1653,13 +1661,13 @@ fn an_odrive_error_latches_stop_and_clear_stop_clears_it() {
     let mut rig = homed();
     rig.board.set_i32(MOTOR_ERROR, 0x40);
     rig.run_for(25);
-    let status = rig.ops.status();
+    let status = rig.ops.status(rig.now);
     assert!(
         matches!(&status.latch, Some(StopCause::AxisError(errors)) if errors.contains("motor BrakeCurrentOutOfRange (0x40)")),
         "{:?}",
         status.latch
     );
-    assert!(!status.position_trusted);
+    assert!(status.position_trusted);
     assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
 
     let clear = rig.clear_stop().unwrap();
@@ -1669,7 +1677,7 @@ fn an_odrive_error_latches_stop_and_clear_stop_clears_it() {
     rig.board.set_i32(MOTOR_ERROR, 0);
     rig.run_for(50);
     assert_eq!(rig.outcome(clear), Some(LiftOutcome::Completed(None)));
-    assert_eq!(rig.ops.status().latch, None);
+    assert_eq!(rig.ops.status(rig.now).latch, None);
 }
 
 #[test]
@@ -1678,13 +1686,13 @@ fn resting_on_the_pressed_minimum_endstop_is_not_an_odrive_error() {
     rig.board.set_i32(AXIS_ERROR, 1 << 12);
     rig.board.set_bool(MIN_ENDSTOP_STATE, true);
     rig.run_for(50);
-    assert_eq!(rig.ops.status().latch, None);
+    assert_eq!(rig.ops.status(rig.now).latch, None);
 
     // The bit without the pressed endstop is an error.
     rig.board.set_bool(MIN_ENDSTOP_STATE, false);
     rig.run_for(25);
     assert!(matches!(
-        rig.ops.status().latch,
+        rig.ops.status(rig.now).latch,
         Some(StopCause::AxisError(_))
     ));
 }
@@ -1721,7 +1729,7 @@ fn after_a_reconnect_under_the_press_limit_the_odrives_own_limit_is_restored() {
     rig.connect();
     rig.run_for(25);
     assert!(
-        rig.ops.status().latch.is_some(),
+        rig.ops.status(rig.now).latch.is_some(),
         "a reconnect while armed stops"
     );
     let clear = rig.clear_fault().unwrap();
@@ -1768,7 +1776,7 @@ fn relay_failure_is_unconfirmed_even_with_a_stationary_axis() {
     rig.run_for(25);
 
     assert_eq!(
-        rig.ops.status().stop_evidence,
+        rig.ops.status(rig.now).stop_evidence,
         Some(StopEvidence::Stationary)
     );
     assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
@@ -1789,7 +1797,7 @@ fn missing_evidence_is_unconfirmed_at_the_deadline_and_late_evidence_never_upgra
     rig.axis(-50.0, 0.0, 0.0);
     rig.run_for(50);
     assert_eq!(
-        rig.ops.status().stop_evidence,
+        rig.ops.status(rig.now).stop_evidence,
         Some(StopEvidence::Stationary)
     );
     assert!(unconfirmed(rig.verdict()));
@@ -1802,7 +1810,7 @@ fn a_lift_fault_latch_is_adopted_and_sends_all_off_once() {
     // Home never finishes, so its timeout latches Stop inside the lift module.
     rig.run_for(3_000);
 
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
     assert_eq!(rig.relay_calls.len(), 1);
     rig.run_for(100);
     assert_eq!(rig.relay_calls.len(), 1);
@@ -1885,9 +1893,9 @@ fn clear_stop_needs_a_confirmed_stop_and_never_arms() {
         states,
         "clear never arms"
     );
-    assert_eq!(rig.ops.status().latch, None);
+    assert_eq!(rig.ops.status(rig.now).latch, None);
     assert_eq!(rig.control.status(), None);
-    assert!(!rig.ops.status().position_trusted);
+    assert!(rig.ops.status(rig.now).position_trusted);
 }
 
 #[test]
@@ -1900,7 +1908,7 @@ fn reconnect_unconfirms_and_a_new_stop_confirms_in_the_new_epoch() {
     rig.connect();
     rig.run_for(25);
     assert!(
-        rig.ops.status().latch.is_some(),
+        rig.ops.status(rig.now).latch.is_some(),
         "a reconnect keeps the latch"
     );
     assert!(unconfirmed(rig.verdict()));
@@ -1926,7 +1934,7 @@ fn clear_stop_fails_and_keeps_the_latch_while_the_axis_moves() {
         rig.outcome(clear),
         Some(LiftOutcome::Fault(LiftFault::ClearFailed(_)))
     ));
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
     assert!(unconfirmed(rig.verdict()), "{:?}", rig.verdict());
 }
 
@@ -1943,7 +1951,7 @@ fn a_stop_the_lift_module_repeats_on_its_own_is_a_new_attempt() {
     rig.run_for(2_100);
 
     assert_eq!(rig.relay_calls.len(), 2);
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
 }
 
 #[test]
@@ -2008,7 +2016,7 @@ fn cancel_during_torque_entry_retires_the_remaining_press_writes() {
         rig.outcome(id),
         Some(LiftOutcome::Cancelled { .. })
     ));
-    assert!(rig.ops.status().latch.is_none());
+    assert!(rig.ops.status(rig.now).latch.is_none());
 }
 
 #[test]
@@ -2117,7 +2125,7 @@ fn a_completed_torque_hold_still_stops_if_contact_gives_way() {
     let mut rig = touched_down();
     rig.axis(-203.0, -1.0, -PRESS_A);
     rig.run_for(25);
-    assert!(rig.ops.status().latch.is_some());
+    assert!(rig.ops.status(rig.now).latch.is_some());
     assert_eq!(rig.board.requested_states().last(), Some(&1));
     assert_eq!(rig.relay_calls.len(), 1);
 }
@@ -2129,7 +2137,7 @@ fn home_after_a_torque_stop_recovers_even_outside_normal_travel() {
     rig.run_for(50);
     assert_eq!(rig.verdict(), Some(StopVerdict::Confirmed));
     rig.clear_stop().unwrap();
-    rig.run_until(100, |rig| rig.ops.status().latch.is_none());
+    rig.run_until(100, |rig| rig.ops.status(rig.now).latch.is_none());
     let mark = rig.board.writes.len();
     let id = rig.start(Home, Unknown).unwrap();
     assert!(!rig.write_order_since(mark).contains(&INPUT_POS));
@@ -2165,7 +2173,7 @@ fn reversed_motor_current_direction_does_not_reverse_the_torque_command() {
             rig.outcome(id),
             Some(LiftOutcome::Completed(Some(_)))
         ));
-        assert!(rig.ops.status().latch.is_none());
+        assert!(rig.ops.status(rig.now).latch.is_none());
     }
 }
 
@@ -2187,8 +2195,8 @@ fn cancelling_lift_away_ends_torque_hold_without_latching_stop() {
         rig.outcome(id),
         Some(LiftOutcome::Cancelled { .. })
     ));
-    assert_eq!(rig.ops.status().live_hold_mm, None);
-    assert!(rig.ops.status().latch.is_none());
+    assert_eq!(rig.ops.status(rig.now).live_hold_mm, None);
+    assert!(rig.ops.status(rig.now).latch.is_none());
     assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&PRESS_A));
     rig.start(
         MoveTo {
@@ -2225,12 +2233,12 @@ fn torque_hold_depth_smaller_than_position_tolerance_still_holds_contact() {
                 rig.outcome(id),
                 Some(LiftOutcome::Completed(Some(_)))
             ));
-            assert!(rig.ops.status().latch.is_none());
+            assert!(rig.ops.status(rig.now).latch.is_none());
         }
         rig.axis(-200.2, 0.0, -PRESS_A);
         rig.run_for(50);
         if complete_first {
-            assert!(rig.ops.status().latch.is_some());
+            assert!(rig.ops.status(rig.now).latch.is_some());
         } else {
             rig.trajectory_done();
             rig.run_for(25);
@@ -2301,7 +2309,7 @@ fn torque_touchdown_allows_the_firmware_limiter_to_reduce_press_current() {
             Some(&(speed / 5.0))
         );
         assert_eq!(rig.outcome(id), None);
-        assert!(rig.ops.status().latch.is_none());
+        assert!(rig.ops.status(rig.now).latch.is_none());
         rig.cancel(id);
         rig.trajectory_done();
         rig.run_for(25);
@@ -2329,7 +2337,7 @@ fn touchdown_at_travel_limit_cancels_without_a_projected_stop() {
     // sample would extend past -300 mm, but Touchdown is stopped by the book.
     rig.axis(-300.0, -3.0, -PRESS_A);
     rig.run_for(25);
-    assert!(rig.ops.status().latch.is_none());
+    assert!(rig.ops.status(rig.now).latch.is_none());
     assert_eq!(rig.board.requested_states(), vec![1, 11, 8]);
     rig.axis(-300.0, 0.0, -PRESS_A);
     rig.trajectory_done();
@@ -2338,7 +2346,7 @@ fn touchdown_at_travel_limit_cancels_without_a_projected_stop() {
         rig.outcome(id),
         Some(LiftOutcome::Fault(LiftFault::TravelExhausted))
     );
-    assert!(rig.ops.status().position_trusted);
+    assert!(rig.ops.status(rig.now).position_trusted);
 }
 
 #[test]
@@ -2356,7 +2364,7 @@ fn touchdown_cancel_still_stops_on_measured_overtravel() {
         .unwrap();
     rig.axis(-300.0, -3.0, -PRESS_A);
     rig.run_for(25);
-    assert!(rig.ops.status().latch.is_none());
+    assert!(rig.ops.status(rig.now).latch.is_none());
     rig.axis(-300.25, 0.0, -PRESS_A);
     rig.trajectory_done();
     rig.run_for(25);
@@ -2393,11 +2401,119 @@ fn touchdown_can_record_contact_inside_the_old_hold_depth_margin() {
                 hold_limit_mm: -300.0,
             })))
         );
-        assert!(rig.ops.status().latch.is_none());
+        assert!(rig.ops.status(rig.now).latch.is_none());
         assert_eq!(rig.moves(), vec![0.0]);
         rig.axis(-300.0, 0.0, -PRESS_A);
         rig.run_for(25);
-        assert!(rig.ops.status().latch.is_some());
+        assert!(rig.ops.status(rig.now).latch.is_some());
         assert_eq!(rig.board.requested_states().last(), Some(&1));
+    }
+}
+
+#[test]
+fn native_homed_encoder_allows_motion_without_a_host_observed_home() {
+    let mut rig = Rig::new(LIFT_AXIS);
+    rig.board.set_bool(IS_HOMED, true);
+    rig.run_for(25);
+    assert!(rig.ops.status(rig.now).position_trusted);
+    arm(&mut rig);
+    rig.start(MoveTo { position_mm: -10.0 }, Off).unwrap();
+    assert_eq!(rig.board.requested_states(), vec![1, 8]);
+    assert_eq!(rig.moves(), vec![-10.0]);
+}
+
+#[test]
+fn native_homed_trust_expires_without_fresh_samples_and_needs_a_verified_link() {
+    let mut rig = homed();
+    assert!(
+        !rig.ops
+            .status(rig.now + Duration::from_millis(101))
+            .position_trusted
+    );
+    let sample = rig
+        .link_events
+        .iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            LinkEvent::Telemetry(sample) => Some(sample.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let mut status = rig.engine.status();
+    status.phase = sans_core::LinkPhase::Faulted;
+    rig.feed(LinkEvent::Status(status));
+    rig.feed(LinkEvent::Telemetry(sample));
+    assert!(!rig.ops.status(rig.now).position_trusted);
+}
+
+#[test]
+fn reconnect_uses_only_the_new_epochs_native_reference() {
+    let mut rig = homed();
+    let old = rig
+        .link_events
+        .iter()
+        .rev()
+        .find_map(|(_, e)| match e {
+            LinkEvent::Telemetry(sample) => Some(sample.clone()),
+            _ => None,
+        })
+        .unwrap();
+    rig.board.set_bool(IS_HOMED, false);
+    rig.connect();
+    rig.feed(LinkEvent::Telemetry(old));
+    assert!(!rig.ops.status(rig.now).position_trusted);
+    rig.board.set_bool(IS_HOMED, true);
+    rig.run_for(25);
+    assert!(rig.ops.status(rig.now).position_trusted);
+    assert_eq!(rig.board.requested_states(), vec![1, 11, 1]);
+}
+
+#[test]
+fn invalid_native_reference_stops_motion_and_a_fresh_valid_report_restores_trust() {
+    let spoils: [fn(&mut FakeFibre); 3] = [
+        |board| board.set_bool(IS_HOMED, false),
+        |board| board.set_bool(ENCODER_IS_READY, false),
+        |board| board.set_i32(ENCODER_ERROR, 1),
+    ];
+    for spoil in spoils {
+        let mut rig = armed();
+        let id = rig
+            .start(
+                MoveTo {
+                    position_mm: -100.0,
+                },
+                Off,
+            )
+            .unwrap();
+        spoil(&mut rig.board);
+        rig.run_for(25);
+        assert!(matches!(
+            rig.outcome(id),
+            Some(LiftOutcome::Fault(LiftFault::Stopped(_)))
+        ));
+        assert!(!rig.ops.status(rig.now).position_trusted);
+        rig.board.set_bool(IS_HOMED, true);
+        rig.board.set_bool(ENCODER_IS_READY, true);
+        rig.board.set_i32(ENCODER_ERROR, 0);
+        rig.run_for(25);
+        assert!(rig.ops.status(rig.now).position_trusted);
+        assert_eq!(
+            rig.start(MoveTo { position_mm: -10.0 }, Off),
+            Err(LiftRejection::Latched)
+        );
+    }
+}
+
+#[test]
+fn completed_torque_hold_stops_when_native_position_reference_is_lost() {
+    for endpoint in [IS_HOMED, ENCODER_IS_READY] {
+        let mut rig = touched_down();
+        assert!(rig.ops.status(rig.now).active.is_none());
+        rig.board.set_bool(endpoint, false);
+        rig.run_for(25);
+        assert!(rig.ops.status(rig.now).latch.is_some());
+        assert!(!rig.ops.status(rig.now).position_trusted);
+        assert_eq!(rig.board.requested_states().last(), Some(&1));
+        assert_eq!(rig.relay_calls.len(), 1);
     }
 }

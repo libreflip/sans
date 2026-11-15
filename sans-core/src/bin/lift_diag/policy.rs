@@ -119,7 +119,7 @@ impl Diagnostic {
                 let current = self
                     .latest
                     .as_ref()
-                    .filter(|sample| sample.epoch() == self.ops.status().epoch)
+                    .filter(|sample| sample.epoch() == self.ops.status(now).epoch)
                     .and_then(|sample| sample.fresh_values(now))
                     .and_then(|values| values.position_mm)
                     .ok_or("lift needs a fresh position")?;
@@ -132,7 +132,7 @@ impl Diagnostic {
                 LiftRequest::MoveTo { position_mm }
             }
             Command::Cancel => {
-                if let Some(id) = self.ops.status().active {
+                if let Some(id) = self.ops.status(now).active {
                     self.ops.cancel(now, id, link);
                 }
                 return Ok(None);
@@ -147,7 +147,7 @@ impl Diagnostic {
                 return Ok(None);
             }
             Command::ClearFault => {
-                return if self.ops.status().latch.is_some() {
+                return if self.ops.status(now).latch.is_some() {
                     self.stop
                         .clear(now, &mut self.ops, link)
                         .map(Some)
@@ -214,15 +214,15 @@ impl Diagnostic {
         events
     }
 
-    pub(super) fn status(&self) -> (LiftStatus, Option<StopStatus>) {
-        (self.ops.status(), self.stop.status())
+    pub(super) fn status(&self, now: Instant) -> (LiftStatus, Option<StopStatus>) {
+        (self.ops.status(now), self.stop.status())
     }
 
     pub(super) fn sample_summary(&self, now: Instant) -> String {
         let Some(sample) = self
             .latest
             .as_ref()
-            .filter(|s| s.epoch() == self.ops.status().epoch)
+            .filter(|s| s.epoch() == self.ops.status(now).epoch)
         else {
             return "no current-epoch sample".into();
         };

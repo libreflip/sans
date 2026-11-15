@@ -53,7 +53,8 @@ scripts/pi-run --bin lift_diag pi@sans-pi.local -- \
 Those profile and CSV paths are on the Pi; the CSV stays there.
 
 Use a new CSV filename each time. Startup leaves the axis idle and the air
-actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
+actuators off. Wait for `Verified`, then use `status` to check fresh telemetry. A fresh native
+homed report with ready, error-free encoder feedback establishes Position trust.
 
 ## Commands
 
@@ -61,7 +62,7 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | --- | --- |
 | `home` | Run Home and establish Position trust. |
 | `arm` | Enable the motor, as a separate action. |
-| `disarm` | Idle the motor when no operation is active; loses Position trust. |
+| `disarm` | Idle the motor when no operation is active; keeps a valid Home reference. |
 | `move -10` | Move down to absolute position -10 mm. |
 | `touchdown 1.0 5` | Press at 1 A in torque mode with a 5 mm/s firmware velocity limit. Speed is optional. |
 | `lift -5` | Lift to absolute position -5 mm, which must be above the current position. |
@@ -78,7 +79,8 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 2. Try `touchdown <amps> [mm/s]` on scrap material, then `lift` away. Check that contact
    detection and press hold work, and that the press current can lift the load.
 3. Try `cancel`, `stop` and the physical button during motion. After a Confirmed
-   Stop, recover with separate `clear-fault`, `home` and `arm` commands. If Stop
+   Stop, use `clear-fault`, then `arm` as separate commands. Run `home` only if
+   ODrive no longer reports a valid Home reference. If Stop
    is Unconfirmed, switch off power and check the machine before continuing.
 
 A crash can leave temporary limits in board RAM. Check the board limits before

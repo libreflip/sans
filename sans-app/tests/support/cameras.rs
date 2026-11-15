@@ -157,7 +157,7 @@ impl FixtureFactory {
     pub fn scanner(left: Vec<Step>, right: Vec<Step>) -> (Self, CaptureCalls) {
         let mut board = FakeFibre::compatible();
         board.settle_after_one_read.insert(11, 1);
-        board.set_bool(IS_HOMED, true);
+        board.set_bool(IS_HOMED, false);
         board.set_bool(TRAJECTORY_DONE, true);
         let calls = CaptureCalls::default();
         (
