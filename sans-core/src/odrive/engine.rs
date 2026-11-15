@@ -2111,13 +2111,13 @@ impl LinkEngine {
                 }
                 Err(reason) => {
                     self.sequences.quarantine(sequence);
-                    self.latch_fault(reason.clone());
                     let lane = self
                         .connection
                         .as_mut()
                         .expect("connection")
                         .urgent
                         .remove(lane);
+                    self.latch_fault(reason.clone());
                     self.finish(
                         lane.op.ticket,
                         lane.op.command,

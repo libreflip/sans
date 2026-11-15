@@ -135,15 +135,7 @@ impl Rig {
     /// Exchange packets with the board and feed link events until quiet.
     fn settle(&mut self) {
         for _ in 0..50_000 {
-            let mut replies = Vec::new();
-            while let Some(transmit) = self.engine.take_transmit() {
-                if !transmit.claim_for_send(self.now) {
-                    continue;
-                }
-                self.wire
-                    .push((transmit.urgent, decode_request(&transmit.packet)));
-                replies.extend(self.board.handle(&transmit.packet));
-            }
+            let replies = self.exchange_packets();
             let mut fed = false;
             while let Some(event) = self.engine.take_event() {
                 fed = true;
@@ -164,6 +156,55 @@ impl Rig {
             }
         }
         panic!("the rig kept exchanging without time passing");
+    }
+
+    /// Exchange a batch of packets without consuming policy events.
+    fn exchange_packets(&mut self) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        while let Some(transmit) = self.engine.take_transmit() {
+            if !transmit.claim_for_send(self.now) {
+                continue;
+            }
+            self.wire
+                .push((transmit.urgent, decode_request(&transmit.packet)));
+            replies.extend(self.board.handle(&transmit.packet));
+        }
+        replies
+    }
+
+    /// Isolate adapter failure handling from the lift's automatic Stop response.
+    fn settle_link_only(&mut self) {
+        for _ in 0..50_000 {
+            let replies = self.exchange_packets();
+            if replies.is_empty() {
+                return;
+            }
+            for reply in replies {
+                self.engine.receive(self.now, &reply);
+            }
+        }
+        panic!("the link kept exchanging without time passing");
+    }
+
+    fn submit_link_only(&mut self, command: LinkCommand, priority: Priority) -> Ticket {
+        port(&mut self.engine, &mut self.tickets, self.now)(command, priority).unwrap()
+    }
+
+    fn link_results(&mut self, ticket: Ticket) -> Vec<sans_core::CommandResult> {
+        let mut results = Vec::new();
+        while let Some(event) = self.engine.take_event() {
+            if let LinkEvent::CommandResult {
+                ticket: got,
+                result,
+                ..
+            } = event
+            {
+                if got == ticket {
+                    results.push(result);
+                }
+            }
+        }
+        results
     }
 
     fn observe(&mut self) {
@@ -2311,50 +2352,24 @@ fn completed_torque_hold_stops_when_native_position_reference_is_lost() {
 #[test]
 fn link_fault_retires_a_press_between_stages_without_waiting_for_reconnect() {
     let mut rig = armed();
-    let ticket = Ticket(9000);
     rig.board.fault_next(INPUT_POS, ReplyFault::Hold);
-    rig.engine.submit(
-        rig.now,
-        ticket,
+    let ticket = rig.submit_link_only(
         LinkCommand::BeginTorquePress {
             amps: PRESS_A,
             velocity_mm_s: 4.0,
         },
         Priority::Ordinary,
     );
-    let first = rig.engine.take_transmit().unwrap();
-    assert!(first.claim_for_send(rig.now));
-    assert!(rig.board.handle(&first.packet).is_none());
+    rig.settle_link_only();
     rig.now += Duration::from_millis(21);
     rig.board.set_f32(POS_ESTIMATE, f32::NAN);
     for reply in rig.board.take_held() {
         rig.engine.receive(rig.now, &reply);
     }
-    // Exercise the adapter directly here: the lift's reaction to a fault would
-    // send Stop and mask a stranded adapter ticket.
-    while let Some(packet) = rig.engine.take_transmit() {
-        if packet.claim_for_send(rig.now) {
-            if let Some(reply) = rig.board.handle(&packet.packet) {
-                rig.engine.receive(rig.now, &reply);
-            }
-        }
-    }
-    let mut results = Vec::new();
-    while let Some(event) = rig.engine.take_event() {
-        if let LinkEvent::CommandResult {
-            ticket: got,
-            result,
-            ..
-        } = event
-        {
-            if got == ticket {
-                results.push(result);
-            }
-        }
-    }
+    rig.settle_link_only();
     assert_eq!(rig.engine.status().phase, sans_core::LinkPhase::Faulted);
     assert_eq!(
-        results,
+        rig.link_results(ticket),
         vec![sans_core::CommandResult::Retired { transmitted: true }]
     );
 }
@@ -2386,4 +2401,37 @@ fn moving_touchdown_entry_is_not_a_torque_settings_error() {
         Err(LiftRejection::NotStationary)
     );
     assert_eq!(rig.board.writes.len(), mark);
+}
+
+#[test]
+fn malformed_urgent_press_reply_finishes_once_and_still_allows_disarm() {
+    let mut rig = armed();
+    rig.board.fault_next(INPUT_POS, ReplyFault::Hold);
+    let ticket = rig.submit_link_only(
+        LinkCommand::BeginTorquePress {
+            amps: PRESS_A,
+            velocity_mm_s: 4.0,
+        },
+        Priority::Urgent,
+    );
+    rig.settle_link_only();
+    let mut replies = rig.board.take_held();
+    assert_eq!(replies.len(), 1);
+    let mut reply = replies.pop().unwrap();
+    reply.push(0); // A write acknowledgement must have no payload.
+    rig.engine.receive(rig.now, &reply);
+    rig.settle_link_only();
+    assert_eq!(rig.engine.status().phase, sans_core::LinkPhase::Faulted);
+    let results = rig.link_results(ticket);
+    assert!(matches!(
+        results.as_slice(),
+        [sans_core::CommandResult::OutcomeUnknown { .. }]
+    ));
+    let stop = rig.submit_link_only(LinkCommand::Disarm, Priority::Urgent);
+    rig.settle_link_only();
+    assert_eq!(
+        rig.link_results(stop),
+        vec![sans_core::CommandResult::Completed]
+    );
+    assert_eq!(rig.board.requested_states().last(), Some(&1));
 }

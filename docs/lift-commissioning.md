@@ -31,9 +31,8 @@ limiter; its current and optional speed cannot exceed the board's limits. Omitte
 speed uses the lower controller/trajectory limit. The firmware may reduce actual
 current to enforce that speed, including while stationary.
 
-The commissioned board uses `axis0.encoder.config.ignore_illegal_hall_state = True`.
-The operator enabled it after an earlier "Position trust lost during motion"
-Stop. This is a board setting; Sans does not write it.
+Board-specific changes reported by the operator are recorded with the
+[run 16 observations](../sans-core/test-results/lift-16.md).
 
 Contact hold keeps the torque and monitors downward drift against
 `touchdown_hold_depth_mm`. Cancelling an active Touchdown or lifting away
