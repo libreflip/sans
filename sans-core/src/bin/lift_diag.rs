@@ -18,6 +18,8 @@ use sans_core::{
     MonospaceEventKind, StopCause, StopVerdict, UsbFibreOpener,
 };
 
+const CURRENT_PRINT_INTERVAL: Duration = Duration::from_millis(200);
+
 #[derive(Parser)]
 #[command(about = "Supervised ODrive lift diagnostic. Stop other device owners first.")]
 struct Args {
@@ -126,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut failed = false;
     let mut board_lost = false;
     let mut shown = diagnostic.status();
+    let mut last_current_print = None;
     loop {
         let mut link = link_port(&handle, &log);
         let mut relays = |within| {
@@ -237,6 +240,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 diagnostic.link_event(at, &event, &mut link);
+                if let LinkEvent::Telemetry(sample) = &event {
+                    let armed = sample.epoch() == diagnostic.status().0.epoch
+                        && sample
+                            .fresh_values(at)
+                            .is_some_and(|values| values.axis_state.is_armed());
+                    if !armed {
+                        last_current_print = None;
+                    } else if last_current_print.is_none_or(|last| {
+                        at.saturating_duration_since(last) >= CURRENT_PRINT_INTERVAL
+                    }) {
+                        log.record(at, "current", diagnostic.sample_summary(at));
+                        last_current_print = Some(at);
+                    }
+                }
                 settle(&mut diagnostic, &log, &mut relays);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) if closing.is_none() => {

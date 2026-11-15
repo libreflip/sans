@@ -389,6 +389,7 @@ fn touched_down() -> Rig {
     let id = descend_to_contact(
         &mut rig,
         Touchdown {
+            press_current_a: PRESS_A,
             post_turn_page_width_mm: None,
         },
         -200.0,
@@ -497,6 +498,7 @@ fn touchdown_descends_negative_and_lift_away_returns_toward_zero() {
     let id = rig
         .start(
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: None,
             },
             Off,
@@ -738,6 +740,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         ),
         (
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: None,
             },
             Unknown,
@@ -745,6 +748,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
         ),
         (
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: Some(351.0),
             },
             Off,
@@ -786,6 +790,7 @@ fn invalid_targets_are_rejected_before_anything_is_sent() {
     assert_eq!(
         untrusted.start(
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: None
             },
             Off
@@ -1048,12 +1053,76 @@ fn stop_leaves_urgently_while_a_telemetry_read_is_held() {
 // ----- 6. Touchdown contact and hold --------------------------------------------
 
 #[test]
+fn touchdown_uses_requested_current_for_contact_hold_and_lift_away() {
+    let mut rig = armed();
+    let id = rig
+        .start(
+            Touchdown {
+                press_current_a: 1.0,
+                post_turn_page_width_mm: None,
+            },
+            Off,
+        )
+        .unwrap();
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&1.0));
+    rig.axis(-150.0, -5.0, -0.95);
+    rig.run_for(150);
+    rig.axis(-200.0, 0.0, -0.95);
+    rig.run_until(300, |rig| rig.moves().len() == 2);
+    assert_eq!(rig.moves(), vec![-298.0, -202.0]);
+    rig.axis(-200.4, 0.0, -0.95);
+    rig.run_for(150);
+    assert_eq!(
+        rig.outcome(id),
+        Some(LiftOutcome::Completed(Some(TouchdownHold {
+            position_mm: -200.4,
+            press_current_a: 1.0,
+            hold_target_mm: -202.0,
+        })))
+    );
+    let mark = rig.board.writes.len();
+    rig.start(
+        MoveTo {
+            position_mm: -100.0,
+        },
+        Unknown,
+    )
+    .unwrap();
+    assert_eq!(rig.write_order_since(mark), vec![INPUT_POS]);
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&1.0));
+    arrive(&mut rig);
+    rig.start(MoveTo { position_mm: -50.0 }, Unknown).unwrap();
+    assert_eq!(rig.f32_writes(CURRENT_LIM).last(), Some(&4.0));
+}
+
+#[test]
+fn touchdown_rejects_invalid_or_excessive_requested_current_without_writes() {
+    let mut rig = armed();
+    let writes = rig.board.writes.len();
+    for current_a in [0.0, -1.0, f32::NAN, f32::INFINITY, 2.01, 4.0] {
+        assert!(matches!(
+            rig.start(
+                Touchdown {
+                    press_current_a: current_a,
+                    post_turn_page_width_mm: None,
+                },
+                Off
+            ),
+            Err(LiftRejection::InvalidPressCurrent { maximum_a: 2.0, .. })
+        ));
+        assert_eq!(rig.board.writes.len(), writes);
+        assert!(rig.ops.status().active.is_none());
+    }
+}
+
+#[test]
 fn touchdown_detects_contact_after_grace_and_records_only_once_settled() {
     let mut rig = armed();
     let mark = rig.board.writes.len();
     let id = rig
         .start(
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: None,
             },
             Off,
@@ -1114,6 +1183,7 @@ fn hold_that_reaches_its_target_unresisted_is_contact_not_held() {
     let id = descend_to_contact(
         &mut rig,
         Touchdown {
+            press_current_a: PRESS_A,
             post_turn_page_width_mm: None,
         },
         -200.0,
@@ -1149,6 +1219,7 @@ fn touchdown_ending(
     ms: u64,
 ) -> OperationId {
     let request = Touchdown {
+        press_current_a: PRESS_A,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
@@ -1191,6 +1262,7 @@ fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
     let mut rig = armed_with(&lift_axis);
 
     let request = Touchdown {
+        press_current_a: PRESS_A,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
@@ -1211,6 +1283,7 @@ fn contact_too_close_to_travel_for_a_hold_target_is_never_clamped() {
 fn dropped_telemetry_during_touchdown_ends_in_stop_never_contact() {
     let mut rig = armed();
     let request = Touchdown {
+        press_current_a: PRESS_A,
         post_turn_page_width_mm: None,
     };
     let id = rig.start(request, Off).unwrap();
@@ -1272,6 +1345,7 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
     let id = rig
         .start(
             Touchdown {
+                press_current_a: PRESS_A,
                 post_turn_page_width_mm: Some(150.0),
             },
             Off,
@@ -1314,6 +1388,7 @@ fn touchdown_detects_contact_from_descent_current_only_in_both_directions() {
         let id = rig
             .start(
                 Touchdown {
+                    press_current_a: PRESS_A,
                     post_turn_page_width_mm: None,
                 },
                 Off,
@@ -1446,6 +1521,7 @@ fn a_live_hold_rejects_home_and_descents_and_lifts_away_at_the_press_limit() {
         Err(LiftRejection::InHold)
     );
     let touchdown = Touchdown {
+        press_current_a: PRESS_A,
         post_turn_page_width_mm: None,
     };
     assert_eq!(rig.start(touchdown, Off), Err(LiftRejection::InHold));

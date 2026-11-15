@@ -8,7 +8,7 @@ use sans_core::{
     OperationId, Relays, StopCause, StopControl, StopStatus, TelemetrySample, VacuumEvidence,
 };
 
-pub(super) const HELP: &str = "home | arm | disarm | move <absolute-mm> | touchdown | lift <absolute-mm> | cancel | stop | clear-fault | status | quit";
+pub(super) const HELP: &str = "home | arm | disarm | move <absolute-mm> | touchdown <amps> | lift <absolute-mm> | cancel | stop | clear-fault | status | quit";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Command {
@@ -16,7 +16,7 @@ pub(super) enum Command {
     Arm,
     Disarm,
     Move(f32),
-    Touchdown,
+    Touchdown(f32),
     Lift(f32),
     Cancel,
     Stop,
@@ -34,7 +34,15 @@ impl FromStr for Command {
             ["home"] => Ok(Self::Home),
             ["arm"] => Ok(Self::Arm),
             ["disarm"] => Ok(Self::Disarm),
-            ["touchdown"] => Ok(Self::Touchdown),
+            ["touchdown", value] => {
+                let amps = value
+                    .parse::<f32>()
+                    .map_err(|_| "touchdown expects current in amps".to_owned())?;
+                if !amps.is_finite() || amps <= 0.0 {
+                    return Err("touchdown current must be finite and positive amps".into());
+                }
+                Ok(Self::Touchdown(amps))
+            }
             ["cancel"] => Ok(Self::Cancel),
             ["stop"] => Ok(Self::Stop),
             ["clear-fault"] => Ok(Self::ClearFault),
@@ -92,7 +100,8 @@ impl Diagnostic {
             Command::Arm => LiftRequest::Arm,
             Command::Disarm => LiftRequest::Disarm,
             Command::Move(position_mm) => LiftRequest::MoveTo { position_mm },
-            Command::Touchdown => LiftRequest::Touchdown {
+            Command::Touchdown(press_current_a) => LiftRequest::Touchdown {
+                press_current_a,
                 post_turn_page_width_mm: None,
             },
             Command::Lift(position_mm) => {
@@ -209,8 +218,8 @@ impl Diagnostic {
         let age_ms = sample.age(now).as_secs_f64() * 1000.0;
         match sample.fresh_values(now) {
             Some(values) => format!(
-                "position_mm={:?} velocity_mm_s={:?} current_a={} age_ms={age_ms:.1}",
-                values.position_mm, values.velocity_mm_s, values.iq_measured_a
+                "position_mm={:?} velocity_mm_s={:?} measured_a={:.3} setpoint_a={:.3} age_ms={age_ms:.1}",
+                values.position_mm, values.velocity_mm_s, values.iq_measured_a, values.iq_setpoint_a
             ),
             None => format!("stale age_ms={age_ms:.1}; values withheld"),
         }

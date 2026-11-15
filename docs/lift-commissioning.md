@@ -55,7 +55,7 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | `arm` | Enable the motor, as a separate action. |
 | `disarm` | Idle the motor when no operation is active; loses Position trust. |
 | `move -10` | Move down to absolute position -10 mm. |
-| `touchdown` | Lower to contact and keep pressing at the profile's press setting. |
+| `touchdown 1.0` | Lower to contact and hold with a 1 A current limit, up to the profile's press limit. |
 | `lift -5` | Lift to absolute position -5 mm, which must be above the current position. |
 | `cancel` | Cancel the current operation; a press hold may remain active. |
 | `stop` or blank Enter | Stop the lift and switch the air actuators off. |
@@ -63,11 +63,13 @@ actuators off. Wait for `Verified`, then use `status` to check fresh telemetry.
 | `status` or `help` | Show state, position, current, sample age and commands. |
 | `quit`, EOF or Ctrl-C | Request Stop and wait for its verdict before exiting. |
 
+Touchdown's current ceiling is `current_limit_a × touchdown_press_percent / 100`.
+
 ## Try it
 
 1. Run `home`, then `arm`, waiting for each to finish. Try a short move and
    check direction and distance before moving farther.
-2. Try `touchdown` on some scrap material, then `lift` away. Check that contact
+2. Try `touchdown <amps>` on scrap material, then `lift` away. Check that contact
    detection and press hold work, and that the press current can lift the load.
 3. Try `cancel`, `stop` and the physical button during motion. After a Confirmed
    Stop, recover with separate `clear-fault`, `home` and `arm` commands. If Stop
@@ -77,3 +79,6 @@ Keep the CSV and a short note of what worked or failed. It already records the
 profile, telemetry, commands and Stop results. The 100 ms dispatch and 500 ms
 stopped/off targets still need checking on the machine. Physical testing for
 #60 remains pending, and production scanning stays disabled.
+
+While armed, the terminal shows measured and setpoint current, position and
+sample age about five times a second. The CSV keeps every telemetry sample.

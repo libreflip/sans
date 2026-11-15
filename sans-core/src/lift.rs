@@ -151,6 +151,9 @@ pub enum LiftRequest {
     /// Lower until contact and hold the press. With a post-turn page width,
     /// emits [`LiftEvent::TurnBlowerCutoff`] on the way down.
     Touchdown {
+        /// Requested press current in amps, positive and at most the board's
+        /// own current limit read on this connection.
+        press_current_a: f32,
         /// Page width of the turn just made, if this Touchdown follows one.
         post_turn_page_width_mm: Option<f32>,
     },
@@ -208,6 +211,13 @@ pub enum LiftRejection {
     InvalidPageWidth(f32),
     /// The target is not finite or outside the commissioned travel.
     InvalidTarget(f32),
+    /// Requested Touchdown current is non-finite or nonpositive.
+    InvalidPressCurrent {
+        /// Current requested by the caller, in amps.
+        requested_a: f32,
+        /// Board's maximum Touchdown current, in amps, or 0 if not known.
+        maximum_a: f32,
+    },
     /// A descent needs confirmed vacuum-off evidence.
     VacuumNotConfirmedOff,
     /// The wiggle starts only at the wiggle-start anchor.
@@ -509,9 +519,15 @@ impl LiftOperations {
                 }
             }
             LiftRequest::Touchdown {
+                press_current_a,
                 post_turn_page_width_mm,
             } => Phase::Descend {
-                touchdown: self.check_touchdown(now, post_turn_page_width_mm, vacuum)?,
+                touchdown: self.check_touchdown(
+                    now,
+                    post_turn_page_width_mm,
+                    press_current_a,
+                    vacuum,
+                )?,
                 window: None,
             },
         };
@@ -763,8 +779,15 @@ impl LiftOperations {
         &self,
         now: Instant,
         post_turn_page_width_mm: Option<f32>,
+        press_current_a: f32,
         vacuum: VacuumEvidence,
     ) -> Result<Touchdown, LiftRejection> {
+        if !(press_current_a.is_finite() && press_current_a > 0.0) {
+            return Err(LiftRejection::InvalidPressCurrent {
+                requested_a: press_current_a,
+                maximum_a: self.board_current_a.unwrap_or(0.0),
+            });
+        }
         let start_mm = self.fresh_position(now)?;
         if vacuum != VacuumEvidence::ConfirmedOff {
             return Err(LiftRejection::VacuumNotConfirmedOff);
@@ -779,7 +802,7 @@ impl LiftOperations {
                 Some(previous + self.motion.blower_off_descent_percent / 100.0 * width)
             }
         };
-        let press_a = self.motion.touchdown_press_current_a;
+        let press_a = press_current_a;
         if !self
             .board_current_a
             .is_some_and(|board_a| press_a <= board_a)
