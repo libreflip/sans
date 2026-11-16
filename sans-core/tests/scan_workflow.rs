@@ -762,17 +762,12 @@ fn one_capture_cycle_turns_the_page_saves_both_page_records_and_starts_the_next(
         pair(8).unwrap(),
         "the second cycle's own canonical pair"
     );
-    // The second Touchdown switches the Turn blower off at its cutoff.
-    started.until(|_| {
-        commands(&started)
-            .iter()
-            .filter(|c| *c == "VACUUM ON")
-            .count()
-            == 2
-    });
+    // The second Touchdown switches the Turn blower off at its cutoff. The
+    // cycle keeps going, so only the first two cycles' commands are compared.
+    started.until(|_| commands(&started).len() >= 16);
 
     assert_eq!(
-        commands(&started),
+        commands(&started)[..16],
         [
             "LIGHT ON",
             "PRESS START",
@@ -886,4 +881,24 @@ fn stop_mid_attempt_logs_the_attempt_as_stopped() {
         !commands(&started).contains(&"PRESS?".to_string()),
         "no baseline after Stop"
     );
+}
+
+#[test]
+fn exit_mid_attempt_still_logs_the_attempt() {
+    let started = start(book_board(), vec![pair(7)]);
+    home(&started);
+    ready(&started, 200);
+    started.send(ControllerIntent::Start);
+    started.until(|_| commands(&started).contains(&"VACUUM OFF".to_string()));
+    let snapshot = started.until(|snapshot| scanning(snapshot).is_some());
+    let directory = scanning(&snapshot).unwrap().directory.clone();
+
+    started.send(ControllerIntent::Exit);
+    started.until(|snapshot| snapshot.screen == MachineScreen::Exited);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while attempt_log(&directory).is_empty() && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+
+    assert_eq!(attempt_log(&directory)[0]["result"], "stopped");
 }

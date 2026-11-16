@@ -203,6 +203,7 @@ impl ScanSession {
             (Step::Capturing, Input::Captured(Err(error))) => self.fail(
                 AttemptResult::Failed,
                 format!("Capture pair failed: {error}"),
+                false,
                 &mut out,
             ),
             (_, Input::Board(command, Err(error))) => {
@@ -312,6 +313,7 @@ impl ScanSession {
             (Step::Classifying { until }, Input::Tick) if now >= until => self.fail(
                 AttemptResult::NoVerdict,
                 "no pressure verdict at the classification anchor".into(),
+                false,
                 &mut out,
             ),
             (Step::Saving, Input::Saved(Ok(()))) => {
@@ -325,6 +327,7 @@ impl ScanSession {
             (Step::Saving, Input::Saved(Err(error))) => self.fail(
                 AttemptResult::Failed,
                 format!("cannot save the Page records: {error}"),
+                false,
                 &mut out,
             ),
             (Step::CleaningUp { relays, .. }, Input::LiftFinished(outcome)) => {
@@ -342,9 +345,11 @@ impl ScanSession {
                 if let LiftOutcome::Cancelled { position_mm } = outcome {
                     self.cycle.record.stop_position_mm = Some(position_mm);
                 }
+                // The operation already finished, so there is nothing to cancel.
                 self.fail(
                     AttemptResult::Failed,
                     format!("{step:?} ended: {outcome:?}"),
+                    false,
                     &mut out,
                 );
             }
@@ -401,28 +406,29 @@ impl ScanSession {
             Verdict::NeverSealed => (AttemptResult::NeverSealed, "the page did not seal"),
             Verdict::SealLost => (AttemptResult::SealLost, "the page lost its seal"),
         };
-        self.fail(result, format!("pickup failed: {detail}"), out);
+        self.fail(result, format!("pickup failed: {detail}"), true, out);
     }
 
-    /// End the attempt: cancel a running lift, switch the relays off, then
-    /// log and block once both are done.
-    fn fail(&mut self, result: AttemptResult, detail: String, out: &mut Vec<Effect>) {
+    /// End the attempt: cancel the lift if `lift_running`, switch the relays
+    /// off, then log and block once both are done.
+    fn fail(
+        &mut self,
+        result: AttemptResult,
+        detail: String,
+        lift_running: bool,
+        out: &mut Vec<Effect>,
+    ) {
         log::error!("Capture cycle failed: {detail}");
         let record = &mut self.cycle.record;
         record.result = result;
         record.detail = Some(detail);
-        let lift = match self.cycle.step {
-            Step::Leg(leg) => {
-                record.failed_leg = Some(format!("{leg:?}"));
-                out.push(Effect::CancelLift);
-                true
-            }
-            Step::Touchdown => {
-                out.push(Effect::CancelLift);
-                true
-            }
-            _ => false,
-        };
+        if let Step::Leg(leg) = self.cycle.step {
+            record.failed_leg = Some(format!("{leg:?}"));
+        }
+        let lift = lift_running && matches!(self.cycle.step, Step::Leg(_) | Step::Touchdown);
+        if lift {
+            out.push(Effect::CancelLift);
+        }
         self.cycle.classifier = None;
         self.cycle.step = Step::CleaningUp {
             lift,
@@ -935,6 +941,24 @@ mod tests {
         assert_eq!(record.stop_position_mm, Some(-150.0));
         assert_eq!(record.failed_leg.as_deref(), Some("ToWiggleStart"));
         assert_eq!(record.trigger_drop_mbar, Some(BASELINE - (BASELINE - 0.3)));
+    }
+
+    #[test]
+    fn a_leg_that_faults_by_itself_is_not_cancelled_again_and_still_blocks() {
+        let mut driver = Driver::new();
+        driver.run_to_classification();
+        driver.pressure(2.0, 3);
+        driver.take_log();
+        driver.finish(LiftOutcome::Fault(LiftFault::TimedOut));
+
+        assert_eq!(
+            driver.take_log(),
+            ["ALL OFF", "save Failed 0 pages=false"],
+            "no cancel of an operation that already finished"
+        );
+        assert_eq!(driver.session.cycle.step, Step::Blocked);
+        let record = &driver.session.cycle.record;
+        assert_eq!(record.failed_leg.as_deref(), Some("ToWiggleStart"));
     }
 
     #[test]

@@ -84,8 +84,8 @@ pub(super) struct SaveRequest {
     pub(super) pages: Option<Arc<CapturePair>>,
 }
 
-/// Write the pages, Left then Right, then append the record. The record is
-/// appended even when a page write fails, so every attempt is logged.
+/// Write the pages, Left then Right, then append the record. A failed page
+/// write is still logged, as a failed attempt, so every attempt is logged.
 pub(super) fn save(request: &SaveRequest) -> io::Result<()> {
     let pages = match &request.pages {
         None => Ok(()),
@@ -95,7 +95,12 @@ pub(super) fn save(request: &SaveRequest) -> io::Result<()> {
                 .and_then(|()| write_page(&request.directory, left + 1, &pair.right))
         }
     };
-    append_attempt(&request.directory, &request.record)?;
+    let mut record = request.record.clone();
+    if let Err(error) = &pages {
+        record.result = AttemptResult::Failed;
+        record.detail = Some(format!("cannot save the Page records: {error}"));
+    }
+    append_attempt(&request.directory, &record)?;
     pages
 }
 
@@ -223,6 +228,11 @@ mod tests {
 
         assert!(save(&request(dir.path(), 0, true)).is_err());
         let log = std::fs::read_to_string(dir.path().join(ATTEMPT_LOG)).unwrap();
-        assert_eq!(log.lines().count(), 1);
+        let lines: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["result"], "failed", "never logged as turned");
     }
 }

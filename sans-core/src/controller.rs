@@ -648,11 +648,7 @@ fn spawn_controller<Factory: MachineFactory>(
                     return;
                 }
                 // A Stop ended the session; its attempt is still logged.
-                for request in state.orphans.drain(..) {
-                    if let Some(machine) = &machine {
-                        let _ = machine.send(MachineRequest::Save(Box::new(request)));
-                    }
-                }
+                save_orphans(&mut state, &machine);
                 let mut changed = false;
                 let mut cycle = CycleDriver {
                     lift: &mut lift,
@@ -913,6 +909,11 @@ fn spawn_controller<Factory: MachineFactory>(
                     }
                     Inbox::Intent(ControllerIntent::ReconnectLiftAxis) => lift.reconnect(),
                     Inbox::Intent(ControllerIntent::Exit) => {
+                        // The Machine thread still serves this before it sees the controller gone.
+                        if let Workflow::Scanning(session) = &mut state.workflow {
+                            state.orphans.extend(session.take_unlogged());
+                        }
+                        save_orphans(&mut state, &machine);
                         state.screen = MachineScreen::Exited;
                         let _ = state.publish(&mut lift, &mut board);
                         return;
@@ -1076,6 +1077,20 @@ fn spawn_controller<Factory: MachineFactory>(
         accepting_intents,
         controller_thread: Some(controller_thread),
     })
+}
+
+/// Send the attempt records of ended Scan sessions to the Machine thread.
+fn save_orphans(state: &mut Projection, machine: &Option<Sender<MachineRequest>>) {
+    for request in state.orphans.drain(..) {
+        let sent = machine.as_ref().is_some_and(|machine| {
+            machine
+                .send(MachineRequest::Save(Box::new(request)))
+                .is_ok()
+        });
+        if !sent {
+            log::error!("cannot log the stopped Capture attempt: the Machine thread has stopped");
+        }
+    }
 }
 
 /// Runs the Capture cycle's effects against the lift axis, the board and
