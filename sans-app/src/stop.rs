@@ -70,7 +70,7 @@ pub(crate) fn show_stop(ui: &mut egui::Ui, stop: Option<&StopStatus>) {
         }
         StopVerdict::Confirmed => {
             ui.label(
-                "Motion stopped and ALL OFF processed. Clear Stop to recover; Home before moving.",
+                "Motion stopped and ALL OFF processed. Clear Stop to recover; interrupted work will not resume.",
             );
         }
         StopVerdict::Unconfirmed { reason } => {

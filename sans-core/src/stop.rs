@@ -24,8 +24,8 @@
 //!   upgrades it; a Confirmed Stop drops to Unconfirmed if the axis evidence
 //!   is withdrawn.
 //! - Recovery: Clear Stop is accepted only from Confirmed Stop and runs the
-//!   lift module's `clear_fault`, which never arms. Position trust stays lost
-//!   until a Home.
+//!   lift module's `clear_fault`, which never arms. Position trust follows fresh
+//!   native homed/encoder evidence; Home is needed only without a valid reference.
 //!
 //! # Integration contract
 //!
@@ -120,7 +120,7 @@ impl StopControl {
         ops.stop(cause.clone(), link);
         match self.record.as_mut() {
             Some(record) if record.verdict == StopVerdict::Confirming => {
-                record.stops = ops.status().stops;
+                record.stops = ops.status(now).stops;
             }
             _ => self.dispatch(now, cause, ops, relays),
         }
@@ -129,7 +129,7 @@ impl StopControl {
 
     /// Follow the lift latch and judge the verdict at `now`.
     pub fn observe(&mut self, now: Instant, ops: &LiftOperations, relays: &mut Relays<'_>) {
-        let status = ops.status();
+        let status = ops.status(now);
         let Some(cause) = status.latch else {
             self.record = None;
             return;
@@ -207,7 +207,7 @@ impl StopControl {
         let cause = self.record.take().map_or(cause, |record| record.cause);
         self.record = Some(Record {
             cause,
-            stops: ops.status().stops,
+            stops: ops.status(now).stops,
             deadline: now + self.budget,
             relays,
             verdict: StopVerdict::Confirming,

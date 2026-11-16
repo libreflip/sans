@@ -7,12 +7,11 @@
 //! connection gate, the poll schedule, request correlation, deadlines, epochs,
 //! readiness and unit conversion.
 //!
-//! There is no public raw read or write: every write Sans can make is a named
-//! typed command, and Sans never writes control mode, input mode or any stored
-//! configuration, and never calls save, erase, reboot or DFU functions. The
-//! gate writes no limits, so the ODrive's own velocity, acceleration and
-//! current limits apply; the only limit Sans writes is a Touchdown's reduced
-//! press current and its restore.
+//! Every write is a named typed command. The gate only requests idle. Touchdown
+//! temporarily selects torque/passthrough control with a reduced current limit
+//! and the firmware velocity limiter. Move, Arm and Home restore position/trap
+//! control; Disarm retires staged writes immediately. Nothing saves, erases,
+//! reboots or flashes the board.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -23,8 +22,9 @@ use super::descriptor::{check_capabilities, flatten, value_type, Endpoint, Resol
 use super::protocol::{
     decode_reply, describe_error_words, descriptor_crc16, encode_descriptor_read, encode_request,
     WireValue, AXIS_ERROR_MIN_ENDSTOP_PRESSED, AXIS_STATE_CLOSED_LOOP_CONTROL, AXIS_STATE_HOMING,
-    AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, DESCRIPTOR_CHUNK_REQUEST_LEN,
-    INPUT_MODE_TRAP_TRAJ, SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
+    AXIS_STATE_IDLE, CONTROL_MODE_POSITION_CONTROL, CONTROL_MODE_TORQUE_CONTROL,
+    DESCRIPTOR_CHUNK_REQUEST_LEN, INPUT_MODE_PASSTHROUGH, INPUT_MODE_TRAP_TRAJ,
+    SEQUENCE_FORCED_BIT, SEQUENCE_MASK,
 };
 use crate::config::{odrive_profile_problems, LiftAxisProfile, LiftDirection};
 use crate::MachineProfile;
@@ -40,7 +40,7 @@ const COUNT_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const CONFIRM_REREAD_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Identity and status reads made once per connection, in order.
-const IDENTITY_READS: [Endpoint; 12] = [
+const IDENTITY_READS: [Endpoint; 20] = [
     Endpoint::SerialNumber,
     Endpoint::HwVersionMajor,
     Endpoint::HwVersionMinor,
@@ -53,6 +53,14 @@ const IDENTITY_READS: [Endpoint; 12] = [
     Endpoint::MotorArmedState,
     Endpoint::CurrentLimit,
     Endpoint::TrapDecelLimit,
+    Endpoint::ControllerVelLimit,
+    Endpoint::CurrentModeVelLimit,
+    Endpoint::VelGain,
+    Endpoint::TorqueConstant,
+    Endpoint::MotorDirection,
+    Endpoint::MotorType,
+    Endpoint::LoadEncoderAxis,
+    Endpoint::TrapVelLimit,
 ];
 
 /// One telemetry cycle reads every telemetry row of the capability table.
@@ -128,6 +136,14 @@ pub enum LinkCommand {
     /// only once this connection passed the capability and
     /// identity checks and read the axis back idle.
     ClearErrors,
+    /// Enter torque control with the firmware current-mode velocity limiter.
+    /// Current is positive in the machine's descent direction; speed is mm/s.
+    BeginTorquePress {
+        /// Requested motor current in amps.
+        amps: f32,
+        /// Positive maximum descent speed, within the board's native limit.
+        velocity_mm_s: f32,
+    },
 }
 
 /// The outcome of one command. `Completed` means the named readback matched;
@@ -200,6 +216,60 @@ pub struct DiscoveryRecord {
     pub current_limit_a: Option<f32>,
     /// `trap_traj.config.decel_limit` in motor turns per second squared.
     pub deceleration_turns_per_s2: Option<f32>,
+    /// Native settings used to convert current to torque and bound Touchdown.
+    pub torque: TorqueSettings,
+}
+
+/// Board settings read without modifying stored configuration.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TorqueSettings {
+    /// `motor.config.torque_constant`, Nm/A.
+    pub torque_constant: f32,
+    /// Electrical current direction, either -1 or 1.
+    pub motor_direction: i32,
+    /// Native motor type; torque Touchdown supports high-current PM motors (0).
+    pub motor_type: i32,
+    /// Axis whose encoder feeds the controller.
+    pub load_encoder_axis: u8,
+    /// Controller velocity limit in motor turns/s.
+    pub velocity_turns_s: f32,
+    /// Native trajectory speed; the default press speed uses the lower limit.
+    pub trajectory_velocity_turns_s: f32,
+    /// Controller velocity gain in Nm per turn/s.
+    pub velocity_gain: f32,
+    /// Previous firmware current-mode velocity limiter setting.
+    pub velocity_limiter_enabled: bool,
+}
+
+impl TorqueSettings {
+    pub(crate) fn check(&self, axis: u8, amps: f32, speed: f32) -> Result<(), String> {
+        if self.motor_type != 0
+            || !matches!(self.motor_direction, -1 | 1)
+            || self.load_encoder_axis != axis
+            || !(self.torque_constant.is_finite()
+                && self.torque_constant > 0.0
+                && self.velocity_gain.is_finite()
+                && self.velocity_gain > 0.0
+                && self.velocity_turns_s.is_finite()
+                && self.velocity_turns_s > 0.0)
+        {
+            return Err("Touchdown needs a PM motor, its own encoder, direction +/-1, and positive finite torque constant, velocity limit and gain".into());
+        }
+        if !(amps.is_finite() && amps > 0.0) {
+            return Err("Touchdown current must be positive and finite".into());
+        }
+        if !(speed.is_finite() && speed > 0.0 && speed <= self.velocity_turns_s) {
+            return Err(
+                "Touchdown speed must be positive and no greater than the board velocity limit"
+                    .into(),
+            );
+        }
+        let torque = amps * self.torque_constant;
+        if !torque.is_finite() {
+            return Err("Touchdown current converts to non-finite torque".into());
+        }
+        Ok(())
+    }
 }
 
 /// A snapshot of link state.
@@ -637,11 +707,19 @@ impl InFlight {
 fn is_energizing(spec: RequestSpec) -> bool {
     matches!(
         spec,
-        RequestSpec::Write(Endpoint::InputPos, _)
-            | RequestSpec::Write(
-                Endpoint::RequestedState,
-                WireValue::I32(AXIS_STATE_CLOSED_LOOP_CONTROL | AXIS_STATE_HOMING)
-            )
+        RequestSpec::Write(
+            Endpoint::InputPos
+                | Endpoint::InputTorque
+                | Endpoint::InputVel
+                | Endpoint::ControlMode
+                | Endpoint::InputMode
+                | Endpoint::ControllerVelLimit
+                | Endpoint::CurrentModeVelLimit,
+            _
+        ) | RequestSpec::Write(
+            Endpoint::RequestedState,
+            WireValue::I32(AXIS_STATE_CLOSED_LOOP_CONTROL | AXIS_STATE_HOMING)
+        )
     )
 }
 
@@ -712,6 +790,15 @@ struct Operation {
     window: Duration,
     confirm_until: Option<Instant>,
     not_before: Option<Instant>,
+    remaining: VecDeque<(RequestSpec, Confirm)>,
+    completed_stages: usize,
+}
+
+impl Operation {
+    /// Only a revoked first packet means no part of the command left the host.
+    fn was_transmitted(&self, unsent_first: bool) -> bool {
+        self.completed_stages > 0 || (self.transmitted && !unsent_first)
+    }
 }
 
 struct UrgentLane {
@@ -741,6 +828,7 @@ struct IdentityReads {
     armed_state: Option<i32>,
     current_limit_a: Option<f32>,
     deceleration_turns_per_s2: Option<f32>,
+    torque: TorqueSettings,
 }
 
 impl IdentityReads {
@@ -760,6 +848,18 @@ impl IdentityReads {
             (Endpoint::TrapDecelLimit, WireValue::F32(v)) => {
                 self.deceleration_turns_per_s2 = Some(v)
             }
+            (Endpoint::TrapVelLimit, WireValue::F32(v)) => {
+                self.torque.trajectory_velocity_turns_s = v
+            }
+            (Endpoint::ControllerVelLimit, WireValue::F32(v)) => self.torque.velocity_turns_s = v,
+            (Endpoint::CurrentModeVelLimit, WireValue::Bool(v)) => {
+                self.torque.velocity_limiter_enabled = v
+            }
+            (Endpoint::VelGain, WireValue::F32(v)) => self.torque.velocity_gain = v,
+            (Endpoint::TorqueConstant, WireValue::F32(v)) => self.torque.torque_constant = v,
+            (Endpoint::MotorDirection, WireValue::I32(v)) => self.torque.motor_direction = v,
+            (Endpoint::MotorType, WireValue::I32(v)) => self.torque.motor_type = v,
+            (Endpoint::LoadEncoderAxis, WireValue::U8(v)) => self.torque.load_encoder_axis = v,
             (endpoint, value) => {
                 return Err(format!("identity read {endpoint:?} returned {value:?}"));
             }
@@ -918,6 +1018,8 @@ pub struct LinkEngine {
     clock: Option<Instant>,
     last_count_publish: Option<Instant>,
     count_pending: bool,
+    /// Original velocity settings survive a partial press and a reconnect.
+    torque_restore: Option<TorqueSettings>,
 }
 
 impl LinkEngine {
@@ -941,6 +1043,7 @@ impl LinkEngine {
             clock: None,
             last_count_publish: None,
             count_pending: false,
+            torque_restore: None,
         }
     }
 
@@ -1061,11 +1164,13 @@ impl LinkEngine {
         match priority {
             Priority::Urgent => match self.plan(now, command) {
                 Err(reason) => self.finish(ticket, command, CommandResult::Rejected { reason }),
-                Ok((write, confirm)) => {
+                Ok(mut stages) => {
+                    let (write, confirm) = stages.pop_front().expect("nonempty plan");
                     if command == LinkCommand::Disarm {
                         // A disarm supersedes energizing writes still waiting to leave.
                         self.revoke_unsent_energizing();
                     }
+                    self.retire_staged_commands();
                     let op = Operation {
                         ticket,
                         command,
@@ -1076,6 +1181,8 @@ impl LinkEngine {
                         window: self.config.urgent_deadline,
                         confirm_until: None,
                         not_before: None,
+                        remaining: stages,
+                        completed_stages: 0,
                     };
                     let connection = self.connection.as_mut().expect("usable connection");
                     connection.urgent.push(UrgentLane {
@@ -1098,6 +1205,7 @@ impl LinkEngine {
                 if command == LinkCommand::Disarm {
                     self.retire_queue();
                     self.revoke_unsent_energizing();
+                    self.retire_staged_commands();
                 }
                 let queue = &mut self.connection.as_mut().expect("usable connection").queue;
                 if queue.len() < ORDINARY_QUEUE_CAPACITY {
@@ -1279,7 +1387,7 @@ impl LinkEngine {
             self.settle_unanswered(&in_flight) && in_flight.is_first_packet()
         });
         if let Some(op) = active {
-            results.push((op.ticket, op.command, op.transmitted && !unsent_first));
+            results.push((op.ticket, op.command, op.was_transmitted(unsent_first)));
         }
         results.extend(
             queued
@@ -1293,7 +1401,7 @@ impl LinkEngine {
             results.push((
                 lane.op.ticket,
                 lane.op.command,
-                lane.op.transmitted && !unsent_first,
+                lane.op.was_transmitted(unsent_first),
             ));
         }
         results.extend(
@@ -1327,6 +1435,7 @@ impl LinkEngine {
         }
         self.retire_queue();
         self.revoke_unsent_energizing();
+        self.retire_staged_commands();
     }
 
     fn retire_queue(&mut self) {
@@ -1384,6 +1493,11 @@ impl LinkEngine {
 
     fn send(&mut self, now: Instant, spec: RequestSpec, urgent: bool) -> Option<InFlight> {
         let connection = self.connection.as_ref()?;
+        // Compound plans can outlive the sample used at acceptance. A link
+        // fault also blocks their later stages, before the consumer sees it.
+        if connection.fault.is_some() && is_energizing(spec) {
+            return None;
+        }
         let epoch = connection.epoch;
         let Some(sequence) = self.sequences.allocate() else {
             self.latch_fault(
@@ -1504,7 +1618,10 @@ impl LinkEngine {
             if let Some(op) = connection.active.clone() {
                 // While a confirmation waits to re-read, telemetry may use the
                 // slot so freshness is maintained; queued commands still wait.
-                if !op.not_before.is_some_and(|not_before| now < not_before) {
+                let telemetry_due = op.completed_stages > 0
+                    && matches!(op.step, OpStep::SendWrite)
+                    && (connection.cycle.is_some() || now >= connection.next_cycle_at);
+                if !telemetry_due && !op.not_before.is_some_and(|not_before| now < not_before) {
                     if let Some(spec) = self.op_request(&op) {
                         if self.send_ordinary(now, spec, OrdinaryOwner::Command) {
                             let active = self.connection.as_mut().and_then(|c| c.active.as_mut());
@@ -1523,7 +1640,8 @@ impl LinkEngine {
                         Err(reason) => {
                             self.finish(ticket, command, CommandResult::Rejected { reason });
                         }
-                        Ok((write, confirm)) => {
+                        Ok(mut stages) => {
+                            let (write, confirm) = stages.pop_front().expect("nonempty plan");
                             let window = self.config.request_deadline;
                             self.connection.as_mut().expect("connection").active =
                                 Some(Operation {
@@ -1536,6 +1654,8 @@ impl LinkEngine {
                                     window,
                                     confirm_until: None,
                                     not_before: None,
+                                    remaining: stages,
+                                    completed_stages: 0,
                                 });
                         }
                     }
@@ -1628,7 +1748,7 @@ impl LinkEngine {
         &mut self,
         now: Instant,
         command: LinkCommand,
-    ) -> Result<(RequestSpec, Confirm), String> {
+    ) -> Result<VecDeque<(RequestSpec, Confirm)>, String> {
         let resolved = self.connection.as_ref().is_some_and(|connection| {
             connection.endpoints.is_some() && connection.trailer.is_some()
         });
@@ -1637,8 +1757,8 @@ impl LinkEngine {
         }
         let state_write =
             |state| RequestSpec::Write(Endpoint::RequestedState, WireValue::I32(state));
-        match command {
-            LinkCommand::Disarm => Ok((
+        let single = match command {
+            LinkCommand::Disarm => Ok::<_, String>((
                 state_write(AXIS_STATE_IDLE),
                 Confirm::State {
                     expected: AXIS_STATE_IDLE,
@@ -1721,6 +1841,79 @@ impl LinkEngine {
                     Confirm::Readback(Endpoint::CurrentLimit, amps),
                 ))
             }
+            LinkCommand::BeginTorquePress {
+                amps,
+                velocity_mm_s,
+            } => {
+                let values = self.ready_to_energize(now)?;
+                require_error_words_zero(&values)?;
+                let (sign, scale) = self
+                    .config
+                    .direction_sign()
+                    .ok_or("lift axis is uncommissioned")?;
+                let native = self
+                    .connection
+                    .as_ref()
+                    .expect("connection")
+                    .discovery
+                    .torque
+                    .clone();
+                let speed = velocity_mm_s / scale;
+                native.check(self.config.axis, amps, speed)?;
+                let max_current = self.connection.as_ref().unwrap().discovery.current_limit_a;
+                if !max_current.is_some_and(|limit| amps <= limit) {
+                    return Err("Touchdown current exceeds the board current limit".into());
+                }
+                if values.axis_state != AxisState::ClosedLoopControl
+                    || values.control_mode != CONTROL_MODE_POSITION_CONTROL
+                    || values.input_mode != INPUT_MODE_TRAP_TRAJ
+                {
+                    return Err("Touchdown needs closed-loop position control".into());
+                }
+                let position = values
+                    .position_mm
+                    .ok_or("Touchdown needs a fresh position")?;
+                if values.velocity_mm_s.is_none_or(|v| {
+                    v.abs()
+                        > self
+                            .config
+                            .lift_axis
+                            .as_ref()
+                            .unwrap()
+                            .stationary_velocity_mm_s
+                }) {
+                    return Err("Touchdown entry needs a stationary axis".into());
+                }
+                let mut stages = VecDeque::new();
+                stages.push_back(write_stage(
+                    Endpoint::InputPos,
+                    WireValue::F32(sign * position / scale),
+                ));
+                stages.push_back(write_stage(Endpoint::InputVel, WireValue::F32(0.0)));
+                stages.push_back(write_stage(Endpoint::InputTorque, WireValue::F32(0.0)));
+                stages.push_back(write_stage(
+                    Endpoint::ControllerVelLimit,
+                    WireValue::F32(speed),
+                ));
+                stages.push_back(write_stage(
+                    Endpoint::CurrentModeVelLimit,
+                    WireValue::Bool(true),
+                ));
+                stages.push_back(write_stage(
+                    Endpoint::InputMode,
+                    WireValue::I32(INPUT_MODE_PASSTHROUGH),
+                ));
+                stages.push_back(write_stage(
+                    Endpoint::ControlMode,
+                    WireValue::I32(CONTROL_MODE_TORQUE_CONTROL),
+                ));
+                stages.push_back(write_stage(
+                    Endpoint::InputTorque,
+                    WireValue::F32(-sign * amps * native.torque_constant),
+                ));
+                self.torque_restore.get_or_insert(native);
+                return Ok(stages);
+            }
             LinkCommand::MoveAbsolute { position_mm } => {
                 let Some(lift_axis) = self.config.lift_axis.clone() else {
                     return Err("the lift axis is uncommissioned".into());
@@ -1739,8 +1932,11 @@ impl LinkEngine {
                 let values = self.ready_to_energize(now)?;
                 require_error_words_zero(&values)?;
                 if values.axis_state != AxisState::ClosedLoopControl
-                    || values.control_mode != CONTROL_MODE_POSITION_CONTROL
-                    || values.input_mode != INPUT_MODE_TRAP_TRAJ
+                    || !((values.control_mode == CONTROL_MODE_POSITION_CONTROL
+                        && values.input_mode == INPUT_MODE_TRAP_TRAJ)
+                        || self.torque_restore.is_some()
+                        || (values.control_mode == CONTROL_MODE_TORQUE_CONTROL
+                            && values.input_mode == INPUT_MODE_PASSTHROUGH))
                 {
                     return Err(format!(
                         "move needs closed-loop control, control mode {CONTROL_MODE_POSITION_CONTROL} and input mode {INPUT_MODE_TRAP_TRAJ}; observed state {:?}, control mode {}, input mode {}",
@@ -1760,7 +1956,74 @@ impl LinkEngine {
                     Confirm::Readback(Endpoint::InputPos, turns),
                 ))
             }
+        }?;
+        let mut stages = if matches!(
+            command,
+            LinkCommand::Arm | LinkCommand::Home | LinkCommand::MoveAbsolute { .. }
+        ) {
+            self.position_mode_stages(now)?
+        } else {
+            VecDeque::new()
+        };
+        stages.push_back(single);
+        Ok(stages)
+    }
+
+    /// Recover position mode from either our press or externally selected modes.
+    fn position_mode_stages(
+        &mut self,
+        now: Instant,
+    ) -> Result<VecDeque<(RequestSpec, Confirm)>, String> {
+        let normalize = self.torque_restore.is_some()
+            || self.fresh_sample_inner(now).is_some_and(|s| {
+                s.values.control_mode != CONTROL_MODE_POSITION_CONTROL
+                    || s.values.input_mode != INPUT_MODE_TRAP_TRAJ
+            });
+        let mut stages = VecDeque::new();
+        if normalize {
+            let values = self.ready_to_energize(now)?;
+            let (sign, scale) = self
+                .config
+                .direction_sign()
+                .ok_or("lift axis is uncommissioned")?;
+            stages.push_back(write_stage(Endpoint::InputVel, WireValue::F32(0.0)));
+            if values.axis_state != AxisState::Idle {
+                let position = values
+                    .position_mm
+                    .ok_or("mode recovery needs a fresh position")?;
+                let axis = self.config.lift_axis.as_ref().unwrap();
+                if position < axis.travel_minimum_mm || position > axis.travel_maximum_mm {
+                    return Err("mode recovery position is outside travel".into());
+                }
+                stages.push_back(write_stage(
+                    Endpoint::InputPos,
+                    WireValue::F32(sign * position / scale),
+                ));
+            }
+            // While armed, take over the sampled position before removing
+            // pressing torque. Idle closed-loop entry seeds from the encoder
+            // in fw-v0.5.1 axis.cpp::run_closed_loop_control_loop.
+            stages.push_back(write_stage(
+                Endpoint::ControlMode,
+                WireValue::I32(CONTROL_MODE_POSITION_CONTROL),
+            ));
+            stages.push_back(write_stage(Endpoint::InputTorque, WireValue::F32(0.0)));
+            stages.push_back(write_stage(
+                Endpoint::InputMode,
+                WireValue::I32(INPUT_MODE_TRAP_TRAJ),
+            ));
+            if let Some(original) = &self.torque_restore {
+                stages.push_back(write_stage(
+                    Endpoint::ControllerVelLimit,
+                    WireValue::F32(original.velocity_turns_s),
+                ));
+                stages.push_back(write_stage(
+                    Endpoint::CurrentModeVelLimit,
+                    WireValue::Bool(original.velocity_limiter_enabled),
+                ));
+            }
         }
+        Ok(stages)
     }
 
     fn ready_to_energize(&mut self, now: Instant) -> Result<TelemetryValues, String> {
@@ -1848,13 +2111,13 @@ impl LinkEngine {
                 }
                 Err(reason) => {
                     self.sequences.quarantine(sequence);
-                    self.latch_fault(reason.clone());
                     let lane = self
                         .connection
                         .as_mut()
                         .expect("connection")
                         .urgent
                         .remove(lane);
+                    self.latch_fault(reason.clone());
                     self.finish(
                         lane.op.ticket,
                         lane.op.command,
@@ -1881,6 +2144,52 @@ impl LinkEngine {
         self.clock = Some(now);
         self.note_unmatched("a packet from an ended connection");
         self.publish_status();
+    }
+
+    /// Urgent commands and link faults retire the remainder of staged plans.
+    fn retire_staged_commands(&mut self) {
+        let Some(connection) = self.connection.as_mut() else {
+            return;
+        };
+        let staged = connection
+            .active
+            .as_ref()
+            .is_some_and(|op| op.completed_stages > 0 || !op.remaining.is_empty());
+        let mut retired = Vec::new();
+        if staged {
+            let pending = if connection
+                .ordinary
+                .as_ref()
+                .is_some_and(|(_, owner)| *owner == OrdinaryOwner::Command)
+            {
+                connection.ordinary.take().map(|(pending, _)| pending)
+            } else {
+                None
+            };
+            retired.push((connection.active.take().unwrap(), pending));
+        }
+        let mut i = 0;
+        while i < connection.urgent.len() {
+            let op = &connection.urgent[i].op;
+            if op.completed_stages > 0 || !op.remaining.is_empty() {
+                let lane = connection.urgent.remove(i);
+                retired.push((lane.op, lane.in_flight));
+            } else {
+                i += 1;
+            }
+        }
+        for (op, pending) in retired {
+            let unsent = pending
+                .as_ref()
+                .is_some_and(|p| self.settle_unanswered(p) && p.is_first_packet());
+            self.finish(
+                op.ticket,
+                op.command,
+                CommandResult::Retired {
+                    transmitted: op.was_transmitted(unsent),
+                },
+            );
+        }
     }
 
     /// Revoke every energizing write (Arm, Home, Move) that has not left the
@@ -1911,7 +2220,9 @@ impl LinkEngine {
             self.finish(
                 lane.op.ticket,
                 lane.op.command,
-                CommandResult::Retired { transmitted: false },
+                CommandResult::Retired {
+                    transmitted: lane.op.was_transmitted(true),
+                },
             );
         }
     }
@@ -1941,7 +2252,7 @@ impl LinkEngine {
                 op.ticket,
                 op.command,
                 CommandResult::Retired {
-                    transmitted: !in_flight.is_first_packet(),
+                    transmitted: op.was_transmitted(in_flight.is_first_packet()),
                 },
             );
         }
@@ -2038,7 +2349,7 @@ impl LinkEngine {
                 } => {
                     let observed = as_i32(value);
                     if observed == expected {
-                        return OpOutcome::Done(CommandResult::Completed);
+                        return self.stage_completed(op);
                     }
                     if op.confirm_until.is_some_and(|until| now >= until) {
                         let observed = format!(
@@ -2056,7 +2367,7 @@ impl LinkEngine {
                 }
                 Confirm::Readback(endpoint, written) => {
                     if same_bits(value, written) {
-                        OpOutcome::Done(CommandResult::Completed)
+                        self.stage_completed(op)
                     } else {
                         OpOutcome::Done(CommandResult::NotConfirmed {
                             observed: format!(
@@ -2070,6 +2381,25 @@ impl LinkEngine {
             (step, reply) => OpOutcome::Done(CommandResult::OutcomeUnknown {
                 reason: format!("unexpected reply {reply:?} in step {step:?}"),
             }),
+        }
+    }
+
+    fn stage_completed(&mut self, op: &mut Operation) -> OpOutcome {
+        op.completed_stages += 1;
+        if let Some((write, confirm)) = op.remaining.pop_front() {
+            op.write = write;
+            op.confirm = confirm;
+            op.step = OpStep::SendWrite;
+            op.confirm_until = None;
+            OpOutcome::Continue
+        } else {
+            if matches!(
+                op.command,
+                LinkCommand::Arm | LinkCommand::Home | LinkCommand::MoveAbsolute { .. }
+            ) {
+                self.torque_restore = None;
+            }
+            OpOutcome::Done(CommandResult::Completed)
         }
     }
 
@@ -2205,6 +2535,10 @@ impl LinkEngine {
         record.armed_state = reads.armed_state;
         record.current_limit_a = reads.current_limit_a;
         record.deceleration_turns_per_s2 = reads.deceleration_turns_per_s2;
+        record.torque = self
+            .torque_restore
+            .clone()
+            .unwrap_or_else(|| reads.torque.clone());
         match reads.serial_number {
             Some(board_serial) if board_serial == expected => self.set_gate(GateStep::IdleWrite),
             board_serial => self.fail_gate(Some(format!(
@@ -2351,7 +2685,7 @@ impl LinkEngine {
                         op.ticket,
                         op.command,
                         CommandResult::Retired {
-                            transmitted: !in_flight.is_first_packet(),
+                            transmitted: op.was_transmitted(in_flight.is_first_packet()),
                         },
                     );
                 }
@@ -2384,7 +2718,7 @@ impl LinkEngine {
             self.latch_fault(reason.clone());
             let result = if unsent {
                 CommandResult::Retired {
-                    transmitted: !in_flight.is_first_packet(),
+                    transmitted: lane.op.was_transmitted(in_flight.is_first_packet()),
                 }
             } else {
                 CommandResult::OutcomeUnknown { reason }
@@ -2513,6 +2847,13 @@ enum OpOutcome {
     Continue,
     Done(CommandResult),
     AwaitSample,
+}
+
+fn write_stage(endpoint: Endpoint, value: WireValue) -> (RequestSpec, Confirm) {
+    (
+        RequestSpec::Write(endpoint, value),
+        Confirm::Readback(endpoint, value),
+    )
 }
 
 fn advance_after_send(op: &mut Operation, now: Instant) {

@@ -6,11 +6,11 @@
 //! link commands through a port the caller supplies, and hands back typed
 //! [`LiftEvent`]s. It runs one operation at a time, with no queue, and reports
 //! exactly one [`LiftEvent::Finished`] for each accepted operation. It derives
-//! Position trust from a Home it watched end to end, detects Touchdown contact
+//! Position trust from fresh native homed/encoder evidence, detects Touchdown contact
 //! from polled position and current, and separates routine cancel, which
 //! leaves the axis armed, from Stop, which latches a host fault.
 //!
-//! Lift-axis millimetres are 0 at the Home reference and increase downward.
+//! Lift-axis millimetres are 0 at the Home reference and decrease downward.
 //!
 //! # Integration contract
 //!
@@ -58,8 +58,12 @@
 //!   the Home timeout is Stop. Upstream
 //!   clears `is_homed` on entry and sets it true on every exit, including
 //!   after a fault or an interrupting state request, and an interrupted run
-//!   rewrites the encoder count. So `is_homed` alone is never evidence, and an
-//!   interrupted Home grants no trust.
+//!   rewrites the encoder count. Home completion remains an operation result;
+//!   Position trust independently follows the board's fresh homed/encoder report.
+//! - Position trust (host policy): the native homed flag is authoritative, with
+//!   ready, error-free encoder feedback on a verified link in a fresh current-epoch
+//!   sample. Startup and reconnect can therefore recover trust without a Home
+//!   witnessed by Sans. Stop and Disarm clear press state, not the reference.
 //! - Home leaves the axis idle (reference). Motion needs a separate Arm.
 //!   Home is accepted from idle because the adapter's Arm rejects any error
 //!   word, and the #57 capture showed the axis idle on a pressed endstop with
@@ -74,37 +78,34 @@
 //!   write, so only samples after the readback count.
 //! - Arming (reference) sets the input position to the current estimate, so
 //!   arming commands no motion.
-//! - Routine cancel (reference): an urgent absolute move to the sampled
-//!   position. A position write in trapezoidal mode replans from the current
-//!   setpoint with the configured deceleration, so the axis may overshoot by
-//!   up to the braking reach and return. #60 must measure overshoot, return
-//!   and stop time before this is relied on.
+//! - Explicit Disarm (host policy) is accepted only without an active
+//!   operation, clears the live hold and waits for an
+//!   urgent idle request followed by a fresh stationary idle sample. Use
+//!   routine cancel or cross-board Stop to interrupt an operation.
+//! - Routine cancel: an urgent move to the sampled position, restoring position
+//!   and trapezoidal control if a torque press was active. Position moves use
+//!   the board's trajectory deceleration to estimate braking reach. Touchdown
+//!   relies on book contact and checks the sampled position against travel,
+//!   without projecting a free-motion stopping point.
 //! - Current limit (reference): upstream reads the configured limit every
 //!   control cycle, so a runtime write takes effect at once. Units are amps.
 //! - Touchdown contact (host policy): saturated current in the descent
-//!   direction (measured current signed by the commissioned direction, so
+//!   direction (measured current projected onto descent, so
 //!   opposite torque never counts), stationary velocity
 //!   and no progress for a whole dwell window, after a startup grace, with
 //!   the travel bound checked first. Whether a stalled hold stays saturated
 //!   at the press current is unverified (#60).
-//! - Trajectory done (reference) is planned-time upstream: it reads true
-//!   when the planned trajectory time has elapsed, not when the axis
-//!   arrives, so it is never taken alone as physical arrival. A contact so
-//!   late that the planned time runs out before the dwell completes is
-//!   `TravelExhausted`; that fails closed, and #60 checks how close to the
-//!   descent limit a real contact can be.
-//! - Live hold (host policy): after a completed Touchdown the setpoint still
-//!   presses into the book, limited only by the press current. Until a
-//!   `Completed` or `Cancelled` operation ends stationary above the hold's
-//!   settled position by more than the position tolerance, or Stop or a new
-//!   epoch ends it, no current limit is written and Home and every descent
-//!   are rejected. The first upward move therefore runs at the press limit,
-//!   and the next motion restores the ODrive's own limit first. A routine
-//!   cancel keeps the press limit and the hold. The hold is independent of
-//!   Position trust; without trust the only way out is Stop. Unverified:
-//!   #60 must check that the press current can lift the loaded suction box
-//!   off the book. If it cannot, the lift-away stalls, the move times out
-//!   and becomes Stop, which fails closed.
+//! - Torque Touchdown: the typed entry seeds position while stationary, zeros
+//!   feedforward, sets the firmware velocity limiter, then applies signed torque
+//!   last. Current converts through the board's torque constant; measured Iq also
+//!   accounts for the motor's electrical direction. Trajectory-done is irrelevant
+//!   in torque mode. Contact and hold each need a fresh saturated stationary dwell.
+//! - Live hold: constant torque continues after completion. Hold depth limits
+//!   downward drift; it is never a deeper position target. Home and descents wait
+//!   for lift-away or Stop. Lift-away restores position control at the press current;
+//!   only the following motion restores the board's current limit. A completed hold
+//!   keeps monitoring travel and mode evidence. #60 must check contact detection,
+//!   actual stopping distance and whether the press current can lift the load.
 //! - Stop (reference): a Disarm, which floats the motor phases upstream. What
 //!   the vertical axis does unpowered is a physical question for #60 and #25.
 //! - ODrive errors (host policy): a fresh sample with any error word set,
@@ -122,6 +123,8 @@ use crate::config::{LiftAxisProfile, LiftDirection, MotionProfile};
 use crate::odrive::{
     AxisState, CommandResult, LinkCommand, LinkEvent, LinkPhase, LinkStatus, Priority,
     TelemetrySample, TelemetryValues, Ticket, AXIS_ERROR_MIN_ENDSTOP_PRESSED,
+    CONTROL_MODE_POSITION_CONTROL, CONTROL_MODE_TORQUE_CONTROL, INPUT_MODE_PASSTHROUGH,
+    INPUT_MODE_TRAP_TRAJ,
 };
 use crate::MachineProfile;
 
@@ -134,16 +137,25 @@ pub struct OperationId(pub u64);
 pub enum LiftRequest {
     /// Enter closed-loop control; completes when the adapter confirms it.
     Arm,
-    /// Run native homing from idle. Grants Position trust on clean evidence.
+    /// Urgently idle an inactive axis while retaining a valid native position reference.
+    /// During an operation use routine cancel or cross-board Stop instead.
+    Disarm,
+    /// Run native homing. Position trust follows the board's fresh homed report.
     Home,
     /// Absolute move, also used to park.
     MoveTo {
-        /// Target in millimetres, 0 at Home and increasing downward.
+        /// Target in millimetres, 0 at Home and decreasing downward.
         position_mm: f32,
     },
     /// Lower until contact and hold the press. With a post-turn page width,
     /// emits [`LiftEvent::TurnBlowerCutoff`] on the way down.
     Touchdown {
+        /// Optional press current in amps; otherwise use the Machine profile.
+        /// Must be positive and at most the board's current limit.
+        press_current_a: Option<f32>,
+        /// Optional firmware velocity limit in mm/s; otherwise use the lower of
+        /// the board's controller and trajectory velocity limits.
+        velocity_limit_mm_s: Option<f32>,
         /// Page width of the turn just made, if this Touchdown follows one.
         post_turn_page_width_mm: Option<f32>,
     },
@@ -201,20 +213,31 @@ pub enum LiftRejection {
     InvalidPageWidth(f32),
     /// The target is not finite or outside the commissioned travel.
     InvalidTarget(f32),
+    /// Requested Touchdown current is non-finite or nonpositive.
+    InvalidPressCurrent {
+        /// Current requested by the caller, in amps.
+        requested_a: f32,
+        /// Board's maximum Touchdown current, in amps, or 0 if not known.
+        maximum_a: f32,
+    },
     /// A descent needs confirmed vacuum-off evidence.
     VacuumNotConfirmedOff,
     /// The wiggle starts only at the wiggle-start anchor.
     NotAtWiggleStart,
     /// The Touchdown descent limit is outside travel or not below the axis.
     NoDescentRoom,
+    /// Native torque conversion or velocity limiter settings cannot support this press.
+    TorqueSettings(String),
     /// A Touchdown hold is live: Home and descents wait for a lift-away or Stop.
     InHold,
+    /// Touchdown entry needs a stationary axis.
+    NotStationary,
     /// Clearing the fault needs a fresh sample reading idle.
     NotIdle,
-    /// The profile's Touchdown press current exceeds the ODrive's own current
+    /// The requested Touchdown press current exceeds the ODrive's own current
     /// limit, or that limit was not read at connection.
     PressAboveBoardLimit {
-        /// `motion.touchdown_press_current_a`.
+        /// Requested Touchdown press current, in amps.
         press_a: f32,
         /// The ODrive's `current_lim`, if read.
         board_a: Option<f32>,
@@ -244,11 +267,11 @@ pub enum LiftFault {
     ClearFailed(String),
     /// Home ended idle without clean evidence; the axis is idle and unlatched.
     HomeFailed(String),
-    /// Touchdown reached the descent limit or a hold target outside travel.
+    /// Touchdown reached the commissioned travel minimum.
     TravelExhausted,
     /// Touchdown stalled where it started.
     NoProgress,
-    /// The hold reached its target without resistance.
+    /// The press drifted past its hold depth without retaining contact.
     ContactNotHeld,
     /// Touchdown did not settle within the move timeout.
     TimedOut,
@@ -263,8 +286,9 @@ pub struct TouchdownHold {
     pub position_mm: f32,
     /// The press current limit in force.
     pub press_current_a: f32,
-    /// The hold target, the hold depth below contact.
-    pub hold_target_mm: f32,
+    /// The lowest allowed position: the hold depth below contact, bounded by
+    /// the travel minimum. Never a motion target.
+    pub hold_limit_mm: f32,
 }
 
 /// How an operation ended.
@@ -344,7 +368,6 @@ pub struct LiftOperations {
     epoch: u64,
     verified: bool,
     latest: Option<TelemetrySample>,
-    trusted: bool,
     touchdown_mm: Option<f32>,
     /// A live hold's own reference, kept apart from trust and `touchdown_mm`.
     live_hold_mm: Option<f32>,
@@ -355,6 +378,9 @@ pub struct LiftOperations {
     /// The ODrive's own `current_lim`, read at connection. It is not re-read
     /// while a press limit may be in force, so it stays the value to restore.
     board_current_a: Option<f32>,
+    board_torque: crate::TorqueSettings,
+    axis_index: u8,
+    live_hold_limit_mm: Option<f32>,
     /// The ODrive's own trajectory deceleration in mm/s², read at connection.
     board_deceleration_mm_s2: Option<f32>,
     latch: Option<StopCause>,
@@ -384,6 +410,7 @@ struct Active {
 #[derive(Clone, Debug)]
 enum Phase {
     Arm,
+    Disarm,
     Clear,
     Home,
     Move {
@@ -395,7 +422,7 @@ enum Phase {
     },
     Hold {
         touchdown: Touchdown,
-        target_mm: f32,
+        limit_mm: f32,
         window: Option<Window>,
     },
     Cancel {
@@ -409,6 +436,7 @@ struct Touchdown {
     start_mm: f32,
     limit_mm: f32,
     press_a: f32,
+    velocity_mm_s: f32,
     cutoff_mm: Option<f32>,
 }
 
@@ -424,7 +452,7 @@ enum Step {
     Finish(LiftOutcome),
     Stop(String),
     Cancel(LiftFault),
-    Hold { target_mm: f32 },
+    Hold { limit_mm: f32 },
 }
 
 /// Submits one lift-axis link command and returns its ticket, or `None` when
@@ -445,12 +473,14 @@ impl LiftOperations {
             epoch: 0,
             verified: false,
             latest: None,
-            trusted: false,
             touchdown_mm: None,
             live_hold_mm: None,
             applied_limit_a: None,
             press_limit: false,
             board_current_a: None,
+            board_torque: crate::TorqueSettings::default(),
+            axis_index: profile.odrive.axis,
+            live_hold_limit_mm: None,
             board_deceleration_mm_s2: None,
             latch: None,
             stop_disarm: None,
@@ -483,6 +513,7 @@ impl LiftOperations {
         }
         let phase = match request {
             LiftRequest::Arm => Phase::Arm,
+            LiftRequest::Disarm => Phase::Disarm,
             LiftRequest::Home => Phase::Home,
             LiftRequest::MoveTo { position_mm } => Phase::Move {
                 target_mm: self.check_move(now, position_mm, vacuum, None)?,
@@ -500,9 +531,17 @@ impl LiftOperations {
                 }
             }
             LiftRequest::Touchdown {
+                press_current_a,
+                velocity_limit_mm_s,
                 post_turn_page_width_mm,
             } => Phase::Descend {
-                touchdown: self.check_touchdown(now, post_turn_page_width_mm, vacuum)?,
+                touchdown: self.check_touchdown(
+                    now,
+                    post_turn_page_width_mm,
+                    press_current_a.unwrap_or(self.motion.touchdown_press_current_a),
+                    velocity_limit_mm_s,
+                    vacuum,
+                )?,
                 window: None,
             },
         };
@@ -516,7 +555,7 @@ impl LiftOperations {
                             leg: PageTurnLeg::Wiggle,
                             ..
                         }
-                    ) || position.is_none_or(|p| target_mm > p + axis.position_tolerance_mm)
+                    ) || position.is_none_or(|p| target_mm < p - axis.position_tolerance_mm)
                 }
                 Phase::Home | Phase::Descend { .. } => true,
                 _ => false,
@@ -529,11 +568,11 @@ impl LiftOperations {
             Phase::Home => axis.home_timeout_ms,
             _ => axis.move_timeout_ms,
         };
-        if matches!(phase, Phase::Home) {
-            self.lose_trust();
+        if matches!(phase, Phase::Home | Phase::Disarm) {
+            self.clear_press_state();
         }
         let id = self.begin(now, Duration::from_millis(timeout), phase);
-        self.submit_phase(link);
+        self.submit_phase(now, link);
         Ok(id)
     }
 
@@ -548,7 +587,11 @@ impl LiftOperations {
             return;
         };
         match phase {
-            Phase::Arm | Phase::Clear | Phase::Cancel { .. } | Phase::HomeCancel => {}
+            Phase::Arm
+            | Phase::Disarm
+            | Phase::Clear
+            | Phase::Cancel { .. }
+            | Phase::HomeCancel => {}
             Phase::Home => {
                 let deadline = now + Duration::from_millis(self.axis().cancel_timeout_ms);
                 let active = self.active.as_mut().expect("checked");
@@ -564,9 +607,7 @@ impl LiftOperations {
     /// Latch Stop, finish the active operation and submit an urgent Disarm.
     /// Always accepted.
     pub fn stop(&mut self, cause: StopCause, link: &mut Port<'_>) {
-        self.lose_trust();
-        // The latch and the Arm needed after it reset the pressing setpoint.
-        self.live_hold_mm = None;
+        self.clear_press_state();
         self.finish(LiftOutcome::Fault(LiftFault::Stopped(cause.clone())));
         self.latch.get_or_insert(cause);
         self.stop_disarm = link(LinkCommand::Disarm, Priority::Urgent);
@@ -651,11 +692,11 @@ impl LiftOperations {
         self.events.pop_front()
     }
 
-    /// Current policy state.
-    pub fn status(&self) -> LiftStatus {
+    /// Policy state at `now`; position trust requires fresh native encoder evidence.
+    pub fn status(&self, now: Instant) -> LiftStatus {
         LiftStatus {
             epoch: self.epoch,
-            position_trusted: self.trusted,
+            position_trusted: self.position_trusted(now),
             latch: self.latch.clone(),
             active: self.active.as_ref().map(|active| active.id),
             touchdown_mm: self.touchdown_mm,
@@ -678,7 +719,7 @@ impl LiftOperations {
     fn fresh_position(&self, now: Instant) -> Result<f32, LiftRejection> {
         let position = self.fresh(now).and_then(|values| values.position_mm);
         let position = position.ok_or(LiftRejection::NoFreshSample)?;
-        if !self.trusted {
+        if !self.position_trusted(now) {
             return Err(LiftRejection::PositionUntrusted);
         }
         Ok(position)
@@ -710,7 +751,7 @@ impl LiftOperations {
             Some(anchor) if (position - anchor).abs() > tolerance => {
                 Err(LiftRejection::NotAtWiggleStart)
             }
-            None if target_mm > position + tolerance && vacuum != VacuumEvidence::ConfirmedOff => {
+            None if target_mm < position - tolerance && vacuum != VacuumEvidence::ConfirmedOff => {
                 Err(LiftRejection::VacuumNotConfirmedOff)
             }
             _ => Ok(target_mm),
@@ -726,7 +767,7 @@ impl LiftOperations {
         }
     }
 
-    /// The recorded Touchdown position minus the leg's Lift percentage of the page width.
+    /// The recorded Touchdown position plus the leg's Lift percentage of the page width.
     fn leg_target(&self, leg: PageTurnLeg, page_width_mm: f32) -> Result<f32, LiftRejection> {
         let page_width_mm = self.check_page_width(page_width_mm)?;
         let touchdown = self
@@ -740,15 +781,23 @@ impl LiftOperations {
             PageTurnLeg::ToVacuumOff => motion.vacuum_off_percent,
             PageTurnLeg::ToFinalLift => motion.final_lift_percent,
         };
-        Ok(touchdown - percent / 100.0 * page_width_mm)
+        Ok(touchdown + percent / 100.0 * page_width_mm)
     }
 
     fn check_touchdown(
         &self,
         now: Instant,
         post_turn_page_width_mm: Option<f32>,
+        press_current_a: f32,
+        velocity_limit_mm_s: Option<f32>,
         vacuum: VacuumEvidence,
     ) -> Result<Touchdown, LiftRejection> {
+        if !(press_current_a.is_finite() && press_current_a > 0.0) {
+            return Err(LiftRejection::InvalidPressCurrent {
+                requested_a: press_current_a,
+                maximum_a: self.board_current_a.unwrap_or(0.0),
+            });
+        }
         let start_mm = self.fresh_position(now)?;
         if vacuum != VacuumEvidence::ConfirmedOff {
             return Err(LiftRejection::VacuumNotConfirmedOff);
@@ -760,10 +809,10 @@ impl LiftOperations {
                 let previous = self
                     .touchdown_mm
                     .ok_or(LiftRejection::NoTouchdownPosition)?;
-                Some(previous - self.motion.blower_off_descent_percent / 100.0 * width)
+                Some(previous + self.motion.blower_off_descent_percent / 100.0 * width)
             }
         };
-        let press_a = self.motion.touchdown_press_current_a;
+        let press_a = press_current_a;
         if !self
             .board_current_a
             .is_some_and(|board_a| press_a <= board_a)
@@ -774,10 +823,26 @@ impl LiftOperations {
             });
         }
         let axis = self.axis();
-        let limit_mm = axis.travel_maximum_mm - axis.touchdown_hold_depth_mm;
+        let speed_turns = velocity_limit_mm_s.map_or(
+            self.board_torque
+                .velocity_turns_s
+                .min(self.board_torque.trajectory_velocity_turns_s),
+            |v| v / axis.mm_per_turn,
+        );
+        self.board_torque
+            .check(self.axis_index, press_a, speed_turns)
+            .map_err(LiftRejection::TorqueSettings)?;
+        let values = self.fresh(now).ok_or(LiftRejection::NoFreshSample)?;
+        if values
+            .velocity_mm_s
+            .is_none_or(|v| v.abs() > axis.stationary_velocity_mm_s)
+        {
+            return Err(LiftRejection::NotStationary);
+        }
+        let limit_mm = axis.travel_minimum_mm;
         if !(limit_mm >= axis.travel_minimum_mm
             && limit_mm <= axis.travel_maximum_mm
-            && limit_mm > start_mm + axis.touchdown_no_progress_mm)
+            && limit_mm < start_mm - axis.touchdown_no_progress_mm)
         {
             return Err(LiftRejection::NoDescentRoom);
         }
@@ -785,6 +850,7 @@ impl LiftOperations {
             start_mm,
             limit_mm,
             press_a,
+            velocity_mm_s: speed_turns * axis.mm_per_turn,
             cutoff_mm,
         })
     }
@@ -807,11 +873,12 @@ impl LiftOperations {
     }
 
     /// Submit the active phase's command, first setting its current limit if needed.
-    fn submit_phase(&mut self, link: &mut Port<'_>) {
+    fn submit_phase(&mut self, now: Instant, link: &mut Port<'_>) {
+        let trusted = self.position_trusted(now);
         let Some(active) = self.active.as_mut() else {
             return;
         };
-        if needs_trust(&active.phase) && !self.trusted {
+        if needs_trust(&active.phase) && !trusted {
             let cause = StopCause::Uncertain("Position trust lost before motion".into());
             return self.stop(cause, link);
         }
@@ -820,6 +887,7 @@ impl LiftOperations {
         let restore_a = self.board_current_a.filter(|_| self.press_limit);
         let (wanted_a, command) = match active.phase {
             Phase::Arm => (None, LinkCommand::Arm),
+            Phase::Disarm => (None, LinkCommand::Disarm),
             Phase::Home => (restore_a, LinkCommand::Home),
             Phase::Move { target_mm } => (
                 restore_a,
@@ -829,8 +897,9 @@ impl LiftOperations {
             ),
             Phase::Descend { touchdown, .. } => (
                 Some(touchdown.press_a),
-                LinkCommand::MoveAbsolute {
-                    position_mm: touchdown.limit_mm,
+                LinkCommand::BeginTorquePress {
+                    amps: touchdown.press_a,
+                    velocity_mm_s: touchdown.velocity_mm_s,
                 },
             ),
             _ => return,
@@ -849,7 +918,14 @@ impl LiftOperations {
                     link,
                 );
             }
-            _ => self.submit(command, Priority::Ordinary, link),
+            _ => {
+                let priority = if matches!(active.phase, Phase::Disarm) {
+                    Priority::Urgent
+                } else {
+                    Priority::Ordinary
+                };
+                self.submit(command, priority, link);
+            }
         }
     }
 
@@ -866,7 +942,8 @@ impl LiftOperations {
     }
 
     /// Start the routine cancel sequence: an urgent move to the sampled
-    /// position, or an urgent Stop when the braking envelope leaves travel.
+    /// position. Position moves also check projected braking reach; Touchdown
+    /// checks only the sampled position while seeking book contact.
     fn begin_cancel(&mut self, now: Instant, fault: Option<LiftFault>, link: &mut Port<'_>) {
         let axis = self.axis().clone();
         let sampled = self
@@ -876,29 +953,40 @@ impl LiftOperations {
             let cause = StopCause::Uncertain("cancel without a fresh sample".into());
             return self.stop(cause, link);
         };
-        let speed = velocity.abs();
-        let deceleration = self
-            .board_deceleration_mm_s2
-            .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
-        let reach = if speed <= axis.stationary_velocity_mm_s {
-            0.0
-        } else if let Some(deceleration) = deceleration {
-            speed * (self.max_age + self.urgent_deadline).as_secs_f32()
-                + speed * speed / (2.0 * deceleration)
-        } else {
-            let cause = StopCause::Uncertain(
-                "cancel braking reach is unknown: the ODrive deceleration limit was not read"
-                    .into(),
-            );
-            return self.stop(cause, link);
-        };
-        let end = position + velocity.signum() * reach;
         let inside = |mm: f32| mm >= axis.travel_minimum_mm && mm <= axis.travel_maximum_mm;
-        if !(inside(position) && inside(end)) {
-            let cause = StopCause::Uncertain(format!(
-                "cancel braking envelope {position} to {end} mm leaves travel"
-            ));
-            return self.stop(cause, link);
+        if !inside(position) {
+            return self.stop(
+                StopCause::Uncertain(format!("cancel position {position} mm is outside travel")),
+                link,
+            );
+        }
+        let touchdown = self.active.as_ref().is_some_and(|active| {
+            matches!(active.phase, Phase::Descend { .. } | Phase::Hold { .. })
+        });
+        if !touchdown {
+            let speed = velocity.abs();
+            let deceleration = self
+                .board_deceleration_mm_s2
+                .filter(|mm_s2| mm_s2.is_finite() && *mm_s2 > 0.0);
+            let reach = if speed <= axis.stationary_velocity_mm_s {
+                0.0
+            } else if let Some(deceleration) = deceleration {
+                speed * (self.max_age + self.urgent_deadline).as_secs_f32()
+                    + speed * speed / (2.0 * deceleration)
+            } else {
+                let cause = StopCause::Uncertain(
+                    "cancel braking reach is unknown: the ODrive deceleration limit was not read"
+                        .into(),
+                );
+                return self.stop(cause, link);
+            };
+            let end = position + velocity.signum() * reach;
+            if !inside(end) {
+                let cause = StopCause::Uncertain(format!(
+                    "cancel braking envelope {position} to {end} mm leaves travel"
+                ));
+                return self.stop(cause, link);
+            }
         }
         if let Some(active) = self.active.as_mut() {
             active.phase = Phase::Cancel { fault };
@@ -931,7 +1019,8 @@ impl LiftOperations {
             if self.stop_evidence.is_some() {
                 self.stop_evidence = Some(StopEvidence::Unconfirmed);
             }
-            self.lose_trust();
+            self.clear_press_state();
+            self.latest = None;
         }
         if epoch_changed {
             // A new epoch never reuses the previous one's Disarm confirmation.
@@ -939,10 +1028,12 @@ impl LiftOperations {
             self.stop_confirmed_at = None;
             // The new gate idles the axis, and Arm resets the setpoint.
             self.live_hold_mm = None;
+            self.live_hold_limit_mm = None;
             self.latest = None;
             self.applied_limit_a = None;
         }
         if let Some(discovery) = &status.discovery {
+            self.board_torque = discovery.torque.clone();
             // Under a press limit the board reads the press current, not its own.
             if let Some(amps) = discovery.current_limit_a.filter(|_| !self.press_limit) {
                 self.board_current_a = Some(amps);
@@ -999,10 +1090,15 @@ impl LiftOperations {
             if !matches!(active.phase, Phase::Descend { .. }) {
                 self.press_limit = false;
             }
-            return self.submit_phase(link);
+            return self.submit_phase(now, link);
         }
         if matches!(active.phase, Phase::Arm) {
             return self.finish(LiftOutcome::Completed(None));
+        }
+        if matches!(active.phase, Phase::Cancel { .. }) {
+            // Cancel has handed torque control back to a sampled position hold.
+            self.live_hold_mm = None;
+            self.live_hold_limit_mm = None;
         }
         active.confirmed_at = Some(now);
         active.moving = true;
@@ -1021,11 +1117,14 @@ impl LiftOperations {
         let Some(values) = sample.fresh_values(now).cloned() else {
             return;
         };
+        let holding = self.live_hold_mm.is_some();
         if values.encoder_error != 0 || !values.encoder_ready || !values.is_homed {
-            self.lose_trust();
+            self.clear_press_state();
         }
-        if !self.trusted && self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)) {
-            let cause = StopCause::Uncertain("Position trust lost during motion".into());
+        if !self.position_trusted(now)
+            && (holding || self.active.as_ref().is_some_and(|a| needs_trust(&a.phase)))
+        {
+            let cause = StopCause::Uncertain(format!("ODrive position reference unavailable: homed {}, encoder ready {}, encoder error 0x{:x}", values.is_homed, values.encoder_ready, values.encoder_error));
             return self.stop(cause, link);
         }
         // A Home's own errors finish it as `HomeFailed`; the next sample stops.
@@ -1057,16 +1156,55 @@ impl LiftOperations {
         {
             self.stop_evidence = Some(StopEvidence::Unconfirmed);
         }
+        let check_travel = self.live_hold_mm.is_some()
+            || self.active.as_ref().is_some_and(|active| {
+                matches!(
+                    active.phase,
+                    Phase::Descend { .. } | Phase::Hold { .. } | Phase::Cancel { .. }
+                )
+            });
+        if self.latch.is_none()
+            && ((self.live_hold_mm.is_some()
+                && self
+                    .live_hold_limit_mm
+                    .is_some_and(|limit| position <= limit))
+                || (check_travel
+                    && (position < axis.travel_minimum_mm || position > axis.travel_maximum_mm)))
+        {
+            return self.stop(
+                StopCause::Uncertain("lift motion left its travel or contact hold limit".into()),
+                link,
+            );
+        }
         let Some(active) = self.active.as_mut() else {
+            if self.live_hold_mm.is_some()
+                && self.latch.is_none()
+                && (values.axis_state != AxisState::ClosedLoopControl
+                    || values.control_mode != CONTROL_MODE_TORQUE_CONTROL
+                    || values.input_mode != INPUT_MODE_PASSTHROUGH)
+            {
+                self.stop(
+                    StopCause::Uncertain("torque hold lost closed-loop torque control".into()),
+                    link,
+                );
+            }
             return;
         };
         if !active.confirmed_at.is_some_and(|at| taken_at > at) {
             return;
         }
-        let step = sample_step(&axis, active, &values, taken_at, position, stationary);
+        let step = sample_step(
+            &axis,
+            self.board_torque.motor_direction,
+            active,
+            &values,
+            taken_at,
+            position,
+            stationary,
+        );
         let id = active.id;
         if let Phase::Descend { touchdown, .. } = &mut active.phase {
-            if touchdown.cutoff_mm.is_some_and(|cutoff| position >= cutoff) {
+            if touchdown.cutoff_mm.is_some_and(|cutoff| position <= cutoff) {
                 touchdown.cutoff_mm = None;
                 self.events.push_back(LiftEvent::TurnBlowerCutoff { id });
             }
@@ -1081,39 +1219,45 @@ impl LiftOperations {
                 ) && stationary
                     && self
                         .live_hold_mm
-                        .is_some_and(|hold| position < hold - axis.position_tolerance_mm)
+                        .is_some_and(|hold| position > hold + axis.position_tolerance_mm)
                 {
                     self.live_hold_mm = None;
+                    self.live_hold_limit_mm = None;
                 }
                 self.finish(outcome)
             }
             Step::Stop(reason) => self.stop(StopCause::Uncertain(reason), link),
             Step::Cancel(fault) => self.begin_cancel(now, Some(fault), link),
-            Step::Hold { target_mm } => {
+            Step::Hold { limit_mm } => {
                 let active = self.active.as_mut().expect("active");
                 if let Phase::Descend { touchdown, .. } = active.phase {
                     active.phase = Phase::Hold {
                         touchdown,
-                        target_mm,
+                        limit_mm,
                         window: None,
                     };
                 }
-                self.submit(
-                    LinkCommand::MoveAbsolute {
-                        position_mm: target_mm,
-                    },
-                    Priority::Ordinary,
-                    link,
-                );
+                // Keep torque unchanged; the hold depth is only a drift guard.
             }
         }
     }
 
     // ----- outcomes ------------------------------------------------------------
 
-    fn lose_trust(&mut self) {
-        self.trusted = false;
+    fn position_trusted(&self, now: Instant) -> bool {
+        self.verified
+            && self.latest.as_ref().is_some_and(|sample| {
+                sample.epoch() == self.epoch
+                    && sample.fresh_values(now).is_some_and(|values| {
+                        values.is_homed && values.encoder_ready && values.encoder_error == 0
+                    })
+            })
+    }
+
+    fn clear_press_state(&mut self) {
         self.touchdown_mm = None;
+        self.live_hold_mm = None;
+        self.live_hold_limit_mm = None;
     }
 
     fn finish(&mut self, outcome: LiftOutcome) {
@@ -1121,18 +1265,15 @@ impl LiftOperations {
             return;
         };
         if let LiftOutcome::Completed(hold) = &outcome {
-            match active.phase {
-                Phase::Home => self.trusted = true,
-                Phase::Clear => {
-                    self.latch = None;
-                    self.stop_evidence = None;
-                    self.stop_disarm = None;
-                }
-                _ => {}
+            if matches!(active.phase, Phase::Clear) {
+                self.latch = None;
+                self.stop_evidence = None;
+                self.stop_disarm = None;
             }
             if let Some(hold) = hold {
                 self.touchdown_mm = Some(hold.position_mm);
                 self.live_hold_mm = Some(hold.position_mm);
+                self.live_hold_limit_mm = Some(hold.hold_limit_mm);
             }
         }
         self.events.push_back(LiftEvent::Finished {
@@ -1154,6 +1295,7 @@ fn needs_trust(phase: &Phase) -> bool {
 fn phase_name(phase: &Phase) -> &'static str {
     match phase {
         Phase::Arm => "Arm",
+        Phase::Disarm => "Disarm",
         Phase::Clear => "clear fault",
         Phase::Home => "Home",
         Phase::Move { .. } => "move",
@@ -1179,6 +1321,7 @@ fn odrive_errors(values: &TelemetryValues) -> Option<String> {
 /// Judge one fresh sample taken after the active command's confirmation.
 fn sample_step(
     axis: &LiftAxisProfile,
+    motor_direction: i32,
     active: &mut Active,
     values: &TelemetryValues,
     taken_at: Instant,
@@ -1190,7 +1333,16 @@ fn sample_step(
         && values.motor_error == 0
         && values.encoder_error == 0
         && values.controller_error == 0;
-    let closed_loop_ok = values.axis_state == AxisState::ClosedLoopControl && errors_zero;
+    let torque = matches!(active.phase, Phase::Descend { .. } | Phase::Hold { .. });
+    let modes_ok = if torque {
+        values.control_mode == CONTROL_MODE_TORQUE_CONTROL
+            && values.input_mode == INPUT_MODE_PASSTHROUGH
+    } else {
+        values.control_mode == CONTROL_MODE_POSITION_CONTROL
+            && values.input_mode == INPUT_MODE_TRAP_TRAJ
+    };
+    let closed_loop_ok =
+        values.axis_state == AxisState::ClosedLoopControl && errors_zero && modes_ok;
     let armed_fault = || {
         Step::Stop(format!(
             "axis state {:?} with errors axis 0x{:x}, motor 0x{:x}, encoder 0x{:x}, controller 0x{:x}",
@@ -1203,10 +1355,11 @@ fn sample_step(
     };
     let dwell = Duration::from_millis(axis.touchdown_dwell_ms);
     // Measured current in the descent direction; opposite torque never counts.
-    let descent_iq_a = match axis.direction {
-        LiftDirection::Normal => values.iq_measured_a,
-        LiftDirection::Reversed => -values.iq_measured_a,
-    };
+    let descent_iq_a = motor_direction as f32
+        * match axis.direction {
+            LiftDirection::Normal => -values.iq_measured_a,
+            LiftDirection::Reversed => values.iq_measured_a,
+        };
     let stalled = |press_a: f32| {
         descent_iq_a >= axis.touchdown_saturation_percent / 100.0 * press_a && stationary
     };
@@ -1230,6 +1383,11 @@ fn sample_step(
     };
     match &mut active.phase {
         Phase::Arm => Step::Wait,
+        Phase::Disarm => match values.axis_state {
+            AxisState::Idle if stationary => Step::Finish(LiftOutcome::Completed(None)),
+            AxisState::Idle => Step::Wait,
+            other => Step::Stop(format!("disarmed axis reads {other:?}")),
+        },
         Phase::Clear => {
             // A moving axis never clears: Stop evidence would be withdrawn.
             if values.axis_state == AxisState::Idle && stationary && odrive_errors(values).is_none()
@@ -1296,7 +1454,7 @@ fn sample_step(
             }
         }
         Phase::Descend { touchdown, window } => {
-            if position >= touchdown.limit_mm - tolerance || values.trajectory_done {
+            if position <= touchdown.limit_mm {
                 return Step::Cancel(LiftFault::TravelExhausted);
             }
             let grace = Duration::from_millis(axis.touchdown_grace_ms);
@@ -1307,30 +1465,25 @@ fn sample_step(
             if (contact.position_mm - touchdown.start_mm).abs() <= axis.touchdown_no_progress_mm {
                 return Step::Cancel(LiftFault::NoProgress);
             }
-            let target_mm = contact.position_mm + axis.touchdown_hold_depth_mm;
-            if !(target_mm.is_finite()
-                && target_mm >= axis.travel_minimum_mm
-                && target_mm <= axis.travel_maximum_mm)
-            {
-                return Step::Cancel(LiftFault::TravelExhausted);
-            }
-            Step::Hold { target_mm }
+            let limit_mm =
+                (contact.position_mm - axis.touchdown_hold_depth_mm).max(axis.travel_minimum_mm);
+            Step::Hold { limit_mm }
         }
         Phase::Hold {
             touchdown,
-            target_mm,
+            limit_mm,
             window,
         } => {
+            if position <= *limit_mm {
+                return Step::Cancel(LiftFault::ContactNotHeld);
+            }
             let stalled = stalled(touchdown.press_a);
             if let Some(settled) = advance(window, stalled) {
                 return Step::Finish(LiftOutcome::Completed(Some(TouchdownHold {
                     position_mm: settled.position_mm,
                     press_current_a: touchdown.press_a,
-                    hold_target_mm: *target_mm,
+                    hold_limit_mm: *limit_mm,
                 })));
-            }
-            if !stalled && values.trajectory_done && (position - *target_mm).abs() <= tolerance {
-                return Step::Cancel(LiftFault::ContactNotHeld);
             }
             Step::Wait
         }

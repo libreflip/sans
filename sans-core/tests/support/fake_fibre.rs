@@ -1,4 +1,5 @@
-//! A fake legacy-Fibre ODrive built from the #57 capture.
+//! A fake legacy-Fibre ODrive using the #57 captured endpoint schema.
+//! Runtime values and dynamics are synthetic test inputs, not a board capture.
 //!
 //! It serves the reconstructed descriptor, keeps a raw value per endpoint ID,
 //! drops requests whose trailer is wrong as the pinned dispatcher does, and
@@ -30,9 +31,17 @@ pub const MOTOR_ERROR: u16 = 132;
 pub const MOTOR_IS_CALIBRATED: u16 = 134;
 pub const IQ_SETPOINT: u16 = 149;
 pub const IQ_MEASURED: u16 = 150;
+pub const TORQUE_CONSTANT: u16 = 177;
+pub const MOTOR_DIRECTION: u16 = 178;
+pub const MOTOR_TYPE: u16 = 179;
 pub const CURRENT_LIM: u16 = 180;
 pub const CONTROLLER_ERROR: u16 = 193;
 pub const INPUT_POS: u16 = 194;
+pub const INPUT_VEL: u16 = 195;
+pub const INPUT_TORQUE: u16 = 196;
+pub const CURRENT_MODE_VEL_LIMIT: u16 = 205;
+pub const VEL_GAIN: u16 = 211;
+pub const LOAD_ENCODER_AXIS: u16 = 223;
 pub const TRAJECTORY_DONE: u16 = 200;
 pub const CONTROL_MODE: u16 = 208;
 pub const INPUT_MODE: u16 = 209;
@@ -96,7 +105,7 @@ pub struct FakeFibre {
 }
 
 impl FakeFibre {
-    /// A compatible board matching the #57 capture: idle, calibrated,
+    /// A compatible board with the #57 schema and synthetic state: idle, calibrated,
     /// encoder ready, in position control with trapezoidal input, no errors.
     pub fn compatible() -> Self {
         let flat: serde_json::Value = serde_json::from_str(ENDPOINTS).unwrap();
@@ -149,6 +158,14 @@ impl FakeFibre {
         fake.set_i32(CONTROL_MODE, 3);
         fake.set_i32(INPUT_MODE, 5);
         fake.set_f32(CURRENT_LIM, 4.8);
+        fake.set_f32(TORQUE_CONSTANT, 0.1); // torque constant, Nm/A
+        fake.set_i32(MOTOR_DIRECTION, 1); // motor direction
+        fake.set_i32(MOTOR_TYPE, 0); // high-current PM motor
+        fake.set_f32(VEL_GAIN, 1.0); // velocity gain, Nm/(turn/s)
+        fake.set_f32(CONTROLLER_VEL_LIMIT, 1.0);
+        fake.set_f32(TRAP_VEL_LIMIT, 1.0);
+        fake.set_raw(LOAD_ENCODER_AXIS, vec![0]); // load encoder axis
+
         // 2 mm/s^2 at the test profiles' 8 mm per turn.
         fake.set_f32(TRAP_DECEL_LIMIT, 0.25);
         fake
@@ -269,7 +286,11 @@ impl FakeFibre {
             };
             if endpoint == CURRENT_STATE && payload_was_empty(packet) {
                 if let Some(settled) = self.settling.take() {
+                    let home_finished = settled == 1 && current == 11_i32.to_le_bytes();
                     self.set_i32(CURRENT_STATE, settled);
+                    if home_finished {
+                        self.set_bool(IS_HOMED, true);
+                    }
                 }
             }
             current[..limit.min(current.len())].to_vec()

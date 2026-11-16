@@ -222,8 +222,15 @@ printf '%s' "${{DOCKER_DEFAULT_PLATFORM-unset}}" > {log}/cross.platform
 [ {status} -eq 0 ] || exit {status}
 target=${{CARGO_TARGET_DIR:-target}}
 {writes} || exit 0
+binary=sans
+while [ $# -gt 0 ]; do
+    case $1 in
+        --bin) binary=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
 mkdir -p "$target/aarch64-unknown-linux-gnu/release"
-cp {built} "$target/aarch64-unknown-linux-gnu/release/sans"
+cp {built} "$target/aarch64-unknown-linux-gnu/release/$binary"
 "#,
                         writes = self.cross_writes_binary,
                         log = sh_quote(log.to_str().unwrap()),
@@ -328,6 +335,11 @@ fn rejects_invalid_usage_before_calling_tools() {
         &["-v"],
         &["--wat", HOST],
         &["--binary"],
+        &["--bin"],
+        &["--bin", "", HOST],
+        &["--bin", "unknown", HOST],
+        &["--bin", "../sans", HOST],
+        &["--bin", "hw_diag; touch pwned", HOST],
         &["--env"],
         &["--env", "NOEQUALS", HOST],
         &["--env", "1BAD=x", HOST],
@@ -376,6 +388,8 @@ fn builds_release_binary_in_repository_root_and_uploads_it() {
             "build",
             "--package",
             "sans",
+            "--bin",
+            "sans",
             "--release",
             "--locked",
             "--target",
@@ -384,6 +398,101 @@ fn builds_release_binary_in_repository_root_and_uploads_it() {
     );
     assert_eq!(cwd, harness.repo().canonicalize().unwrap());
     assert_eq!(fs::read(harness.remote_binary()).unwrap(), fake_app(0));
+}
+
+#[test]
+fn diagnostic_binaries_build_from_core_and_run_without_a_desktop() {
+    for (binary, args) in [
+        ("hw_diag", vec!["--port", "/dev/ttyACM0"]),
+        (
+            "lift_diag",
+            vec!["--config", "/home/pi/sans.toml", "--log", "lift.csv"],
+        ),
+    ] {
+        let harness = Harness::new().with_previous_binary();
+        let mut cli = vec!["--bin", binary, HOST, "--"];
+        cli.extend(&args);
+
+        let output = harness.run(&cli);
+
+        assert!(output.status.success(), "{binary}: {}", stderr(&output));
+        let (argv, _) = harness.cross_call().unwrap();
+        assert_eq!(
+            argv,
+            [
+                "build",
+                "--package",
+                "sans-core",
+                "--bin",
+                binary,
+                "--release",
+                "--locked",
+                "--target",
+                "aarch64-unknown-linux-gnu"
+            ]
+        );
+        let remote = harness.home().join(format!(".local/bin/{binary}-dev"));
+        assert_eq!(fs::read(remote).unwrap(), fake_app(0));
+        assert_eq!(
+            fs::read(harness.remote_binary()).unwrap(),
+            b"previous sans-dev"
+        );
+        assert_eq!(harness.app_argv().unwrap(), args);
+        assert_eq!(harness.app_env()["DISPLAY"], None);
+        assert_eq!(harness.app_env()["WAYLAND_DISPLAY"], None);
+        assert_eq!(harness.ssh_calls()[1][..4], ["-tt", "-x", "--", HOST]);
+    }
+}
+
+#[test]
+fn prebuilt_diagnostics_preserve_arguments_environment_and_exit_status() {
+    for binary in ["hw_diag", "lift_diag"] {
+        let mut harness = Harness::new().with_previous_binary();
+        harness.cross_status = None;
+        let local = harness.write_local("prebuilt diagnostic", &fake_app(7));
+        let other_home = harness.root.path().join("other-home");
+        fs::create_dir_all(&other_home).unwrap();
+        let home = format!("HOME={}", other_home.display());
+        let args = ["--log", "two words.csv", "it's", "$(touch pwned)", ""];
+        let mut cli = vec![
+            "--bin",
+            binary,
+            "--binary",
+            local.to_str().unwrap(),
+            "--env",
+            &home,
+            "--env",
+            "PATH=/nonexistent",
+            HOST,
+            "--",
+        ];
+        cli.extend(args);
+
+        let output = harness.run(&cli);
+
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{binary}: {}",
+            stderr(&output)
+        );
+        assert!(harness.cross_call().is_none());
+        assert_eq!(app_argv_in(&other_home).unwrap(), args);
+        assert_eq!(
+            app_env_in(&other_home)["PATH"].as_deref(),
+            Some("/nonexistent")
+        );
+        assert_eq!(
+            fs::read(harness.home().join(format!(".local/bin/{binary}-dev"))).unwrap(),
+            fake_app(7)
+        );
+        assert_eq!(
+            fs::read(harness.remote_binary()).unwrap(),
+            b"previous sans-dev"
+        );
+        assert!(!other_home.join("pwned").exists());
+        assert!(!harness.repo().join("pwned").exists());
+    }
 }
 
 #[test]
@@ -484,21 +593,25 @@ fn upload_atomically_replaces_development_binary_byte_for_byte() {
 
 #[test]
 fn truncated_upload_keeps_previous_binary_and_skips_run() {
-    let mut harness = Harness::new().with_previous_binary();
-    harness.truncate_upload = Some(10);
-    let local = harness.write_local("ci-sans", &binary_with_all_bytes());
+    for binary in ["sans", "hw_diag", "lift_diag"] {
+        let mut harness = Harness::new().with_previous_binary();
+        let remote = harness.home().join(format!(".local/bin/{binary}-dev"));
+        fs::write(&remote, b"previous binary").unwrap();
+        harness.truncate_upload = Some(10);
+        let local = harness.write_local("ci-sans", &binary_with_all_bytes());
 
-    let output = harness.run(&["--binary", local.to_str().unwrap(), HOST]);
+        let output = harness.run(&["--bin", binary, "--binary", local.to_str().unwrap(), HOST]);
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("truncated"));
-    assert_eq!(
-        fs::read(harness.remote_binary()).unwrap(),
-        b"previous sans-dev"
-    );
-    assert_eq!(bin_dir_entries(&harness), ["sans-dev"]);
-    assert_eq!(harness.ssh_calls().len(), 1);
-    assert!(harness.app_argv().is_none());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stderr(&output).contains("truncated"));
+        assert_eq!(fs::read(&remote).unwrap(), b"previous binary");
+        let mut expected = vec![format!("{binary}-dev"), "sans-dev".to_owned()];
+        expected.sort();
+        expected.dedup();
+        assert_eq!(bin_dir_entries(&harness), expected);
+        assert_eq!(harness.ssh_calls().len(), 1);
+        assert!(harness.app_argv().is_none());
+    }
 }
 
 #[test]

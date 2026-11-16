@@ -2,7 +2,7 @@
 # Copy this file to the normal config path or let Sans generate it there.
 # Every <...> value and zero page-width bound must be commissioned before use.
 
-schema_version = 3
+schema_version = 4
 data_root = "scans"
 
 [boards]
@@ -27,16 +27,18 @@ urgent_deadline_ms = 50
 # or current limits: the limits stored on the ODrive apply, and Sans reads its
 # current limit and deceleration at connection. Commissioning does not enable
 # scanning.
-# Lift millimetres are 0 at Home and increase downward; set direction so this holds.
+# Lift millimetres are 0 at Home and negative downward; set direction so this holds.
+# mm_per_turn is travel per MOTOR turn, including gearbox reduction.
+# Bought 20-tooth T2.5 pulley with 10:1 reduction: 20 * 2.5 / 10 = 5 mm per motor turn.
 # The tuning values below are provisional until #60 measures them. Each must be
 # positive and finite; the saturation percent is at most 100 and the hold depth
 # is at most a 5 mm software policy cap.
 #
 # [odrive.lift_axis]
 # direction = "<normal-or-reversed>"
-# mm_per_turn = <positive>
-# travel_minimum_mm = <lower-soft-bound>
-# travel_maximum_mm = <upper-soft-bound>
+# mm_per_turn = <positive-travel-per-motor-turn>
+# travel_minimum_mm = <negative-lower-soft-bound>
+# travel_maximum_mm = <upper-soft-bound-at-most-zero>
 # position_tolerance_mm = <positive>
 # stationary_velocity_mm_s = <positive>
 # move_timeout_ms = <positive>

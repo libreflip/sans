@@ -60,6 +60,14 @@ pub(crate) enum Endpoint {
     TrapVelLimit,
     TrapAccelLimit,
     TrapDecelLimit,
+    InputVel,
+    InputTorque,
+    CurrentModeVelLimit,
+    VelGain,
+    TorqueConstant,
+    MotorDirection,
+    MotorType,
+    LoadEncoderAxis,
     ClearErrors,
 }
 
@@ -106,7 +114,7 @@ use Access::{Read, ReadWrite, Write};
 use ValueType::{Bool, F32, I32, U64, U8};
 
 /// The capability table: every endpoint Sans depends on, in check order.
-const CAPABILITIES: [(Endpoint, Scope, &str, Kind); 34] = [
+const CAPABILITIES: [(Endpoint, Scope, &str, Kind); 42] = [
     (
         Endpoint::SerialNumber,
         Scope::Root,
@@ -310,6 +318,54 @@ const CAPABILITIES: [(Endpoint, Scope, &str, Kind); 34] = [
         Scope::Axis,
         "clear_errors",
         Kind::Function,
+    ),
+    (
+        Endpoint::InputVel,
+        Scope::Axis,
+        "controller.input_vel",
+        Kind::Property(F32, ReadWrite),
+    ),
+    (
+        Endpoint::InputTorque,
+        Scope::Axis,
+        "controller.input_torque",
+        Kind::Property(F32, ReadWrite),
+    ),
+    (
+        Endpoint::CurrentModeVelLimit,
+        Scope::Axis,
+        "controller.config.enable_current_mode_vel_limit",
+        Kind::Property(Bool, ReadWrite),
+    ),
+    (
+        Endpoint::VelGain,
+        Scope::Axis,
+        "controller.config.vel_gain",
+        Kind::Property(F32, Read),
+    ),
+    (
+        Endpoint::TorqueConstant,
+        Scope::Axis,
+        "motor.config.torque_constant",
+        Kind::Property(F32, Read),
+    ),
+    (
+        Endpoint::MotorDirection,
+        Scope::Axis,
+        "motor.config.direction",
+        Kind::Property(I32, Read),
+    ),
+    (
+        Endpoint::MotorType,
+        Scope::Axis,
+        "motor.config.motor_type",
+        Kind::Property(I32, Read),
+    ),
+    (
+        Endpoint::LoadEncoderAxis,
+        Scope::Axis,
+        "controller.config.load_encoder_axis",
+        Kind::Property(U8, Read),
     ),
 ];
 

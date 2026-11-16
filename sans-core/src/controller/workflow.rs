@@ -17,10 +17,10 @@ use crate::lift::{LiftFault, LiftOutcome, OperationId};
 
 /// Where the operator is in the journey from boot to a running Scan session.
 pub(super) enum Workflow {
-    /// Home needs explicit consent: after boot, after a clean Home failure
-    /// and after every loss of Position trust.
+    /// Waiting for live devices and a valid native position reference.
+    /// Home is available with explicit consent when a reference is needed.
     Setup {
-        /// Why the last Home ended without Position trust, if it did.
+        /// Why the last Home operation failed, if it did.
         home_failure: Option<String>,
     },
     /// Native Home is running with the operator's consent.

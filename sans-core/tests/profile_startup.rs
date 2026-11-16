@@ -17,7 +17,7 @@ fn missing_profile_creates_parseable_template_and_stops_startup() {
     ));
     let template = fs::read_to_string(&profile_path).unwrap();
     let parsed = toml::from_str::<toml::Value>(&template).unwrap();
-    assert_eq!(parsed["schema_version"].as_integer(), Some(3));
+    assert_eq!(parsed["schema_version"].as_integer(), Some(4));
     assert!(parsed["odrive"].get("lift_axis").is_none());
     assert!(parsed["boards"].get("ligature_path").is_none());
     let error = prepare_machine_profile(Some(&profile_path)).unwrap_err();
@@ -69,13 +69,19 @@ fn valid_profile_resolves_and_creates_relative_data_root() {
 #[test]
 fn structural_mistakes_are_reported_with_the_selected_profile_path() {
     let cases = [
+        ("schema_version = 4", "schema_version = 3", "negative-down travel"),
         (
-            "schema_version = 3",
             "schema_version = 4",
-            "unsupported schema_version 4",
+            "schema_version = 2",
+            "negate and swap travel bounds",
         ),
         (
-            "schema_version = 3",
+            "schema_version = 4",
+            "schema_version = 5",
+            "unsupported schema_version 5",
+        ),
+        (
+            "schema_version = 4",
             "schema_version = \"3\"",
             "unsupported schema_version",
         ),
@@ -360,7 +366,7 @@ fn version_2_profile_is_rejected_with_limit_removal_guidance() {
     let profile_path = temp.path().join("sans.toml");
     fs::write(
         &profile_path,
-        VALID_PROFILE.replace("schema_version = 3", "schema_version = 2"),
+        VALID_PROFILE.replace("schema_version = 4", "schema_version = 2"),
     )
     .unwrap();
 
@@ -370,7 +376,7 @@ fn version_2_profile_is_rejected_with_limit_removal_guidance() {
     let message = error.to_string();
     assert!(message.contains("current_limit_a"), "{message}");
     assert!(message.contains("touchdown_press_current_a"), "{message}");
-    assert!(message.contains("schema_version = 3"), "{message}");
+    assert!(message.contains("schema_version = 4"), "{message}");
 }
 
 #[test]
@@ -393,8 +399,8 @@ const LIFT_AXIS_TABLE: &str = r#"
 [odrive.lift_axis]
 direction = "reversed"
 mm_per_turn = 8.0
-travel_minimum_mm = 0.0
-travel_maximum_mm = 300.0
+travel_minimum_mm = -300.0
+travel_maximum_mm = 0.0
 position_tolerance_mm = 0.5
 stationary_velocity_mm_s = 0.2
 move_timeout_ms = 2000
@@ -440,8 +446,13 @@ fn complete_lift_axis_table_prepares_as_commissioned() {
 fn invalid_lift_axis_values_are_reported() {
     let cases = [
         (
+            "travel_maximum_mm = 0.0",
             "travel_maximum_mm = 300.0",
-            "travel_maximum_mm = -1.0",
+            "Home is 0 and downward travel is negative",
+        ),
+        (
+            "travel_maximum_mm = 0.0",
+            "travel_maximum_mm = -301.0",
             "odrive.lift_axis travel bounds must be finite and ordered",
         ),
         (

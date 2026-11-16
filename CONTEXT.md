@@ -41,7 +41,7 @@ One attempt to pick up and turn the page within a capture cycle. Retries remain 
 _Avoid_: Cycle, page slot
 
 **Touchdown**:
-The controlled operation that lowers the suction box until it detects page contact and holds the selected press level, with its target a short commissioned hold depth below contact.
+The controlled operation that lowers the suction box until it detects page contact and holds the selected press level. A short commissioned hold depth limits further downward drift after contact.
 _Avoid_: Move down, descend
 
 **Flutter fan**:
@@ -93,7 +93,7 @@ A non-Stop pause after three confirmed pickup failures in which automatic scanni
 _Avoid_: Stopped state, Stop job
 
 **Position trust**:
-Sans's judgement of whether the suction box's current position can be used for absolute motion. Only a Home that Sans watched from start to end on the current connection grants it; the board's homed flag alone never does. It is lost on every Stop, reconnect and uncertain motion, and regaining it requires Home.
+Whether the suction box's position can be used for absolute motion, based on fresh telemetry from the verified current connection reporting ODrive's Home reference and ready, error-free encoder feedback. Stop and Disarm do not erase that reference. Home is needed when the board cannot provide a valid homed reference.
 _Avoid_: Homed flag, homed boolean
 
 **Stop**:
@@ -105,7 +105,7 @@ A Stop for which current-connection evidence shows that motion is stopped and va
 _Avoid_: Safe stop
 
 **Clear Stop**:
-The deliberate recovery from a Confirmed Stop that clears the lift axis's errors and the Stop latch without arming; Position trust stays lost until Home.
+The deliberate recovery from a Confirmed Stop that clears the lift axis's errors and the Stop latch without arming or resuming interrupted work. A valid position reference is retained.
 _Avoid_: Reset, resume
 
 **Unconfirmed Stop**:
