@@ -102,6 +102,10 @@ pub struct FakeFibre {
     /// read and then settle to the mapped state, like a homing run that ends.
     pub settle_after_one_read: HashMap<i32, i32>,
     settling: Option<i32>,
+    /// When set, the axis moves at once: a position write arrives stationary
+    /// with trajectory done, and a nonzero torque write stalls the axis at this
+    /// native position, drawing its whole current limit downward.
+    pub contact_turns: Option<f32>,
 }
 
 impl FakeFibre {
@@ -141,6 +145,7 @@ impl FakeFibre {
             ignore_state_requests: Vec::new(),
             readback_override: HashMap::new(),
             settle_after_one_read: HashMap::new(),
+            contact_turns: None,
             settling: None,
         };
         fake.set_u64(SERIAL_NUMBER, 54_310_774_846_261);
@@ -324,6 +329,23 @@ impl FakeFibre {
                 self.settling = self.settle_after_one_read.get(&state).copied();
             }
             return;
+        }
+        if let Some(contact) = self.contact_turns {
+            let value = || f32::from_le_bytes(payload[..4].try_into().unwrap());
+            if endpoint == INPUT_POS {
+                self.set_f32(POS_ESTIMATE, value());
+                self.set_f32(VEL_ESTIMATE, 0.0);
+                self.set_f32(IQ_MEASURED, 0.0);
+                self.set_bool(TRAJECTORY_DONE, true);
+                self.values.insert(endpoint, payload);
+                return;
+            }
+            if endpoint == INPUT_TORQUE && value() != 0.0 {
+                self.set_f32(POS_ESTIMATE, contact);
+                self.set_f32(VEL_ESTIMATE, 0.0);
+                let limit = self.f32_value(CURRENT_LIM);
+                self.set_f32(IQ_MEASURED, -limit);
+            }
         }
         if endpoint == INPUT_POS {
             // Upstream clears trajectory_done when it replans after a position write.

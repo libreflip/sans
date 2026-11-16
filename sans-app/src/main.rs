@@ -11,7 +11,7 @@ use sans_core::V4lCameraMachineFactory;
 use sans_core::{
     bootstrap, capture_lit_pair, CapturePair, CapturePairError, ControllerMachine, Led,
     MachineBoard, MachineEvent, MachineFactory, MonospaceClient, MonospaceConnection,
-    MonospaceEventKind, MonospaceFault, OpenedBoard, PreparedMachineProfile, SetupBlocker,
+    MonospaceEventKind, MonospaceFault, OpenedBoard, PreparedMachineProfile, Relay, SetupBlocker,
     SetupDiagnostic, StartupError, CAPTURE_LIGHT_SETTLE,
 };
 #[cfg(not(target_os = "linux"))]
@@ -105,6 +105,33 @@ impl MachineBoard for MonospaceBoard {
             .client
             .set_light(on)
             .map_err(|error| error.to_string())
+    }
+
+    fn set_relay(&mut self, relay: Relay, on: bool) -> Result<(), String> {
+        let client = &mut lock(&self.0).client;
+        match relay {
+            Relay::Vacuum => client.set_vacuum(on),
+            Relay::FlutterFan => client.set_fan(on),
+            Relay::TurnBlower => client.set_blower(on),
+        }
+        .map_err(|error| error.to_string())
+    }
+
+    fn read_pressure(&mut self) -> Result<f32, String> {
+        lock(&self.0)
+            .client
+            .press_once()
+            .map_err(|error| error.to_string())
+    }
+
+    fn set_pressure_stream(&mut self, on: bool) -> Result<(), String> {
+        let client = &mut lock(&self.0).client;
+        if on {
+            client.start_press_stream()
+        } else {
+            client.stop_press_stream()
+        }
+        .map_err(|error| error.to_string())
     }
 
     fn set_led(&mut self, led: Led) -> Result<(), String> {

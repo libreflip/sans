@@ -10,13 +10,13 @@ mod support;
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use sans_core::{
     bootstrap, CameraCaptureError, CameraRole, CapturePair, CapturePairError, CaptureStatus,
     CapturedFrame, ControllerHandle, ControllerIntent, ControllerMachine, ControllerSnapshot,
     CropGeometry, FibreOpener, Led, LinkPhase, MachineBoard, MachineEvent, MachineFactory,
-    MachineScreen, OpenedBoard, PreparedMachineProfile, ScanReadiness, SetupBlocker,
+    MachineScreen, OpenedBoard, PreparedMachineProfile, Relay, ScanReadiness, SetupBlocker,
     SetupDiagnostic, SetupState, StopCause, StopVerdict,
 };
 use support::fake_fibre::*;
@@ -27,19 +27,78 @@ const VALID_PROFILE: &str = include_str!("fixtures/valid-sans.toml");
 /// Board commands and captures in the order they happened.
 type Log = Arc<Mutex<Vec<String>>>;
 
+/// The pressure every reading starts from, in millibar.
+const AMBIENT_MBAR: f32 = 1_000.0;
+
 struct Board {
     log: Log,
     events: mpsc::Receiver<MachineEvent>,
+    /// The Pressure drop streamed while the vacuum is on.
+    vacuum_drop: Arc<Mutex<f32>>,
+    vacuum: bool,
+    streaming: bool,
+    last_reading: Option<Instant>,
+}
+
+impl Board {
+    fn push(&self, command: &str) {
+        self.log.lock().unwrap().push(command.into());
+    }
+
+    fn pressure(&self) -> f32 {
+        let drop = if self.vacuum {
+            *self.vacuum_drop.lock().unwrap()
+        } else {
+            0.0
+        };
+        AMBIENT_MBAR - drop
+    }
 }
 
 impl MachineBoard for Board {
     fn all_off(&mut self, _within: Duration) -> Result<(), String> {
-        self.log.lock().unwrap().push("ALL OFF".into());
+        self.vacuum = false;
+        self.push("ALL OFF");
         Ok(())
     }
 
     fn poll(&mut self) -> Option<MachineEvent> {
-        self.events.try_recv().ok()
+        if let Ok(event) = self.events.try_recv() {
+            return Some(event);
+        }
+        // Stream a reading every 10 ms; always answering would starve the inbox.
+        let due = self
+            .last_reading
+            .is_none_or(|last| last.elapsed() >= Duration::from_millis(10));
+        if !(self.streaming && due) {
+            return None;
+        }
+        self.last_reading = Some(Instant::now());
+        Some(MachineEvent::Pressure(self.pressure()))
+    }
+
+    fn set_relay(&mut self, relay: Relay, on: bool) -> Result<(), String> {
+        let name = match relay {
+            Relay::Vacuum => {
+                self.vacuum = on;
+                "VACUUM"
+            }
+            Relay::FlutterFan => "FAN",
+            Relay::TurnBlower => "BLOWER",
+        };
+        self.push(&format!("{name} {}", if on { "ON" } else { "OFF" }));
+        Ok(())
+    }
+
+    fn read_pressure(&mut self) -> Result<f32, String> {
+        self.push("PRESS?");
+        Ok(self.pressure())
+    }
+
+    fn set_pressure_stream(&mut self, on: bool) -> Result<(), String> {
+        self.streaming = on;
+        self.push(if on { "PRESS START" } else { "PRESS STOP" });
+        Ok(())
     }
 
     fn set_light(&mut self, on: bool) -> Result<(), String> {
@@ -155,6 +214,7 @@ struct Started {
     button: mpsc::Sender<MachineEvent>,
     gate: Arc<Mutex<()>>,
     lose_cameras: mpsc::Sender<SetupBlocker>,
+    vacuum_drop: Arc<Mutex<f32>>,
     data_root: std::path::PathBuf,
     markers: std::cell::Cell<u16>,
     _temp: tempfile::TempDir,
@@ -215,6 +275,7 @@ fn start(board: FakeFibre, captures: Vec<Result<CapturePair, CapturePairError>>)
     let gate = Arc::new(Mutex::new(()));
     let (lose_cameras, lost) = mpsc::channel();
     let opener = FakeOpener::new(board);
+    let vacuum_drop = Arc::new(Mutex::new(0.0));
     let controller = bootstrap(
         Some(&path),
         Factory {
@@ -222,6 +283,10 @@ fn start(board: FakeFibre, captures: Vec<Result<CapturePair, CapturePairError>>)
             board: Some(Board {
                 log: Arc::clone(&log),
                 events,
+                vacuum_drop: Arc::clone(&vacuum_drop),
+                vacuum: false,
+                streaming: false,
+                last_reading: None,
             }),
             machine: Machine {
                 log: Arc::clone(&log),
@@ -239,6 +304,7 @@ fn start(board: FakeFibre, captures: Vec<Result<CapturePair, CapturePairError>>)
         button,
         gate,
         lose_cameras,
+        vacuum_drop,
         // The fixture's relative data root resolves beside the profile.
         data_root: temp.path().join("scan-data"),
         markers: Default::default(),
@@ -565,6 +631,8 @@ fn stop_then_clear_stop_returns_to_idle_without_another_home() {
     let started = start(homing_board(), vec![pair(1)]);
     home(&started);
     ready(&started, 200);
+    // Held captures keep the Capture cycle from arming before the Stop.
+    let gate = started.gate.lock().unwrap();
     started.send(ControllerIntent::Start);
     started.until(|snapshot| scanning(snapshot).is_some());
 
@@ -572,6 +640,7 @@ fn stop_then_clear_stop_returns_to_idle_without_another_home() {
     let confirmed = started.until(|snapshot| {
         snapshot.stop.as_ref().map(|stop| &stop.verdict) == Some(&StopVerdict::Confirmed)
     });
+    drop(gate);
     assert!(matches!(confirmed.screen, MachineScreen::Setup(_)));
     started.send(ControllerIntent::ClearStop);
     let cleared = started.until(|snapshot| snapshot.stop.is_none());
@@ -639,5 +708,182 @@ fn already_homed_startup_skips_home_but_manual_home_is_still_available() {
         started.requested_states(),
         vec![1, 11],
         "Home from Idle is explicit"
+    );
+}
+
+/// The fake axis contacts the book at this height, in millimetres.
+const CONTACT_MM: f32 = -250.0;
+
+/// A homing board whose axis moves at once and touches the book at `CONTACT_MM`.
+fn book_board() -> FakeFibre {
+    let mut board = homing_board();
+    // The support profile has 8 mm per motor turn.
+    board.contact_turns = Some(CONTACT_MM / 8.0);
+    board
+}
+
+fn attempt_log(directory: &std::path::Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(directory.join("pressure-log.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+/// The board commands and captures, without LED projections.
+fn commands(started: &Started) -> Vec<String> {
+    started
+        .log()
+        .into_iter()
+        .filter(|entry| !entry.starts_with("LED"))
+        .collect()
+}
+
+#[test]
+fn one_capture_cycle_turns_the_page_saves_both_page_records_and_starts_the_next() {
+    let started = start(book_board(), vec![pair(7), pair(8), pair(9)]);
+    *started.vacuum_drop.lock().unwrap() = 2.0;
+    home(&started);
+    ready(&started, 200);
+
+    started.send(ControllerIntent::Start);
+    let next = started.until(|snapshot| {
+        scanning(snapshot).is_some_and(|view| {
+            view.left_sequence == 2 && view.capture.status == CaptureStatus::Ready
+        })
+    });
+    let view = scanning(&next).unwrap();
+    assert_eq!(
+        (view.capture_cycle, view.right_sequence, view.attempt),
+        (2, 3, 1)
+    );
+    assert_eq!(
+        **view.capture.latest_complete_pair.as_ref().unwrap(),
+        pair(8).unwrap(),
+        "the second cycle's own canonical pair"
+    );
+    // The second Touchdown switches the Turn blower off at its cutoff.
+    started.until(|_| {
+        commands(&started)
+            .iter()
+            .filter(|c| *c == "VACUUM ON")
+            .count()
+            == 2
+    });
+
+    assert_eq!(
+        commands(&started),
+        [
+            "LIGHT ON",
+            "PRESS START",
+            "session capture",
+            "VACUUM OFF",
+            "PRESS?",
+            "VACUUM ON",
+            "FAN ON",
+            "FAN OFF",
+            "BLOWER ON",
+            "VACUUM OFF",
+            "session capture",
+            "VACUUM OFF",
+            "PRESS?",
+            "BLOWER OFF",
+            "VACUUM ON",
+            "FAN ON",
+        ]
+    );
+    // Arm once, then the Touchdown and every leg from the same contact height:
+    // 10, 65, 60, 80, 100 and 105% of 200 mm above it.
+    let board = started.opener.board.lock().unwrap();
+    assert_eq!(board.requested_states(), vec![1, 11, 8]);
+    let targets: Vec<f32> = board
+        .writes_to(INPUT_POS)
+        .into_iter()
+        .map(|payload| 8.0 * f32::from_le_bytes(payload.try_into().unwrap()))
+        .collect();
+    drop(board);
+    for anchor in [-230.0, -120.0, -130.0, -90.0, -50.0, -40.0] {
+        assert!(
+            targets.iter().any(|target| (target - anchor).abs() < 0.01),
+            "{anchor} not in {targets:?}"
+        );
+    }
+    let directory = &view.directory;
+    for (sequence, value) in [("0000", 7), ("0001", 7)] {
+        let bytes = fs::read(directory.join(format!("{sequence}.jpg"))).unwrap();
+        let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (4, 3));
+        assert!(i16::from(image.get_pixel(0, 0)[0]).abs_diff(value) <= 2);
+    }
+    assert!(!directory.join("0002.jpg").exists());
+    let log = attempt_log(directory);
+    assert_eq!(log.len(), 1, "{log:?}");
+    let record = &log[0];
+    assert_eq!(record["result"], "turned");
+    assert_eq!(
+        (record["left_sequence"].as_u64(), record["attempt"].as_u64()),
+        (Some(0), Some(1))
+    );
+    assert_eq!(record["baseline_mbar"], 1000.0);
+    assert_eq!(record["touchdown_mm"], f64::from(CONTACT_MM));
+    assert_eq!(record["pickup_threshold_mbar"], 1.2);
+    let at =
+        |key: &str| chrono::DateTime::parse_from_rfc3339(record[key].as_str().unwrap()).unwrap();
+    assert!(at("baseline_at") - at("vacuum_off_at") >= chrono::Duration::seconds(1));
+}
+
+#[test]
+fn a_vacuum_fault_switches_all_off_logs_the_attempt_and_blocks_at_the_same_sequence_pair() {
+    let started = start(book_board(), vec![pair(7)]);
+    home(&started);
+    ready(&started, 200);
+
+    started.send(ControllerIntent::Start);
+    let blocked = started.until(|snapshot| {
+        scanning(snapshot)
+            .is_some_and(|view| matches!(view.capture.status, CaptureStatus::Blocked { .. }))
+    });
+
+    let view = scanning(&blocked).unwrap();
+    assert_eq!(
+        view.capture.status,
+        CaptureStatus::Blocked {
+            reason: "pickup failed: the vacuum is not working".into()
+        }
+    );
+    assert_eq!((view.left_sequence, view.attempt), (0, 1));
+    assert!(commands(&started).contains(&"ALL OFF".to_string()));
+    assert_eq!(blocked.stop, None, "a pickup failure is not a Stop");
+    let directory = view.directory.clone();
+    started.until(|_| !attempt_log(&directory).is_empty());
+    let log = attempt_log(&directory);
+    assert_eq!(log[0]["result"], "vacuum_fault");
+    assert!(log[0]["lowest_mbar"].as_f64().is_some());
+    assert!(!directory.join("0000.jpg").exists());
+}
+
+#[test]
+fn stop_mid_attempt_logs_the_attempt_as_stopped() {
+    let started = start(book_board(), vec![pair(7)]);
+    home(&started);
+    ready(&started, 200);
+    started.send(ControllerIntent::Start);
+    // Inside the one-second Pressure-baseline wait.
+    started.until(|_| commands(&started).contains(&"VACUUM OFF".to_string()));
+    let directory = started.until(|snapshot| scanning(snapshot).is_some());
+    let directory = scanning(&directory).unwrap().directory.clone();
+
+    started.send(ControllerIntent::Stop);
+    started.until(|snapshot| snapshot.stop.is_some());
+    started.until(|_| !attempt_log(&directory).is_empty());
+
+    let log = attempt_log(&directory);
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0]["result"], "stopped");
+    assert!(log[0]["vacuum_off_at"].is_string());
+    assert!(log[0]["baseline_mbar"].is_null());
+    assert!(
+        !commands(&started).contains(&"PRESS?".to_string()),
+        "no baseline after Stop"
     );
 }

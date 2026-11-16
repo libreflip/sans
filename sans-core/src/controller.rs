@@ -1,5 +1,6 @@
 //! Controller-owned Machine state exposed as typed intents and snapshots.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -20,10 +21,14 @@ use crate::odrive::{
 use crate::stop::{Relays, StopControl, StopStatus, StopVerdict};
 use crate::{prepare_machine_profile, PreparedMachineProfile, StartupError};
 
+mod cycle;
 mod machine;
+mod persist;
 mod workflow;
 
+use cycle::{BoardCommand, Effect, Input};
 use machine::{setup_state, spawn_machine, MachineRequest};
+use persist::SaveRequest;
 use workflow::{create_session_directory, ScanSession, Workflow};
 
 /// Telemetry-only snapshot changes publish at most four times a second.
@@ -317,6 +322,32 @@ pub trait MachineBoard: Send + 'static {
     fn set_led(&mut self, _led: Led) -> Result<(), String> {
         Ok(())
     }
+
+    /// Switch one Capture-cycle relay and wait for its `OK`.
+    fn set_relay(&mut self, relay: Relay, _on: bool) -> Result<(), String> {
+        Err(format!("this board cannot switch the {relay:?}"))
+    }
+
+    /// Send `PRESS?` and wait for one pressure reading in millibar.
+    fn read_pressure(&mut self) -> Result<f32, String> {
+        Err("this board cannot read pressure".into())
+    }
+
+    /// Send `PRESS START` or `PRESS STOP` and wait for its `OK`.
+    fn set_pressure_stream(&mut self, _on: bool) -> Result<(), String> {
+        Err("this board cannot stream pressure".into())
+    }
+}
+
+/// A Monospace relay the Capture cycle switches. The light has its own method.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Relay {
+    /// The suction-box vacuum pump.
+    Vacuum,
+    /// The Flutter fan.
+    FlutterFan,
+    /// The Turn blower.
+    TurnBlower,
 }
 
 /// The board as the factory opened it, or why it did not open.
@@ -516,6 +547,8 @@ pub(super) enum Inbox {
     BoardEvent(MachineEvent),
     Cameras(Result<Vec<SetupDiagnostic>, Vec<SetupBlocker>>),
     Captured(Result<CapturePair, CapturePairError>),
+    /// A Scan session save finished on the Machine thread.
+    Saved(Result<(), String>),
     Machine(MachineEvent),
     MachinePanicked,
 }
@@ -566,6 +599,7 @@ fn spawn_controller<Factory: MachineFactory>(
             let mut board_setup: Option<Result<SetupDiagnostic, SetupBlocker>> = None;
             let mut capturing: Option<CaptureFor> = None;
             let page_width = &profile.profile().page_width;
+            let command_ms = Duration::from_millis(profile.profile().timeouts.command_ms);
             let mut state = Projection {
                 revision: 0,
                 opened: false,
@@ -586,6 +620,7 @@ fn spawn_controller<Factory: MachineFactory>(
                 pressure_mbar: None,
                 shown_led: None,
                 light_lit: false,
+                orphans: Vec::new(),
             };
             // Without a Machine thread the lift axis and Stop still run.
             let machine = match machine {
@@ -612,11 +647,39 @@ fn spawn_controller<Factory: MachineFactory>(
                 {
                     return;
                 }
-                let mut home_changed = false;
-                for (id, outcome) in lift.take_finished() {
-                    home_changed |= state.workflow.home_finished(id, &outcome);
+                // A Stop ended the session; its attempt is still logged.
+                for request in state.orphans.drain(..) {
+                    if let Some(machine) = &machine {
+                        let _ = machine.send(MachineRequest::Save(Box::new(request)));
+                    }
                 }
-                if home_changed && !state.publish(&mut lift, &mut board) {
+                let mut changed = false;
+                let mut cycle = CycleDriver {
+                    lift: &mut lift,
+                    board: &mut board,
+                    machine: &machine,
+                    capturing: &mut capturing,
+                    within: command_ms,
+                };
+                // A cutoff and a finish from one pass arrive in that order.
+                for id in cycle.lift.take_cutoffs() {
+                    if state.workflow.lift_op() == Some(id) {
+                        changed |= cycle.drive(&mut state.workflow, Input::TurnBlowerCutoff);
+                    }
+                }
+                for (id, outcome) in cycle.lift.take_finished() {
+                    changed |= state.workflow.home_finished(id, &outcome);
+                    if let Workflow::Scanning(session) = &mut state.workflow {
+                        if session.lift_op == Some(id) {
+                            session.lift_op = None;
+                            changed |= cycle.drive(&mut state.workflow, Input::LiftFinished(outcome));
+                        }
+                    }
+                }
+                if state.workflow.cycle_wakeup().is_some_and(|at| at <= Instant::now()) {
+                    changed |= cycle.drive(&mut state.workflow, Input::Tick);
+                }
+                if changed && !state.publish(&mut lift, &mut board) {
                     return;
                 }
                 // Wake for whichever comes first: the next poll of a live
@@ -629,6 +692,8 @@ fn spawn_controller<Factory: MachineFactory>(
                     .chain(lift.refresh_wait(now))
                     .chain(
                         lift.next_wakeup()
+                            .into_iter()
+                            .chain(state.workflow.cycle_wakeup())
                             .map(|at| at.saturating_duration_since(now)),
                     )
                     .min();
@@ -804,23 +869,32 @@ fn spawn_controller<Factory: MachineFactory>(
                             }
                             Ok(directory) => {
                                 log::info!("Scan session started in {}", directory.display());
-                                let mut session = ScanSession::new(directory, page_width_mm);
-                                let lit = board
-                                    .as_mut()
-                                    .map_or(Err("no Monospace connection".into()), |board| {
-                                        board.set_light(true)
-                                    });
-                                state.light_lit = lit.is_ok();
+                                let mut session = ScanSession::new(
+                                    directory,
+                                    page_width_mm,
+                                    &profile.profile().pickup,
+                                );
+                                // The light and the pressure stream run for the whole session.
+                                let lit = match board.as_mut() {
+                                    None => Err("no Monospace connection".to_string()),
+                                    Some(board) => board
+                                        .set_light(true)
+                                        .map_err(|error| format!("LIGHT ON failed: {error}"))
+                                        .and_then(|()| {
+                                            state.light_lit = true;
+                                            board.set_pressure_stream(true).map_err(|error| {
+                                                format!("PRESS START failed: {error}")
+                                            })
+                                        }),
+                                };
                                 let sent = machine.as_ref().is_some_and(|machine| {
                                     lit.is_ok()
                                         && machine.send(MachineRequest::SessionCapture).is_ok()
                                 });
                                 match lit {
                                     Err(error) => {
-                                        log::error!("Scan session LIGHT ON failed: {error}");
-                                        session.capture = CaptureStatus::Blocked {
-                                            reason: format!("LIGHT ON failed: {error}"),
-                                        }
+                                        log::error!("Scan session start failed: {error}");
+                                        session.capture = CaptureStatus::Blocked { reason: error }
                                     }
                                     Ok(()) if sent => capturing = Some(CaptureFor::Session),
                                     Ok(()) => {
@@ -830,7 +904,7 @@ fn spawn_controller<Factory: MachineFactory>(
                                         }
                                     }
                                 }
-                                Workflow::Scanning(session)
+                                Workflow::Scanning(Box::new(session))
                             }
                         };
                         if !state.publish(&mut lift, &mut board) {
@@ -878,24 +952,24 @@ fn spawn_controller<Factory: MachineFactory>(
                     Inbox::Captured(result) => {
                         match capturing.take() {
                             Some(CaptureFor::Session) => {
-                                // Attempt 1's first valid complete pair is
+                                // The cycle's first valid complete pair is
                                 // canonical. A session Stop already ended
                                 // drops its late result.
-                                if let Workflow::Scanning(session) = &mut state.workflow {
-                                    session.capture = match result {
-                                        Ok(pair) => {
-                                            log::info!("Scan session captured its first pair");
-                                            session.canonical = Some(Arc::new(pair));
-                                            CaptureStatus::Ready
-                                        }
-                                        Err(error) => {
-                                            log::error!("Scan session capture failed: {error}");
-                                            CaptureStatus::Blocked {
-                                                reason: error.to_string(),
-                                            }
-                                        }
-                                    };
+                                match &result {
+                                    Ok(_) => log::info!("Scan session captured a pair"),
+                                    Err(error) => {
+                                        log::error!("Scan session capture failed: {error}")
+                                    }
                                 }
+                                let result = result.map(Arc::new).map_err(|error| error.to_string());
+                                CycleDriver {
+                                    lift: &mut lift,
+                                    board: &mut board,
+                                    machine: &machine,
+                                    capturing: &mut capturing,
+                                    within: command_ms,
+                                }
+                                .drive(&mut state.workflow, Input::Captured(result));
                             }
                             _ => {
                                 let status = match result {
@@ -922,15 +996,40 @@ fn spawn_controller<Factory: MachineFactory>(
                             return;
                         }
                     }
+                    Inbox::Saved(result) => {
+                        match &result {
+                            Ok(()) => log::info!("Scan session save finished"),
+                            Err(error) => log::error!("Scan session save failed: {error}"),
+                        }
+                        let changed = CycleDriver {
+                            lift: &mut lift,
+                            board: &mut board,
+                            machine: &machine,
+                            capturing: &mut capturing,
+                            within: command_ms,
+                        }
+                        .drive(&mut state.workflow, Input::Saved(result));
+                        if changed && !state.publish(&mut lift, &mut board) {
+                            return;
+                        }
+                    }
                     Inbox::BoardEvent(MachineEvent::Pressure(mbar))
                     | Inbox::Machine(MachineEvent::Pressure(mbar)) => {
                         // Every reading is kept; snapshots for it publish at
                         // the telemetry rate, so the next one carries the latest.
                         state.pressure_mbar = Some(mbar);
+                        let changed = CycleDriver {
+                            lift: &mut lift,
+                            board: &mut board,
+                            machine: &machine,
+                            capturing: &mut capturing,
+                            within: command_ms,
+                        }
+                        .drive(&mut state.workflow, Input::Pressure(mbar));
                         let due = lift.last_publish.is_none_or(|last| {
                             last.elapsed() >= TELEMETRY_PUBLISH_INTERVAL
                         });
-                        if due && !state.publish(&mut lift, &mut board) {
+                        if (changed || due) && !state.publish(&mut lift, &mut board) {
                             return;
                         }
                     }
@@ -979,11 +1078,95 @@ fn spawn_controller<Factory: MachineFactory>(
     })
 }
 
+/// Runs the Capture cycle's effects against the lift axis, the board and
+/// the Machine thread, feeding each reply straight back.
+struct CycleDriver<'a> {
+    lift: &'a mut LiftAxis,
+    board: &'a mut Option<Box<dyn MachineBoard>>,
+    machine: &'a Option<Sender<MachineRequest>>,
+    capturing: &'a mut Option<CaptureFor>,
+    /// The `ALL OFF` reply budget.
+    within: Duration,
+}
+
+impl CycleDriver<'_> {
+    /// Fold `input` into a running Scan session; true when it did anything.
+    fn drive(&mut self, workflow: &mut Workflow, input: Input) -> bool {
+        let Workflow::Scanning(session) = workflow else {
+            return false;
+        };
+        let mut changed = false;
+        let mut inputs = VecDeque::from([input]);
+        while let Some(input) = inputs.pop_front() {
+            let now = Instant::now();
+            for effect in session.on(now, SystemTime::now(), input) {
+                changed = true;
+                log::debug!("Capture cycle: {effect:?}");
+                match effect {
+                    Effect::Board(command) => {
+                        let reply = self.board_command(command);
+                        inputs.push_back(Input::Board(command, reply));
+                    }
+                    Effect::Lift(request, vacuum) => match self.lift.begin(now, request, vacuum) {
+                        Ok(id) => session.lift_op = Some(id),
+                        Err(rejection) => inputs.push_back(Input::LiftRefused(format!(
+                            "{request:?} was refused: {rejection:?}"
+                        ))),
+                    },
+                    Effect::CancelLift => {
+                        if let Some(id) = session.lift_op {
+                            self.lift.cancel(now, id);
+                        }
+                    }
+                    Effect::Capture => {
+                        let sent = self.machine.as_ref().is_some_and(|machine| {
+                            machine.send(MachineRequest::SessionCapture).is_ok()
+                        });
+                        if sent {
+                            *self.capturing = Some(CaptureFor::Session);
+                        } else {
+                            inputs.push_back(Input::Captured(Err(
+                                "the Machine thread has stopped".into(),
+                            )));
+                        }
+                    }
+                    Effect::Save(request) => {
+                        let sent = self.machine.as_ref().is_some_and(|machine| {
+                            machine.send(MachineRequest::Save(request)).is_ok()
+                        });
+                        if !sent {
+                            inputs.push_back(Input::Saved(Err(
+                                "the Machine thread has stopped".into()
+                            )));
+                        }
+                    }
+                    Effect::Stop(reason) => {
+                        let cause = StopCause::Uncertain(format!("Capture cycle: {reason}"));
+                        self.lift.stop(now, cause, &mut relays(self.board));
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    fn board_command(&mut self, command: BoardCommand) -> Result<Option<f32>, String> {
+        let Some(board) = self.board.as_mut() else {
+            return Err("no Monospace connection".into());
+        };
+        match command {
+            BoardCommand::Relay(relay, on) => board.set_relay(relay, on).map(|()| None),
+            BoardCommand::AllOff => board.all_off(self.within).map(|()| None),
+            BoardCommand::ReadPressure => board.read_pressure().map(Some),
+        }
+    }
+}
+
 /// Which request the one Capture pair in flight answers.
 enum CaptureFor {
     /// A diagnostic capture from Setup.
     Preview,
-    /// The Scan session's first Capture pair.
+    /// A Scan session's Capture pair.
     Session,
 }
 
@@ -1006,6 +1189,8 @@ struct Projection {
     shown_led: Option<Led>,
     /// The capture light this workflow switched on for a Scan session.
     light_lit: bool,
+    /// Attempt records of Scan sessions a Stop or lost gate ended.
+    orphans: Vec<SaveRequest>,
 }
 
 impl Projection {
@@ -1055,6 +1240,9 @@ impl Projection {
             _ => enabled && trusted,
         };
         if !keep {
+            if let Workflow::Scanning(session) = &mut self.workflow {
+                self.orphans.extend(session.take_unlogged());
+            }
             self.workflow = Workflow::setup();
         }
     }
@@ -1097,7 +1285,13 @@ impl Projection {
                 left_sequence: session.left_sequence,
                 right_sequence: session.left_sequence + 1,
                 attempt: session.attempt,
-                capture: capture_preview_state(session.capture.clone(), session.canonical.clone()),
+                capture: capture_preview_state(
+                    session.capture.clone(),
+                    session
+                        .canonical
+                        .clone()
+                        .or_else(|| session.previous.clone()),
+                ),
             }),
         }
     }
@@ -1114,6 +1308,9 @@ impl Projection {
         if self.light_lit && !keep_light {
             self.light_lit = false;
             if let Some(board) = board.as_mut() {
+                if let Err(error) = board.set_pressure_stream(false) {
+                    log::error!("cannot stop the pressure stream: {error}");
+                }
                 if let Err(error) = board.set_light(false) {
                     log::error!("cannot switch the capture light off: {error}");
                 }
@@ -1183,6 +1380,8 @@ struct LiftAxis {
     last_publish: Option<Instant>,
     /// Lift operations that finished since the controller last asked.
     finished: Vec<(OperationId, LiftOutcome)>,
+    /// Touchdowns that passed their Turn-blower cutoff since the controller last asked.
+    cutoffs: Vec<OperationId>,
 }
 
 impl LiftAxis {
@@ -1201,6 +1400,7 @@ impl LiftAxis {
             latest: None,
             last_publish: None,
             finished: Vec::new(),
+            cutoffs: Vec::new(),
         };
         let config = match LinkConfig::from_profile(profile.profile()) {
             Ok(config) => config,
@@ -1232,15 +1432,35 @@ impl LiftAxis {
 
     /// Start native Home from idle. It never arms.
     fn home(&mut self, now: Instant) -> Result<OperationId, LiftRejection> {
-        let mut link = port(&self.link);
         // Home commands no descent, so vacuum evidence is not needed.
-        let vacuum = VacuumEvidence::NotConfirmedOff;
-        self.ops.start(now, LiftRequest::Home, vacuum, &mut link)
+        self.begin(now, LiftRequest::Home, VacuumEvidence::NotConfirmedOff)
+    }
+
+    /// Start one lift operation.
+    fn begin(
+        &mut self,
+        now: Instant,
+        request: LiftRequest,
+        vacuum: VacuumEvidence,
+    ) -> Result<OperationId, LiftRejection> {
+        let mut link = port(&self.link);
+        self.ops.start(now, request, vacuum, &mut link)
+    }
+
+    /// Routinely cancel the running operation `id`.
+    fn cancel(&mut self, now: Instant, id: OperationId) {
+        let mut link = port(&self.link);
+        self.ops.cancel(now, id, &mut link);
     }
 
     /// Lift operations that finished since the last call.
     fn take_finished(&mut self) -> Vec<(OperationId, LiftOutcome)> {
         std::mem::take(&mut self.finished)
+    }
+
+    /// Touchdowns that passed their Turn-blower cutoff since the last call.
+    fn take_cutoffs(&mut self) -> Vec<OperationId> {
+        std::mem::take(&mut self.cutoffs)
     }
 
     fn clear_stop(&mut self, now: Instant) {
@@ -1273,8 +1493,9 @@ impl LiftAxis {
         while let Some(event) = self.ops.take_event() {
             log_lift_event(&event);
             self.stop.note(&event);
-            if let LiftEvent::Finished { id, outcome, .. } = event {
-                self.finished.push((id, outcome));
+            match event {
+                LiftEvent::Finished { id, outcome, .. } => self.finished.push((id, outcome)),
+                LiftEvent::TurnBlowerCutoff { id } => self.cutoffs.push(id),
             }
         }
         self.stop.observe(now, &self.ops, relays);

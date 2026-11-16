@@ -171,6 +171,8 @@ pub enum LiftRequest {
 /// Page-turn legs, each at a Machine-profile Lift percentage of the page width.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PageTurnLeg {
+    /// Up to the classification-start percentage, where pickup is first checked.
+    ToClassificationStart,
     /// Up to the wiggle-start percentage.
     ToWiggleStart,
     /// Down by the wiggle-retreat percentage; the only descent allowed with vacuum on.
@@ -775,6 +777,7 @@ impl LiftOperations {
             .ok_or(LiftRejection::NoTouchdownPosition)?;
         let motion = &self.motion;
         let percent = match leg {
+            PageTurnLeg::ToClassificationStart => motion.classification_start_percent,
             PageTurnLeg::ToWiggleStart => motion.wiggle_start_percent,
             PageTurnLeg::Wiggle => motion.wiggle_start_percent - motion.wiggle_retreat_percent,
             PageTurnLeg::ToBlowerOn => motion.blower_on_percent,

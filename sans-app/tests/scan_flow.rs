@@ -27,7 +27,7 @@ fn home_new_book_page_width_and_start_reach_the_first_pair() {
     assert!(session.has("Start"));
 
     session.tap_label("Start");
-    session.wait_for_label("First pair captured");
+    session.wait_for_label("Scanning...");
 
     for label in [
         "Stop",
