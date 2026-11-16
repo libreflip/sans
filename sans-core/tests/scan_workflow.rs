@@ -764,29 +764,26 @@ fn one_capture_cycle_turns_the_page_saves_both_page_records_and_starts_the_next(
     );
     // The second Touchdown switches the Turn blower off at its cutoff. The
     // cycle keeps going, so only the first two cycles' commands are compared.
-    started.until(|_| commands(&started).len() >= 16);
-
-    assert_eq!(
-        commands(&started)[..16],
-        [
-            "LIGHT ON",
-            "PRESS START",
-            "session capture",
-            "VACUUM OFF",
-            "PRESS?",
-            "VACUUM ON",
-            "FAN ON",
-            "FAN OFF",
-            "BLOWER ON",
-            "VACUUM OFF",
-            "session capture",
-            "VACUUM OFF",
-            "PRESS?",
-            "BLOWER OFF",
-            "VACUUM ON",
-            "FAN ON",
-        ]
-    );
+    let expected = [
+        "LIGHT ON",
+        "PRESS START",
+        "session capture",
+        "VACUUM OFF",
+        "PRESS?",
+        "VACUUM ON",
+        "FAN ON",
+        "FAN OFF",
+        "BLOWER ON",
+        "VACUUM OFF",
+        "session capture",
+        "VACUUM OFF",
+        "PRESS?",
+        "BLOWER OFF",
+        "VACUUM ON",
+        "FAN ON",
+    ];
+    started.until(|_| commands(&started).len() >= expected.len());
+    assert_eq!(commands(&started)[..expected.len()], expected);
     // Arm once, then the Touchdown and every leg from the same contact height:
     // 10, 65, 60, 80, 100 and 105% of 200 mm above it.
     let board = started.opener.board.lock().unwrap();
@@ -857,16 +854,22 @@ fn a_vacuum_fault_switches_all_off_logs_the_attempt_and_blocks_at_the_same_seque
     assert!(!directory.join("0000.jpg").exists());
 }
 
-#[test]
-fn stop_mid_attempt_logs_the_attempt_as_stopped() {
+/// Start a Scan session and return inside its first one-second
+/// Pressure-baseline wait, with the session directory.
+fn mid_baseline_wait() -> (Started, std::path::PathBuf) {
     let started = start(book_board(), vec![pair(7)]);
     home(&started);
     ready(&started, 200);
     started.send(ControllerIntent::Start);
-    // Inside the one-second Pressure-baseline wait.
     started.until(|_| commands(&started).contains(&"VACUUM OFF".to_string()));
-    let directory = started.until(|snapshot| scanning(snapshot).is_some());
-    let directory = scanning(&directory).unwrap().directory.clone();
+    let snapshot = started.until(|snapshot| scanning(snapshot).is_some());
+    let directory = scanning(&snapshot).unwrap().directory.clone();
+    (started, directory)
+}
+
+#[test]
+fn stop_mid_attempt_logs_the_attempt_as_stopped() {
+    let (started, directory) = mid_baseline_wait();
 
     started.send(ControllerIntent::Stop);
     started.until(|snapshot| snapshot.stop.is_some());
@@ -885,13 +888,7 @@ fn stop_mid_attempt_logs_the_attempt_as_stopped() {
 
 #[test]
 fn exit_mid_attempt_still_logs_the_attempt() {
-    let started = start(book_board(), vec![pair(7)]);
-    home(&started);
-    ready(&started, 200);
-    started.send(ControllerIntent::Start);
-    started.until(|_| commands(&started).contains(&"VACUUM OFF".to_string()));
-    let snapshot = started.until(|snapshot| scanning(snapshot).is_some());
-    let directory = scanning(&snapshot).unwrap().directory.clone();
+    let (started, directory) = mid_baseline_wait();
 
     started.send(ControllerIntent::Exit);
     started.until(|snapshot| snapshot.screen == MachineScreen::Exited);
