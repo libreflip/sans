@@ -723,7 +723,7 @@ fn book_board() -> FakeFibre {
 }
 
 fn attempt_log(directory: &std::path::Path) -> Vec<serde_json::Value> {
-    fs::read_to_string(directory.join("pressure-log.jsonl"))
+    fs::read_to_string(directory.join("scan.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
