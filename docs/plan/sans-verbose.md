@@ -744,7 +744,7 @@ pending ijon's call.
   point) and the differential values of the last three flip cycles
   (N-2, N-1, current). Shown directly in the main scan screen (§8), not
   a separate debug screen.
-- **`pressure-log.jsonl`** — one entry per pickup **attempt** (matching
+- **`scan.jsonl` (formerly `pressure-log.jsonl`)** — one entry per pickup **attempt** (matching
   §5.3 step 3 — every attempt is logged, not just the one whose photo
   gets archived), separate per-job file, uploaded alongside the
   archive. Fields:
@@ -776,7 +776,7 @@ pending ijon's call.
   derived from upload order or a timestamp, never reassigned. Enables
   a future single-file replace (re-scan) without renumbering anything
   else in the archive.
-- **Writes `pressure-log.jsonl`** (§6).
+- **Writes `scan.jsonl` (formerly `pressure-log.jsonl`)** (§6).
 - **Uploads the finished archive** to the Z2 storage-machine share on
   job completion.
 - **Whole-book completeness/gap check** — comparing every page slot's
