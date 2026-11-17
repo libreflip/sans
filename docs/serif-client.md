@@ -134,3 +134,18 @@ never deleted automatically.
 - QR: decode the rendered code and compare it with the URL (sans#52).
 - One supervised run against a real serif test instance, as part of
   interface §10.
+
+## 8. Tickets
+
+| Ticket | Content |
+|---|---|
+| #77 | serif client foundation: profile `[serif]`, TLS 1.3 + key, `ping`, upload status |
+| #78 | Background per-page upload worker and ledger (replaces #49's transport) |
+| #79 | Free-space-driven local retention |
+| #47 | Job ID + NTP gate |
+| #48 | `scan.jsonl` / `metadata.opf` content |
+| #51 | Operator-facing upload failure screen and count |
+| #52 | QR code |
+| #55, #56 | Rescan client (v2) |
+
+Server side: libreflip/serif#38.
