@@ -2,7 +2,7 @@
 //!
 //! Each Page record is one quality-95 baseline JPEG under its zero-padded
 //! Sequence number. Each Capture attempt appends one line to
-//! `pressure-log.jsonl`. Writes go straight to their final paths: no staging,
+//! `scan.jsonl`. Writes go straight to their final paths: no staging,
 //! fsync or manifest.
 
 use std::fs::OpenOptions;
@@ -17,7 +17,9 @@ use serde::Serialize;
 use crate::camera::{CapturePair, CapturedFrame};
 
 /// The attempt log's file name inside a Scan session directory.
-pub(super) const ATTEMPT_LOG: &str = "pressure-log.jsonl";
+/// The Scan session's append-only JSON Lines log (`scan.jsonl`, libreflip/sans#48).
+/// Every line carries a `type`; Capture attempts are `"attempt"`.
+pub(super) const ATTEMPT_LOG: &str = "scan.jsonl";
 
 /// The JPEG quality of every Page record.
 const JPEG_QUALITY: u8 = 95;
@@ -46,6 +48,7 @@ pub(super) enum AttemptResult {
 /// The bounded evidence of one Capture attempt: one JSONL line. A
 /// measurement not obtained before the attempt ended is `null`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(tag = "type", rename = "attempt")]
 pub(super) struct AttemptRecord {
     pub(super) result: AttemptResult,
     pub(super) detail: Option<String>,
@@ -218,6 +221,7 @@ mod tests {
         assert_eq!(lines[1]["result"], "never_sealed");
         assert_eq!(lines[1]["left_sequence"], 2);
         assert_eq!(lines[1]["touchdown_mm"], serde_json::Value::Null);
+        assert!(lines.iter().all(|line| line["type"] == "attempt"));
     }
 
     #[test]
