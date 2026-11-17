@@ -375,7 +375,7 @@ resuming after a Stop starts that slot over from a fresh attempt 1.
   (pre-vacuum baseline, reused from §5.1 step 1) and the differential
   values of the last three flip cycles (N-2, N-1, current). Shown
   directly in the main scan screen (§8), not a separate debug screen.
-- **`pressure-log.jsonl`** — one entry per pickup **attempt** (every
+- **`scan.jsonl` (formerly `pressure-log.jsonl`)** — one entry per pickup **attempt** (every
   attempt, not just the one whose photo gets stored), written into the
   per-session directory (§7). Fields: `ambient_mbar`, `differential_mbar`,
   `pickup_result`, `threshold_mbar_used`, `touchdown_position`,
@@ -409,7 +409,7 @@ handling. All of that is MVProduct.
   listing (`Vec<PathBuf>` or equivalent) — so `recognized_page_number:
   Option<String>` and a per-book `page_number_crop` can be added later
   as fields, not a restructuring (`mvprototype-scope.md` §4(a)).
-- Writes `pressure-log.jsonl` (§6) into the same session directory.
+- Writes `scan.jsonl` (formerly `pressure-log.jsonl`) (§6) into the same session directory.
 
 ---
 

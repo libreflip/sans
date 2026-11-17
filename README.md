@@ -92,6 +92,10 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="1209", ATTR{idProduct}=="0d32", MODE="0660", 
 
 Automated tests run the link against a fake Fibre device served from the captured schema. They show host behaviour against upstream `fw-v0.5.1` semantics. The [run 16 summary](sans-core/test-results/lift-16.md) separately records supervised component evidence from the vendor board for #60.
 
+## Upload to serif (planned)
+
+Sans is the client of `serif`, the VM-hosted backend and web portal implemented in [c-base_book-scanner](https://github.com/SasquatchPDX/c-base_book-scanner). It registers each Scan session there as a job, uploads pages in the background at low priority, confirms the finished book by checksum, shows the access QR code, and deletes old confirmed books only when it needs the space. None of this is implemented yet. The wire contract is [`libreflip/serif` `docs/sans-serif-interface.md`](https://github.com/libreflip/serif/blob/master/docs/sans-serif-interface.md); the sans-side design is [docs/serif-client.md](docs/serif-client.md).
+
 ## Direct diagnostics
 
 `cargo run -p sans-core --bin lift_diag -- --config <profile> --log <new.csv>`
