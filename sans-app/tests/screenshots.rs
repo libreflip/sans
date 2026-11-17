@@ -61,7 +61,7 @@ fn write_headless_fixture_renders() {
     session.wait_for_label("Page width: 210 mm");
     shoot(&mut session, "ready");
     session.tap_label("Start");
-    session.wait_for_label("First pair captured");
+    session.wait_for_label("Scanning...");
     shoot(&mut session, "scanning");
 
     // A latched Stop. The fixture Machine has no Monospace, so it is Unconfirmed.

@@ -7,12 +7,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
 
+use super::cycle::Cycle;
 use super::{CaptureStatus, ControllerIntent, Led};
 use crate::camera::CapturePair;
+use crate::config::PickupProfile;
 use crate::lift::{LiftFault, LiftOutcome, OperationId};
 
 /// Where the operator is in the journey from boot to a running Scan session.
@@ -40,7 +42,7 @@ pub(super) enum Workflow {
         notice: Option<String>,
     },
     /// A Scan session is running.
-    Scanning(ScanSession),
+    Scanning(Box<ScanSession>),
 }
 
 impl Workflow {
@@ -72,6 +74,22 @@ impl Workflow {
         }
     }
 
+    /// The running Scan session's lift operation.
+    pub(super) fn lift_op(&self) -> Option<OperationId> {
+        match self {
+            Self::Scanning(session) => session.lift_op,
+            _ => None,
+        }
+    }
+
+    /// The running Scan session's next Capture-cycle deadline.
+    pub(super) fn cycle_wakeup(&self) -> Option<Instant> {
+        match self {
+            Self::Scanning(session) => session.next_wakeup(),
+            _ => None,
+        }
+    }
+
     /// Fold in the finish of a lift operation; true when it was this
     /// workflow's Home. A Stop is shown by the Stop status, so it leaves no
     /// Home failure of its own.
@@ -96,10 +114,10 @@ impl Workflow {
     }
 }
 
-/// The in-memory Scan session and its first Capture cycle.
+/// The in-memory Scan session and its current Capture cycle.
 ///
-/// Sequence numbers are reserved, not advanced: #27 advances them once the
-/// Capture cycle's Page records are durable.
+/// The Sequence pair advances only once the Capture cycle's Page records are
+/// saved; see [`super::cycle`].
 pub(super) struct ScanSession {
     pub(super) directory: PathBuf,
     pub(super) page_width_mm: u16,
@@ -107,20 +125,28 @@ pub(super) struct ScanSession {
     pub(super) left_sequence: u32,
     /// The one-based Capture attempt within this Capture cycle.
     pub(super) attempt: u32,
-    /// Attempt 1's first valid complete Capture pair.
+    /// This Capture cycle's first valid complete Capture pair.
     pub(super) canonical: Option<Arc<CapturePair>>,
+    /// The last saved Capture cycle's pair, shown until the next one arrives.
+    pub(super) previous: Option<Arc<CapturePair>>,
     pub(super) capture: CaptureStatus,
+    /// The cycle's running lift operation.
+    pub(super) lift_op: Option<OperationId>,
+    pub(super) cycle: Cycle,
 }
 
 impl ScanSession {
-    pub(super) fn new(directory: PathBuf, page_width_mm: u16) -> Self {
+    pub(super) fn new(directory: PathBuf, page_width_mm: u16, pickup: &PickupProfile) -> Self {
         Self {
             directory,
             page_width_mm,
             left_sequence: 0,
             attempt: 1,
             canonical: None,
+            previous: None,
             capture: CaptureStatus::Capturing,
+            lift_op: None,
+            cycle: Cycle::new(pickup),
         }
     }
 }
@@ -151,6 +177,14 @@ mod tests {
 
     use super::*;
 
+    fn pickup() -> PickupProfile {
+        PickupProfile {
+            vacuum_working_drop_mbar: 0.5,
+            pickup_drop_mbar: 1.2,
+            confirmation_samples: 3,
+        }
+    }
+
     #[test]
     fn session_directory_is_utc_and_never_reuses_a_taken_name() {
         let root = tempfile::tempdir().unwrap();
@@ -169,7 +203,7 @@ mod tests {
 
     #[test]
     fn button_means_new_book_start_or_stop_and_is_otherwise_inert() {
-        let session = || ScanSession::new(PathBuf::new(), 200);
+        let session = || ScanSession::new(PathBuf::new(), 200, &pickup());
         let cases = [
             (Workflow::setup(), None),
             (
@@ -185,7 +219,10 @@ mod tests {
                 },
                 Some(ControllerIntent::Start),
             ),
-            (Workflow::Scanning(session()), Some(ControllerIntent::Stop)),
+            (
+                Workflow::Scanning(Box::new(session())),
+                Some(ControllerIntent::Stop),
+            ),
         ];
         for (workflow, intent) in cases {
             assert_eq!(workflow.button_intent(), intent);
@@ -203,7 +240,8 @@ mod tests {
         assert_eq!(ready.led(false), Led::Green);
         assert_eq!(Workflow::Homing(OperationId(1)).led(false), Led::Amber);
         assert_eq!(
-            Workflow::Scanning(ScanSession::new(PathBuf::new(), 200)).led(false),
+            Workflow::Scanning(Box::new(ScanSession::new(PathBuf::new(), 200, &pickup())))
+                .led(false),
             Led::Amber
         );
         assert_eq!(ready.led(true), Led::Red);

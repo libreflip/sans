@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 
+use super::persist::{self, SaveRequest};
 use super::{ControllerMachine, SETUP_POLL_INTERVAL};
 use super::{Inbox, MachineEvent, MachineFactory, SetupBlocker, SetupDiagnostic, SetupState};
 use crate::PreparedMachineProfile;
@@ -35,6 +36,8 @@ pub(super) enum MachineRequest {
     CapturePair,
     /// A Scan session capture under the light the controller switched on.
     SessionCapture,
+    /// Write a Capture cycle's Page records and attempt record.
+    Save(Box<SaveRequest>),
 }
 
 /// Run the factory on its own thread: open the board, then the Cameras,
@@ -84,6 +87,10 @@ pub(super) fn spawn_machine<Factory: MachineFactory>(
                     }
                     Ok(MachineRequest::SessionCapture) => {
                         inbox.send(Inbox::Captured(machine.capture_session_pair()))
+                    }
+                    Ok(MachineRequest::Save(request)) => {
+                        let saved = persist::save(&request).map_err(|error| error.to_string());
+                        inbox.send(Inbox::Saved(saved))
                     }
                     Err(RecvTimeoutError::Timeout) => match Factory::poll_machine(&mut machine) {
                         None => Ok(()),

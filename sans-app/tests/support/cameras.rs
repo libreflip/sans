@@ -9,7 +9,7 @@ use std::time::Duration;
 use sans_core::{
     CameraCaptureError, CameraRole, CapturePairMachine, CapturedFrame, FibreConnection,
     FibreOpener, MachineBoard, MachineEvent, MachineFactory, OpenRequest, OpenedBoard,
-    PreparedMachineProfile, RoleCamera, SetupBlocker, SetupDiagnostic,
+    PreparedMachineProfile, Relay, RoleCamera, SetupBlocker, SetupDiagnostic,
 };
 
 use super::core_support::fake_fibre::{FakeFibre, FakeOpener, IS_HOMED, TRAJECTORY_DONE};
@@ -185,6 +185,18 @@ impl MachineBoard for QuietBoard {
     }
 
     fn set_light(&mut self, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn set_relay(&mut self, _relay: Relay, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn read_pressure(&mut self) -> Result<f32, String> {
+        Ok(1_000.0)
+    }
+
+    fn set_pressure_stream(&mut self, _on: bool) -> Result<(), String> {
         Ok(())
     }
 }

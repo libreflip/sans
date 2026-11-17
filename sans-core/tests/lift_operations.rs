@@ -1346,6 +1346,7 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
     );
 
     for (next, vacuum) in [
+        (PageTurnLeg::ToClassificationStart, Unknown),
         (PageTurnLeg::ToWiggleStart, Unknown),
         (PageTurnLeg::Wiggle, Unknown),
         (PageTurnLeg::ToBlowerOn, Unknown),
@@ -1360,9 +1361,12 @@ fn page_turn_legs_follow_the_anchors_and_the_blower_cutoff_fires_once() {
             "{next:?}"
         );
     }
-    // -200.4 mm plus 65, 60, 80, 100 and 105% of 150 mm.
-    let legs = &rig.moves()[rig.moves().len() - 5..];
-    for (written, expected) in legs.iter().zip([-102.9, -110.4, -80.4, -50.4, -42.9]) {
+    // -200.4 mm plus 10, 65, 60, 80, 100 and 105% of 150 mm.
+    let legs = &rig.moves()[rig.moves().len() - 6..];
+    for (written, expected) in legs
+        .iter()
+        .zip([-185.4, -102.9, -110.4, -80.4, -50.4, -42.9])
+    {
         assert!(close(*written, expected), "{legs:?}");
     }
 

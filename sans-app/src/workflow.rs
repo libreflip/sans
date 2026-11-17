@@ -248,7 +248,7 @@ pub(crate) fn show_scanning(
     let (status, colour) = match &capture.status {
         sans_core::CaptureStatus::Capturing => ("Scanning: capturing", egui::Color32::LIGHT_BLUE),
         sans_core::CaptureStatus::Ready => ("Scanning", egui::Color32::LIGHT_GREEN),
-        sans_core::CaptureStatus::Blocked { .. } => ("Capture blocked", egui::Color32::LIGHT_RED),
+        sans_core::CaptureStatus::Blocked { .. } => ("Scan blocked", egui::Color32::LIGHT_RED),
     };
     let header = stop_header(stop).unwrap_or_else(|| {
         Header::new(status, colour).warning_tag(
@@ -264,15 +264,16 @@ pub(crate) fn show_scanning(
         header,
         |ui| {
             result = stop_actions(ui, handle, stop, |ui| {
-                let label = match &capture.status {
+                match &capture.status {
                     sans_core::CaptureStatus::Capturing => {
-                        return screen::action_indicator(ui, "Capturing...");
+                        screen::action_indicator(ui, "Capturing...");
                     }
-                    sans_core::CaptureStatus::Ready => "First pair captured",
-                    sans_core::CaptureStatus::Blocked { .. } => "Capture blocked",
-                };
-                // A status in the action's place; #27 continues the Capture cycle.
-                ui.add_enabled_ui(false, |ui| screen::action_button(ui, label));
+                    sans_core::CaptureStatus::Ready => screen::action_indicator(ui, "Scanning..."),
+                    sans_core::CaptureStatus::Blocked { .. } => {
+                        // A status in the action's place; #28 adds recovery.
+                        ui.add_enabled_ui(false, |ui| screen::action_button(ui, "Scan blocked"));
+                    }
+                }
             });
             exit(ui);
         },
